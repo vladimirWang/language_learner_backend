@@ -1,0 +1,4 @@
+lang,lemma,word_type,gender,plural,separable,trans_intr,level,chinese_mean,english_mean,core_case,sort_key,extra_json,source_md_path
+en,help,verb,,,,vt,A2,帮助,help,help sb. with sth.,日常,"{""past"":""helped"",""past_participle"":""helped"",""third_singular"":""helps""}","en/vocab/help.md"
+en,go,verb,,,,vi,A1,去,go,go to,出行,"{""past"":""went"",""past_participle"":""gone"",""third_singular"":""goes""}","en/vocab/go.md"
+en,book,noun,,books,,,A1,书,book,,日常,,"en/vocab/book.md"

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+builder/.venv/
+builder/work/
+builder/.uv-cache/
+
+# 本地构建缓存 / 产物
+deploy/data/
+
+# 前端
+admin/node_modules/
+admin/dist/
+
+# Go 本地二进制
+server/version-service
+
+# macOS
+.DS_Store

@@ -1,0 +1,79 @@
+# deploy/docker-compose.prod.yml
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: lang-postgres-prod
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DATABASE}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    mem_limit: 512m
+    memswap_limit: 768m
+    cpus: 1.5
+    restart: always
+    command:
+      - postgres
+      - -c shared_buffers=64MB
+      - -c work_mem=2MB
+      - -c maintenance_work_mem=16MB
+      - -c max_connections=16
+      - -c effective_cache_size=256MB
+      - -c wal_buffers=1MB
+
+  version-service:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    container_name: lang-service-prod
+    env_file: .env.prod
+    ports:
+      - "127.0.0.1:8080:8080"
+    mem_limit: 128m
+    memswap_limit: 128m
+    cpus: 1.0
+    restart: always
+    depends_on:
+      - postgres
+
+  # 管理后台前端：静态站点 + /api 反向代理
+  # 部署前先在宿主机构建前端（language_learner_frontend：pnpm build），
+  # 产物目录通过 ADMIN_DIST_DIR 指定（相对 deploy/ 或绝对路径）。
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: lang-nginx-prod
+    ports:
+      - "127.0.0.1:8081:80"
+    volumes:
+      - ./nginx/admin.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${ADMIN_DIST_DIR:-../../language_learner_frontend/dist}:/usr/share/nginx/html:ro
+    mem_limit: 64m
+    memswap_limit: 64m
+    cpus: 0.5
+    restart: always
+    depends_on:
+      - version-service
+
+  # 一次性构建任务：手动或由外部调度执行
+  #   docker compose -f docker-compose.prod.yml run --rm builder --lang de
+  builder:
+    build:
+      context: ..
+      dockerfile: builder/Dockerfile
+    container_name: lang-builder-prod
+    env_file: .env.prod
+    entrypoint: ["uv", "run", "python", "-m", "builder"]
+    mem_limit: 384m
+    memswap_limit: 384m
+    cpus: 1.0
+    volumes:
+      - ../content:/builder/content:ro
+    depends_on:
+      - postgres
+
+volumes:
+  pgdata:

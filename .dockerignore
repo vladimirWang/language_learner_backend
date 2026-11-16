@@ -1,0 +1,11 @@
+# 减少构建上下文；本地虚拟环境/缓存不进入镜像
+.git
+**/__pycache__
+**/*.pyc
+builder/.venv
+builder/work
+builder/.uv-cache
+deploy/data
+admin/node_modules
+admin/dist
+.DS_Store

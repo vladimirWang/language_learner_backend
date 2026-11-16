@@ -1,0 +1,39 @@
+# server/Dockerfile.dev
+# 仅用于本地 dev：version-service 与 Python builder 同容器，
+# 使管理台点击“启动构建”时可直接拉起一次性构建子进程。prod 仍用 server/Dockerfile。
+FROM golang:1.23-alpine AS go-builder
+WORKDIR /src
+COPY server/go.mod server/go.sum ./
+RUN go mod download
+COPY server/ ./
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/version-service ./cmd/version-service
+
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    UV_LINK_MODE=copy
+
+# git / openssh-client 用于素材仓库 ls-remote
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates tzdata git openssh-client && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /builder
+COPY builder/pyproject.toml builder/uv.lock ./
+RUN uv sync --locked --no-dev && rm -rf /root/.cache/uv
+COPY builder/builder ./builder
+COPY content ./content
+COPY --from=go-builder /out/version-service /app/version-service
+
+ENV CONTENT_DIR=/builder/content \
+    WORK_DIR=/builder/work \
+    BUILDER_CMD=uv \
+    BUILDER_ARGS="run --no-sync python -m builder" \
+    BUILDER_DIR=/builder
+
+EXPOSE 8080
+ENTRYPOINT ["/app/version-service"]

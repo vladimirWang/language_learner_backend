@@ -1,0 +1,4 @@
+lang,lemma,word_type,gender,plural,separable,trans_intr,level,chinese_mean,english_mean,core_case,sort_key,extra_json,source_md_path
+de,Hund,noun,m,Hunde,,,A2,狗,dog,,日常,,"de/vocab/Hund.md"
+de,helfen,verb,,,,vi,A2,帮助,help,+D,日常,,"de/vocab/helfen.md"
+de,Tisch,noun,m,Tische,,,A1,桌子,table,,日常,,"de/vocab/Tisch.md"

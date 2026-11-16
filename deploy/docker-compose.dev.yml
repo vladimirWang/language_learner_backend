@@ -1,0 +1,71 @@
+# deploy/docker-compose.dev.yml
+# dev：不启动 PG 容器，复用外部 docker-compose.dev.yml 提供的 PostgreSQL（宿主机 15432）。
+services:
+  # 一次性初始化：把表结构应用到 dev 外部 PG（幂等，每次 up 都执行）
+  schema-init:
+    image: pgvector/pgvector:pg17
+    container_name: lang-schema-init-dev
+    env_file: .env.dev
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        PGHOST="$$PG_HOST" PGPORT="$$PG_PORT" PGUSER="$$PG_USER"
+        PGPASSWORD="$$PG_PASSWORD" PGDATABASE="$$PG_DATABASE"
+        psql -v ON_ERROR_STOP=1 -f /init/01-pgvector.sql
+    volumes:
+      - ./postgres/init:/init:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: "no"
+
+  version-service:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile.dev
+    container_name: lang-service-dev
+    env_file: .env.dev
+    environment:
+      # 容器内无交互终端：自动接受 GitHub 主机指纹，避免 ls-remote 卡在确认
+      GIT_SSH_COMMAND: "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+    ports:
+      - "8080:8080"
+    # 同容器内会跑一次性 Python 构建任务，故放宽到 512m
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 只读挂载宿主 SSH key，用于 git@github.com 形式的仓库地址
+      - ~/.ssh:/root/.ssh:ro
+      # 素材与 builder 源码实时生效，无需重建镜像
+      - ../content:/builder/content:ro
+      - ../builder/builder:/builder/builder:ro
+      - ./data/builder-work:/builder/work
+    depends_on:
+      schema-init:
+        condition: service_completed_successfully
+
+  # 一次性构建任务镜像。dev 下推荐手动执行：
+  #   docker compose -f docker-compose.dev.yml run --rm builder --lang de
+  builder:
+    build:
+      context: ..
+      dockerfile: builder/Dockerfile
+    container_name: lang-builder-dev
+    env_file: .env.dev
+    entrypoint: ["uv", "run", "python", "-m", "builder"]
+    mem_limit: 384m
+    memswap_limit: 384m
+    cpus: 1.0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../content:/builder/content:ro
+      - ./data/builder-cache:/builder/.uv-cache
+      - ./data/builder-work:/builder/work
+
+# dev 不定义 postgres 服务；PG 由外部 compose 提供：
+# /Users/wangfernando/fullstack_workspace/deploy_test/docker_infrastracture/docker-compose.dev.yml

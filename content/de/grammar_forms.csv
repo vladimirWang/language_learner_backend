@@ -1,0 +1,12 @@
+lang,root,form_type,person,case_tag,gender,number_tag,form,note,source_md_path
+de,mein,possessive,1sg,nom,m,sg,mein,阳性第一格,de/grammar/物主代词.md
+de,mein,possessive,1sg,dat,m,sg,meinem,阳性第三格,de/grammar/物主代词.md
+de,mein,possessive,1sg,acc,m,sg,meinen,阳性第四格,de/grammar/物主代词.md
+de,mein,possessive,1sg,nom,f,sg,meine,阴性第一格,de/grammar/物主代词.md
+de,mein,possessive,1sg,dat,f,sg,meiner,阴性第三格,de/grammar/物主代词.md
+de,mein,possessive,1sg,acc,f,sg,meine,阴性第四格,de/grammar/物主代词.md
+de,mein,possessive,1sg,nom,n,sg,mein,中性第一格,de/grammar/物主代词.md
+de,mein,possessive,1sg,dat,n,sg,meinem,中性第三格,de/grammar/物主代词.md
+de,mein,possessive,1sg,acc,n,sg,mein,中性第四格,de/grammar/物主代词.md
+de,helfen,verb_conj,1sg,,,sg,helfe,现在时第一人称单数,de/vocab/helfen.md
+de,helfen,verb_conj,3sg,,,sg,hilft,现在时第三人称单数,de/vocab/helfen.md

@@ -1,0 +1,11 @@
+lang,root,form_type,person,case_tag,gender,number_tag,form,note,source_md_path
+en,be,verb_conj,1sg,,,sg,am,现在时第一人称单数,en/grammar/人称代词.md
+en,be,verb_conj,3sg,,,sg,is,现在时第三人称单数,en/grammar/人称代词.md
+en,be,verb_conj,1pl,,,pl,are,现在时复数,en/grammar/人称代词.md
+en,I,pronoun,1sg,subjective,,sg,I,主格,en/grammar/人称代词.md
+en,I,pronoun,1sg,objective,,sg,me,宾格,en/grammar/人称代词.md
+en,I,pronoun,1sg,possessive,,sg,my,形容词性物主代词,en/grammar/人称代词.md
+en,he,pronoun,3sg,subjective,,sg,he,主格,en/grammar/人称代词.md
+en,he,pronoun,3sg,objective,,sg,him,宾格,en/grammar/人称代词.md
+en,he,pronoun,3sg,possessive,,sg,his,形容词性物主代词,en/grammar/人称代词.md
+en,book,plural,,,n,pl,books,名词复数,en/vocab/book.md

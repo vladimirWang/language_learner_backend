@@ -1,0 +1,4 @@
+lang,lemma,word_type,gender,plural,separable,trans_intr,level,chinese_mean,english_mean,core_case,sort_key,extra_json,source_md_path
+ja,山,noun,,,,,N5,山,mountain,,自然,"{""kanji"":""山"",""kana"":""やま"",""kunyomi"":""やま"",""onyomi"":""サン""}","ja/vocab/山.md"
+ja,行く,verb,,,,,N5,去,go,,出行,"{""verb_class"":""godan"",""masu_form"":""行きます"",""te_form"":""行って"",""nai_form"":""行かない""}","ja/vocab/行く.md"
+ja,は,particle,,,,,N5,主题助词,topic marker,,语法,,"ja/grammar/助词はとが.md"
