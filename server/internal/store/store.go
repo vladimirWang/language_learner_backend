@@ -23,6 +23,147 @@ type Version struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+// ListeningJob 对应 listening_jobs 一行。
+type ListeningJob struct {
+	JobID        string    `json:"job_id"`
+	ExamID       string    `json:"exam_id"`
+	Lang         string    `json:"lang"`
+	SourceURL    string    `json:"source_url"`
+	Status       string    `json:"status"`
+	ManifestPath string    `json:"manifest_path"`
+	LogPath      string    `json:"log_path"`
+	ErrorMsg     string    `json:"error_msg"`
+	LastLogAt    time.Time `json:"last_log_at,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// ListeningJobLog 对应 listening_job_logs 一行。
+type ListeningJobLog struct {
+	Stage     string    `json:"stage"`
+	Level     string    `json:"level"`
+	Message   string    `json:"message"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// CreateListeningJob 登记一次听力导入任务。
+func (s *Store) CreateListeningJob(ctx context.Context, jobID, examID, lang, sourceURL string) error {
+	const q = `
+INSERT INTO listening_jobs (job_id, exam_id, lang, source_url, status, updated_at)
+VALUES ($1, $2, $3, $4, 'pending', now())
+ON CONFLICT (job_id) DO UPDATE SET
+  exam_id = EXCLUDED.exam_id,
+  lang = EXCLUDED.lang,
+  source_url = EXCLUDED.source_url,
+  status = 'pending',
+  error_msg = NULL,
+  manifest_path = NULL,
+  log_path = NULL,
+  updated_at = now()`
+	_, err := s.pool.Exec(ctx, q, jobID, examID, lang, sourceURL)
+	return err
+}
+
+// StartListeningJob 把状态置为 running。
+func (s *Store) StartListeningJob(ctx context.Context, jobID string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE listening_jobs SET status='running', updated_at=now() WHERE job_id=$1`, jobID)
+	return err
+}
+
+// FinishListeningJob 写入成功结果（manifest_path）。
+func (s *Store) FinishListeningJob(ctx context.Context, jobID, manifestPath string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE listening_jobs SET status='built', manifest_path=$1, updated_at=now() WHERE job_id=$2`,
+		manifestPath, jobID)
+	return err
+}
+
+// FailListeningJob 写入失败原因。
+func (s *Store) FailListeningJob(ctx context.Context, jobID, errorMsg string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE listening_jobs SET status='failed', error_msg=$1, updated_at=now() WHERE job_id=$2`,
+		errorMsg, jobID)
+	return err
+}
+
+// AppendListeningLog 追加一条任务日志，同时刷新 listening_jobs.last_log_at。
+func (s *Store) AppendListeningLog(ctx context.Context, jobID, stage, level, message string) error {
+	const q = `INSERT INTO listening_job_logs (job_id, stage, level, message) VALUES ($1,$2,$3,$4);
+UPDATE listening_jobs SET last_log_at = now() WHERE job_id=$1`
+	_, err := s.pool.Exec(ctx, q, jobID, stage, level, message)
+	return err
+}
+
+// ListListeningJobs 返回最近 N 条任务。
+func (s *Store) ListListeningJobs(ctx context.Context, limit int) ([]ListeningJob, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	const q = `
+SELECT job_id, exam_id, lang, source_url, status,
+       COALESCE(manifest_path,''), COALESCE(log_path,''), COALESCE(error_msg,''),
+       last_log_at,
+       created_at, updated_at
+FROM listening_jobs ORDER BY updated_at DESC LIMIT $1`
+	rows, err := s.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []ListeningJob
+	for rows.Next() {
+		var j ListeningJob
+		if err := rows.Scan(&j.JobID, &j.ExamID, &j.Lang, &j.SourceURL, &j.Status,
+			&j.ManifestPath, &j.LogPath, &j.ErrorMsg,
+			&j.LastLogAt,
+			&j.CreatedAt, &j.UpdatedAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, rows.Err()
+}
+
+// ListeningJobDetail 返回单个任务及其最近日志。
+func (s *Store) ListeningJobDetail(ctx context.Context, jobID string) (*ListeningJob, []ListeningJobLog, error) {
+	const vq = `
+SELECT job_id, exam_id, lang, source_url, status,
+       COALESCE(manifest_path,''), COALESCE(log_path,''), COALESCE(error_msg,''),
+       last_log_at,
+       created_at, updated_at
+FROM listening_jobs WHERE job_id=$1`
+	var j ListeningJob
+	err := s.pool.QueryRow(ctx, vq, jobID).Scan(&j.JobID, &j.ExamID, &j.Lang, &j.SourceURL, &j.Status,
+		&j.ManifestPath, &j.LogPath, &j.ErrorMsg,
+		&j.LastLogAt,
+		&j.CreatedAt, &j.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+
+	const lq = `
+SELECT COALESCE(stage,''), COALESCE(level,''), message, created_at
+FROM listening_job_logs WHERE job_id=$1 ORDER BY log_id DESC LIMIT 300`
+	rows, err := s.pool.Query(ctx, lq, jobID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var logs []ListeningJobLog
+	for rows.Next() {
+		var l ListeningJobLog
+		if err := rows.Scan(&l.Stage, &l.Level, &l.Message, &l.CreatedAt); err != nil {
+			return nil, nil, err
+		}
+		logs = append(logs, l)
+	}
+	return &j, logs, rows.Err()
+}
+
 // LogEntry 对应 build_logs 一行。
 type LogEntry struct {
 	Stage     string    `json:"stage"`

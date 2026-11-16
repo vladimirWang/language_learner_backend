@@ -1,4 +1,4 @@
-// Package runner 拉起 Python 一次性构建子进程，并把输出逐行回传。
+// Package runner 拉起 Python 一次性子进程，并把输出逐行回传。
 package runner
 
 import (
@@ -10,7 +10,7 @@ import (
 	"sync"
 )
 
-// Runner 执行外部构建命令；Python 进程结束即退出，不常驻。
+// Runner 执行外部 Python 命令；进程结束即退出，不常驻。
 type Runner struct {
 	cmd  string
 	args []string
@@ -22,10 +22,18 @@ func New(cmd string, args []string, dir string) *Runner {
 	return &Runner{cmd: cmd, args: args, dir: dir}
 }
 
-// Run 执行构建任务，onLine 接收 stdout/stderr 每一行。
-// extraEnv 为额外注入的环境变量（如 SOURCE_COMMIT）。
+// Run 执行标准构建（python -m builder --lang X --version Y）。
 func (r *Runner) Run(ctx context.Context, lang, version string, extraEnv map[string]string, onLine func(string)) error {
 	args := append(append([]string{}, r.args...), "--lang", lang, "--version", version)
+	return r.runCommand(ctx, args, extraEnv, onLine)
+}
+
+// RunCustom 执行自定义子进程，如 `python -m builder.listen --url ...`。
+func (r *Runner) RunCustom(ctx context.Context, args []string, extraEnv map[string]string, onLine func(string)) error {
+	return r.runCommand(ctx, args, extraEnv, onLine)
+}
+
+func (r *Runner) runCommand(ctx context.Context, args []string, extraEnv map[string]string, onLine func(string)) error {
 	cmd := exec.CommandContext(ctx, r.cmd, args...)
 	cmd.Dir = r.dir
 	env := os.Environ()

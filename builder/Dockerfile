@@ -4,7 +4,14 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
     UV_CACHE_DIR=/builder/.uv-cache \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    HF_ENDPOINT=https://hf-mirror.com \
+    WHISPER_MODEL=small
+
+# ffmpeg：音频转码与按题切片；tesseract：视频帧 OCR 提取选项文字
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates ffmpeg tesseract-ocr tesseract-ocr-deu tesseract-ocr-eng && \
+    rm -rf /var/lib/apt/lists/*
 
 # 安装 uv（官方静态二进制）
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv

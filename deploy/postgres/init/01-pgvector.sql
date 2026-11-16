@@ -42,3 +42,29 @@ CREATE TABLE IF NOT EXISTS build_logs (
     level     TEXT,
     created_at TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS listening_jobs (
+    job_id    TEXT PRIMARY KEY,
+    exam_id   TEXT NOT NULL,
+    lang      TEXT NOT NULL DEFAULT 'de',
+    source_url TEXT NOT NULL,
+    status    TEXT NOT NULL,           -- pending / running / built / failed
+    manifest_path TEXT,                -- 成功后填相对路径
+    log_path   TEXT,
+    error_msg  TEXT,
+    last_log_at TIMESTAMPTZ,           -- 最后一条 builder 日志时间，判断是否真在跑
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+-- 增量兼容：已有库补列
+ALTER TABLE listening_jobs ADD COLUMN IF NOT EXISTS last_log_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS listening_job_logs (
+    log_id    BIGSERIAL PRIMARY KEY,
+    job_id    TEXT NOT NULL,
+    stage     TEXT,
+    level     TEXT,
+    message   TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_listening_job_logs_job ON listening_job_logs(job_id, log_id);

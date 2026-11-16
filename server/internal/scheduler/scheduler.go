@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,6 +73,69 @@ func (s *Scheduler) Trigger(lang, version string) (string, error) {
 	s.logLine(ctx, version, "trigger", "accepted build lang="+lang)
 	go s.run(ctx, version, lang)
 	return version, nil
+}
+
+// TriggerListening 校验锁与水位后异步启动听力导入任务，立即返回 job_id。
+// builder.listen 的 CLI args 由 handler 构造好传进来。
+func (s *Scheduler) TriggerListening(jobID, examID, lang string, args []string, extraEnv map[string]string) error {
+	s.mu.Lock()
+	if s.busy {
+		s.mu.Unlock()
+		return ErrBusy
+	}
+	s.busy = true
+	s.mu.Unlock()
+
+	if avail := memutil.AvailableMB(); avail > 0 && int64(avail) < s.minAvailMB {
+		s.setIdle()
+		return ErrLowMemory
+	}
+
+	ctx := context.Background()
+	go s.runListening(ctx, jobID, examID, lang, args, extraEnv)
+	return nil
+}
+
+func (s *Scheduler) runListening(ctx context.Context, jobID, examID, lang string, args []string, extraEnv map[string]string) {
+	defer s.setIdle()
+
+	if s.store != nil {
+		if err := s.store.StartListeningJob(ctx, jobID); err != nil {
+			s.logger.Printf("start listening job %s: %v", jobID, err)
+		}
+		_ = s.store.AppendListeningLog(ctx, jobID, "init", "info",
+			"starting listening import exam="+examID+" lang="+lang)
+	}
+
+	onLine := func(line string) {
+		s.logger.Printf("[listening %s] %s", jobID, line)
+		if s.store != nil {
+			level := "info"
+			stage := "builder"
+			upper := strings.ToUpper(line)
+			if strings.Contains(upper, "ERROR") || strings.Contains(upper, "Traceback") {
+				level = "error"
+			} else if strings.Contains(upper, "WARNING") {
+				level = "warn"
+			}
+			_ = s.store.AppendListeningLog(ctx, jobID, stage, level, line)
+		}
+	}
+
+	err := s.runner.RunCustom(ctx, args, extraEnv, onLine)
+	if s.store == nil {
+		return
+	}
+	if err != nil {
+		s.logger.Printf("listening job %s failed: %v", jobID, err)
+		_ = s.store.AppendListeningLog(ctx, jobID, "runner", "error", err.Error())
+		_ = s.store.FailListeningJob(ctx, jobID, err.Error())
+		return
+	}
+	// 成功：manifest 路径由 builder.listen 写入 work_root/manifest.json；
+	// 这里只把状态置为 built，manifest_path 留空（客户端后续通过扫描目录拿）。
+	_ = s.store.AppendListeningLog(ctx, jobID, "runner", "info", "builder.listen finished")
+	_ = s.store.FinishListeningJob(ctx, jobID, "")
 }
 
 func (s *Scheduler) run(ctx context.Context, version, lang string) {
