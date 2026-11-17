@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -582,10 +583,70 @@ func (h *Handler) listeningDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(target)))
+	w.Header().Set("Content-Type", contentTypeFor(target))
+	if isInlinePlayable(target) {
+		// 音视频、图片、文本等可在浏览器内联展示，方便管理后台直接试听/预览。
+		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filepath.Base(target)))
+	} else {
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(target)))
+	}
 	w.Header().Set("X-Accel-Buffering", "no")
 	http.ServeFile(w, r, target)
+}
+
+// contentTypeFor 根据扩展名返回合适的 MIME type，容器里 mime.types 可能不全，
+// 对常见音视频/图片扩展名做显式映射。
+func contentTypeFor(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".m4a":
+		return "audio/mp4"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".ogg", ".oga":
+		return "audio/ogg"
+	case ".flac":
+		return "audio/flac"
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mov":
+		return "video/quicktime"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".txt", ".srt", ".vtt":
+		return "text/plain; charset=utf-8"
+	case ".json":
+		return "application/json; charset=utf-8"
+	default:
+		if t := mime.TypeByExtension(filepath.Ext(path)); t != "" {
+			return t
+		}
+		return "application/octet-stream"
+	}
+}
+
+// isInlinePlayable 判断文件是否适合在浏览器内联展示（试听/预览）。
+func isInlinePlayable(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".m4a", ".mp3", ".wav", ".ogg", ".oga", ".flac",
+		".mp4", ".webm", ".mov",
+		".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+		".txt", ".srt", ".vtt", ".json":
+		return true
+	default:
+		return false
+	}
 }
 
 // listeningArchive 把整个任务目录打包成 zip 下载（视频 + 音频 + 图片 + 转写）。
@@ -708,7 +769,7 @@ func saveUploadedFile(src io.ReadCloser, dst string) error {
 }
 
 // listeningUpdateAnswers 允许管理员在任务完成后补充答案 CSV。
-// CSV 格式：题号,答案（答案为 A/B/C/D）。更新 manifest.json 中对应题目的 answer 字段。
+// CSV 格式：题号,答案（选择 A/B/C/D；判断 richtig/falsch）。更新 manifest.json 中对应题目的 answer 字段。
 func (h *Handler) listeningUpdateAnswers(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
 	if jobID == "" {
@@ -806,7 +867,9 @@ func (h *Handler) listeningUpdateAnswers(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// parseAnswerCSV 解析答案 CSV：题号,答案（A/B/C/D），忽略表头与非法行。
+// parseAnswerCSV 解析答案 CSV：题号,答案。
+// 答案支持：选择题 A/B/C/D；判断题 richtig/falsch（或缩写 r/f、true/false）。
+// 归一化后存储：A/B/C/D（选择）、R（正确）/F（错误）。忽略表头与非法行。
 func parseAnswerCSV(r io.Reader) (map[int]string, error) {
 	reader := csv.NewReader(r)
 	reader.FieldsPerRecord = -1
@@ -831,11 +894,33 @@ func parseAnswerCSV(r io.Reader) (map[int]string, error) {
 		if err != nil {
 			continue
 		}
-		answer := strings.ToUpper(cells[1])
-		if answer != "A" && answer != "B" && answer != "C" && answer != "D" {
-			return nil, fmt.Errorf("第 %d 题答案不是 A/B/C/D：%s", num, cells[1])
+		answer, err := normalizeAnswer(cells[1])
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 题 %w", num, err)
 		}
 		result[num] = answer
 	}
 	return result, nil
+}
+
+// normalizeAnswer 将各种答案写法归一化为标准单字符：
+// 选择题 → A/B/C/D；判断题 → R（正确）/ F（错误）。
+func normalizeAnswer(raw string) (string, error) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	switch s {
+	case "a":
+		return "A", nil
+	case "b":
+		return "B", nil
+	case "c":
+		return "C", nil
+	case "d":
+		return "D", nil
+	case "r", "richtig", "true", "t":
+		return "R", nil
+	case "f", "falsch", "false":
+		return "F", nil
+	default:
+		return "", fmt.Errorf("不支持的答案 %q（支持 A/B/C/D 或 richtig/falsch）", raw)
+	}
 }

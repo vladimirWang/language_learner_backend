@@ -251,8 +251,30 @@ def _join_with_speakers(rows: list[Segment]) -> str:
     return "\n".join(lines)
 
 
+def _normalize_answer(raw: str) -> str:
+    """归一化答案写法：选择 A/B/C/D；判断 R（正确）/F（错误）。"""
+    s = raw.strip().lower()
+    if s == "a":
+        return "A"
+    if s == "b":
+        return "B"
+    if s == "c":
+        return "C"
+    if s == "d":
+        return "D"
+    if s in ("r", "richtig", "true", "t"):
+        return "R"
+    if s in ("f", "falsch", "false"):
+        return "F"
+    raise ListeningError(f"不支持的答案 {raw!r}（支持 A/B/C/D 或 richtig/falsch）")
+
+
 def load_answers(path: Path) -> dict[int, str]:
-    """读取官方答案 CSV：题号,答案；允许带表头。"""
+    """读取官方答案 CSV：题号,答案；允许带表头。
+
+    答案支持：选择 A/B/C/D；判断 richtig/falsch（或 r/f、true/false）。
+    归一化后存储：A/B/C/D（选择）、R（正确）/F（错误）。
+    """
     if not path.exists():
         raise ListeningError(f"答案文件不存在：{path}")
     result: dict[int, str] = {}
@@ -265,10 +287,7 @@ def load_answers(path: Path) -> dict[int, str]:
                 number = int(cells[0].lstrip("qQ"))
             except ValueError:
                 continue
-            answer = cells[1].upper()
-            if answer not in {"A", "B", "C", "D"}:
-                raise ListeningError(f"第 {number} 题答案不是 A/B/C/D：{cells[1]}")
-            result[number] = answer
+            result[number] = _normalize_answer(cells[1])
     if not result:
         raise ListeningError("答案文件里没有解析到任何题号")
     return result
