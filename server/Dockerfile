@@ -1,5 +1,5 @@
 # 构建阶段
-FROM golang:1.23-alpine AS builder
+FROM golang:1.27-alpine AS builder
 WORKDIR /src
 COPY server/go.mod server/go.sum ./
 RUN go mod download

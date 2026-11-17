@@ -70,6 +70,12 @@ func (s *Scheduler) Trigger(lang, version string) (string, error) {
 	}
 
 	ctx := context.Background()
+	// 同步登记构建记录，避免前端紧接着查状态时记录尚未入库而 404。
+	if s.store != nil {
+		if err := s.store.StartBuild(ctx, version, lang); err != nil {
+			s.logger.Printf("start build %s: %v", version, err)
+		}
+	}
 	s.logLine(ctx, version, "trigger", "accepted build lang="+lang)
 	go s.run(ctx, version, lang)
 	return version, nil
@@ -140,12 +146,6 @@ func (s *Scheduler) runListening(ctx context.Context, jobID, examID, lang string
 
 func (s *Scheduler) run(ctx context.Context, version, lang string) {
 	defer s.setIdle()
-
-	if s.store != nil {
-		if err := s.store.StartBuild(ctx, version, lang); err != nil {
-			s.logger.Printf("start build %s: %v", version, err)
-		}
-	}
 
 	// 尝试获取该语种仓库的最新 commit，作为构建来源标记。
 	sourceCommit := s.fetchCommit(ctx, lang)
