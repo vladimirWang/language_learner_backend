@@ -30,6 +30,7 @@ func (Version) TableName() string { return "build_versions" }
 type ListeningJob struct {
 	JobID        string     `gorm:"primaryKey;column:job_id" json:"job_id"`
 	ExamID       string     `gorm:"column:exam_id" json:"exam_id"`
+	Name         *string    `gorm:"column:name" json:"name"`
 	Lang         string     `gorm:"column:lang" json:"lang"`
 	SourceURL    string     `gorm:"column:source_url" json:"source_url"`
 	Status       string     `gorm:"column:status" json:"status"`
@@ -225,6 +226,7 @@ func (s *Store) RemoveLevelExam(ctx context.Context, levelID int64, examID strin
 // AvailableExam 是可加入关卡的听力 exam（已构建完成）。
 type AvailableExam struct {
 	ExamID    string    `gorm:"column:exam_id" json:"exam_id"`
+	Name      *string   `gorm:"column:name" json:"name"`
 	Lang      string    `gorm:"column:lang" json:"lang"`
 	SourceURL string    `gorm:"column:source_url" json:"source_url"`
 	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
@@ -234,7 +236,7 @@ type AvailableExam struct {
 func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]AvailableExam, error) {
 	rows := make([]AvailableExam, 0)
 	q := s.db.WithContext(ctx).Table("listening_jobs").
-		Select("DISTINCT exam_id, lang, source_url, created_at").
+		Select("DISTINCT exam_id, name, lang, source_url, created_at").
 		Where("status = ? AND deleted_at IS NULL AND has_answers = ?", "built", true).
 		Where("exam_id NOT IN (?)",
 			s.db.Table("level_exams").Select("exam_id").Where("level_id = ?", levelID)).
@@ -348,6 +350,16 @@ func (s *Store) FailListeningJob(ctx context.Context, jobID, errorMsg string) er
 		}).Error
 }
 
+// UpdateListeningJobName 更新听力任务名称；nil 表示清除自定义名称。
+func (s *Store) UpdateListeningJobName(ctx context.Context, jobID string, name *string) error {
+	return s.db.WithContext(ctx).Model(&ListeningJob{}).
+		Where("job_id = ? AND deleted_at IS NULL", jobID).
+		Updates(map[string]any{
+			"name":       name,
+			"updated_at": gorm.Expr("now()"),
+		}).Error
+}
+
 // SoftDeleteListeningJob 软删除听力任务（标记 deleted_at，不删除文件）。
 func (s *Store) SoftDeleteListeningJob(ctx context.Context, jobID string) error {
 	return s.db.WithContext(ctx).Model(&ListeningJob{}).
@@ -388,7 +400,7 @@ func (s *Store) ListListeningJobs(ctx context.Context, limit int) ([]ListeningJo
 	}
 	jobs := make([]ListeningJob, 0)
 	err := s.db.WithContext(ctx).Table("listening_jobs").
-		Select(`job_id, exam_id, lang, source_url, status,
+		Select(`job_id, exam_id, name, lang, source_url, status,
 			COALESCE(manifest_path,'') AS manifest_path,
 			COALESCE(log_path,'') AS log_path,
 			COALESCE(error_msg,'') AS error_msg,
@@ -404,7 +416,7 @@ func (s *Store) ListListeningJobs(ctx context.Context, limit int) ([]ListeningJo
 func (s *Store) ListeningJobDetail(ctx context.Context, jobID string) (*ListeningJob, []ListeningJobLog, error) {
 	var j ListeningJob
 	err := s.db.WithContext(ctx).Table("listening_jobs").
-		Select(`job_id, exam_id, lang, source_url, status,
+		Select(`job_id, exam_id, name, lang, source_url, status,
 			COALESCE(manifest_path,'') AS manifest_path,
 			COALESCE(log_path,'') AS log_path,
 			COALESCE(error_msg,'') AS error_msg,

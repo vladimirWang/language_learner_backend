@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS build_logs (
 CREATE TABLE IF NOT EXISTS listening_jobs (
     job_id    TEXT PRIMARY KEY,
     exam_id   TEXT NOT NULL,
+    name      TEXT,
     lang      TEXT NOT NULL DEFAULT 'de',
     source_url TEXT NOT NULL,
     status    TEXT NOT NULL,           -- pending / running / built / failed
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS listening_jobs (
 ALTER TABLE listening_jobs ADD COLUMN IF NOT EXISTS last_log_at TIMESTAMPTZ;
 ALTER TABLE listening_jobs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 ALTER TABLE listening_jobs ADD COLUMN IF NOT EXISTS has_answers BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE listening_jobs ADD COLUMN IF NOT EXISTS name TEXT;
 
 CREATE TABLE IF NOT EXISTS listening_job_logs (
     log_id    BIGSERIAL PRIMARY KEY,

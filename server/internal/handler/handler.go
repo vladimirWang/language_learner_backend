@@ -60,6 +60,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/listening/job/{jobId}/download", h.listeningDownload)
 	mux.HandleFunc("GET /api/listening/job/{jobId}/archive", h.listeningArchive)
 	mux.HandleFunc("POST /api/listening/job/{jobId}/answers", h.listeningUpdateAnswers)
+	mux.HandleFunc("PATCH /api/listening/job/{jobId}", h.updateListeningJobName)
 	mux.HandleFunc("DELETE /api/listening/job/{jobId}", h.deleteListeningJob)
 
 	// 关卡配置
@@ -81,7 +82,7 @@ func (h *Handler) Routes() http.Handler {
 func (h *Handler) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 		if r.Method == http.MethodOptions {
@@ -900,6 +901,33 @@ func (h *Handler) listeningUpdateAnswers(w http.ResponseWriter, r *http.Request)
 		"updated_count": updated,
 		"answers":       updatedList,
 	})
+}
+
+// updateListeningJobName 更新听力任务的显示名称；空名称表示恢复使用 Exam ID。
+func (h *Handler) updateListeningJobName(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	if jobID == "" {
+		writeError(w, http.StatusBadRequest, "missing jobId")
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	var name *string
+	if req.Name != "" {
+		name = &req.Name
+	}
+	if err := h.store.UpdateListeningJobName(r.Context(), jobID, name); err != nil {
+		h.logger.Printf("update listening job name %s: %v", jobID, err)
+		writeError(w, http.StatusInternalServerError, "update job name failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // deleteListeningJob 软删除听力任务（标记 deleted_at，不删除产物文件）。
