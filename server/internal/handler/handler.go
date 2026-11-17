@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"context"
 	"crypto/rand"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,6 +58,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/listening/job/{jobId}/files", h.listeningFiles)
 	mux.HandleFunc("GET /api/listening/job/{jobId}/download", h.listeningDownload)
 	mux.HandleFunc("GET /api/listening/job/{jobId}/archive", h.listeningArchive)
+	mux.HandleFunc("POST /api/listening/job/{jobId}/answers", h.listeningUpdateAnswers)
 	return h.logRequests(mux)
 }
 
@@ -499,8 +502,22 @@ func (h *Handler) listeningFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	files := make([]listeningFile, 0, 32)
+
+	// 确保 zip 缓存存在（不存在则预生成），这样用户可直接在文件列表里下载 zip，
+	// 走 /download 路径，与单文件下载完全一致，避免 /archive 路径被网关限制。
+	zipPath := filepath.Join(dir, examID+".zip")
+	if _, statErr := os.Stat(zipPath); statErr != nil {
+		if err := buildListeningZip(dir, zipPath); err != nil {
+			h.logger.Printf("prebuild listening zip failed: %v", err)
+		}
+	}
+
 	walkErr := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {
+			return nil
+		}
+		// 排除转写中间产物（16k wav，体积大且无下载价值）
+		if strings.HasSuffix(path, "source16k.wav") {
 			return nil
 		}
 		rel, relErr := filepath.Rel(dir, path)
@@ -546,6 +563,19 @@ func (h *Handler) listeningDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	// 如果请求的是 zip 包，确保它已完整生成（原子 rename，不会读到半成品）。
+	// 这样用户无论何时点下载，都能拿到完整的 zip。
+	if strings.HasSuffix(target, ".zip") {
+		if _, statErr := os.Stat(target); statErr != nil {
+			if buildErr := buildListeningZip(dir, target); buildErr != nil {
+				h.logger.Printf("build listening zip on download failed: %v", buildErr)
+				writeError(w, http.StatusInternalServerError, "build zip failed")
+				return
+			}
+		}
+	}
+
 	info, err := os.Stat(target)
 	if err != nil || info.IsDir() {
 		writeError(w, http.StatusNotFound, "file not found")
@@ -554,10 +584,13 @@ func (h *Handler) listeningDownload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(target)))
+	w.Header().Set("X-Accel-Buffering", "no")
 	http.ServeFile(w, r, target)
 }
 
 // listeningArchive 把整个任务目录打包成 zip 下载（视频 + 音频 + 图片 + 转写）。
+// 策略：首次请求时把 zip 预生成到任务目录下并持久化（不删除），之后直接 ServeFile。
+// 这样 zip 下载与单文件下载走完全相同的 ServeFile 路径，避免流式打包导致的下载卡住。
 func (h *Handler) listeningArchive(w http.ResponseWriter, r *http.Request) {
 	dir, examID, err := h.listeningExamDir(r.Context(), r.PathValue("jobId"))
 	switch {
@@ -574,16 +607,41 @@ func (h *Handler) listeningArchive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set(
-		"Content-Disposition",
-		fmt.Sprintf("attachment; filename=%q", examID+".zip"),
-	)
-	zw := zip.NewWriter(w)
-	defer zw.Close()
+	zipPath := filepath.Join(dir, examID+".zip")
 
-	_ = filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
+	// 缓存不存在则生成（用 Store 不压缩，速度快）。生成到磁盘文件而非 response，
+	// 生成完成后走 ServeFile，与单文件下载路径一致，稳定支持大文件下载。
+	if _, statErr := os.Stat(zipPath); statErr != nil {
+		if err := buildListeningZip(dir, zipPath); err != nil {
+			h.logger.Printf("build listening zip failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "build zip failed")
+			return
+		}
+	}
+
+	// 告诉 nginx 等反向代理不要缓冲此响应，否则大文件下载会卡在代理缓冲阶段。
+	w.Header().Set("X-Accel-Buffering", "no")
+	http.ServeFile(w, r, zipPath)
+}
+
+// buildListeningZip 把 dir 下的文件（排除 source16k.wav）用 Store 模式打包到 zipPath。
+// 先写到临时文件，完成后 rename 到目标路径（原子操作），避免下载时读到半成品。
+func buildListeningZip(dir, zipPath string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(zipPath), ".listening-*.zip.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	// 清理临时文件（成功 rename 后不影响，失败时兜底）
+	defer os.Remove(tmpPath)
+
+	zw := zip.NewWriter(tmp)
+	walkErr := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil || entry.IsDir() {
+			return nil
+		}
+		// 排除自身 zip 与转写中间产物
+		if path == zipPath || strings.HasSuffix(path, "source16k.wav") {
 			return nil
 		}
 		rel, relErr := filepath.Rel(dir, path)
@@ -595,13 +653,28 @@ func (h *Handler) listeningArchive(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 		defer src.Close()
-		dst, createErr := zw.Create(filepath.ToSlash(rel))
+		dst, createErr := zw.CreateHeader(&zip.FileHeader{
+			Name:   filepath.ToSlash(rel),
+			Method: zip.Store,
+		})
 		if createErr != nil {
 			return nil
 		}
 		_, _ = io.Copy(dst, src)
 		return nil
 	})
+	if closeErr := zw.Close(); closeErr != nil {
+		tmp.Close()
+		return closeErr
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if walkErr != nil {
+		return walkErr
+	}
+	// 原子替换：rename 保证下载请求要么读到旧的完整文件，要么读到新的完整文件。
+	return os.Rename(tmpPath, zipPath)
 }
 
 // safeJoin 把相对路径安全地拼到 root 下，拒绝越界与绝对路径。
@@ -632,4 +705,137 @@ func saveUploadedFile(src io.ReadCloser, dst string) error {
 		return err
 	}
 	return nil
+}
+
+// listeningUpdateAnswers 允许管理员在任务完成后补充答案 CSV。
+// CSV 格式：题号,答案（答案为 A/B/C/D）。更新 manifest.json 中对应题目的 answer 字段。
+func (h *Handler) listeningUpdateAnswers(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	if jobID == "" {
+		writeError(w, http.StatusBadRequest, "missing jobId")
+		return
+	}
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid multipart: "+err.Error())
+		return
+	}
+	file, _, err := r.FormFile("answers")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "missing answers.csv")
+		return
+	}
+	defer file.Close()
+
+	answerMap, err := parseAnswerCSV(file)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(answerMap) == 0 {
+		writeError(w, http.StatusBadRequest, "答案文件里没有解析到任何题号")
+		return
+	}
+
+	dir, _, err := h.listeningExamDir(r.Context(), jobID)
+	switch {
+	case err == errListeningJobNotFound:
+		writeError(w, http.StatusNotFound, "job not found")
+		return
+	case err != nil:
+		h.logger.Printf("listening exam dir: %v", err)
+		writeError(w, http.StatusInternalServerError, "locate exam dir failed")
+		return
+	}
+
+	manifestPath := filepath.Join(dir, "manifest.json")
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "manifest not found")
+		return
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		writeError(w, http.StatusInternalServerError, "manifest parse failed")
+		return
+	}
+	questions, ok := manifest["questions"].([]any)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "manifest questions invalid")
+		return
+	}
+
+	updated := 0
+	for _, q := range questions {
+		qMap, ok := q.(map[string]any)
+		if !ok {
+			continue
+		}
+		num, ok := qMap["number"].(float64)
+		if !ok {
+			continue
+		}
+		if ans, exists := answerMap[int(num)]; exists {
+			qMap["answer"] = ans
+			updated++
+		}
+	}
+	manifest["questions"] = questions
+
+	out, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "manifest encode failed")
+		return
+	}
+	if err := os.WriteFile(manifestPath, out, 0o644); err != nil {
+		writeError(w, http.StatusInternalServerError, "manifest write failed")
+		return
+	}
+
+	type qBrief struct {
+		Number int    `json:"number"`
+		Answer string `json:"answer"`
+	}
+	updatedList := make([]qBrief, 0, len(answerMap))
+	for n := range answerMap {
+		updatedList = append(updatedList, qBrief{Number: n, Answer: answerMap[n]})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated_count": updated,
+		"answers":       updatedList,
+	})
+}
+
+// parseAnswerCSV 解析答案 CSV：题号,答案（A/B/C/D），忽略表头与非法行。
+func parseAnswerCSV(r io.Reader) (map[int]string, error) {
+	reader := csv.NewReader(r)
+	reader.FieldsPerRecord = -1
+	rows, err := reader.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("CSV 解析失败：%w", err)
+	}
+	result := make(map[int]string)
+	for _, row := range rows {
+		cells := make([]string, 0, len(row))
+		for _, c := range row {
+			c = strings.TrimSpace(c)
+			if c != "" {
+				cells = append(cells, c)
+			}
+		}
+		if len(cells) < 2 {
+			continue
+		}
+		numStr := strings.TrimLeft(cells[0], "qQ")
+		num, err := strconv.Atoi(numStr)
+		if err != nil {
+			continue
+		}
+		answer := strings.ToUpper(cells[1])
+		if answer != "A" && answer != "B" && answer != "C" && answer != "D" {
+			return nil, fmt.Errorf("第 %d 题答案不是 A/B/C/D：%s", num, cells[1])
+		}
+		result[num] = answer
+	}
+	return result, nil
 }

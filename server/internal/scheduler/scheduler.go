@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,28 @@ import (
 	"github.com/wangfernando/language-learner/server/internal/runner"
 	"github.com/wangfernando/language-learner/server/internal/store"
 )
+
+// pyLogLine 匹配 Python logging 默认格式：时间戳 级别 模块 消息。
+var pyLogLine = regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+ (DEBUG|INFO|WARNING|ERROR|CRITICAL) `)
+
+// parseLogLevel 从日志行解析级别。优先匹配 Python logging 的级别字段，
+// 匹配不到时仅把含 Traceback 的行判为 error（避免消息里的 "error" 字样误报）。
+func parseLogLevel(line string) string {
+	if m := pyLogLine.FindStringSubmatch(line); m != nil {
+		switch m[1] {
+		case "ERROR", "CRITICAL":
+			return "error"
+		case "WARNING":
+			return "warn"
+		default:
+			return "info"
+		}
+	}
+	if strings.Contains(line, "Traceback") {
+		return "error"
+	}
+	return "info"
+}
 
 var (
 	// ErrBusy 表示已有构建任务在跑（同一时刻只允许一个）。
@@ -116,14 +139,8 @@ func (s *Scheduler) runListening(ctx context.Context, jobID, examID, lang string
 	onLine := func(line string) {
 		s.logger.Printf("[listening %s] %s", jobID, line)
 		if s.store != nil {
-			level := "info"
+			level := parseLogLevel(line)
 			stage := "builder"
-			upper := strings.ToUpper(line)
-			if strings.Contains(upper, "ERROR") || strings.Contains(upper, "Traceback") {
-				level = "error"
-			} else if strings.Contains(upper, "WARNING") {
-				level = "warn"
-			}
 			_ = s.store.AppendListeningLog(ctx, jobID, stage, level, line)
 		}
 	}

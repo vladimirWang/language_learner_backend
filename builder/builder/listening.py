@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import wave
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -116,14 +117,20 @@ def import_from_url(
         # 视频抽帧 + OCR（有视频轨时）
         if is_video:
             frame_path = image_dir / f"q{number:02d}.png"
-            _extract_frame(media, frame_path, question["image_time"])
-            question["image"] = f"images/q{number:02d}.png"
+            try:
+                _extract_frame(media, frame_path, question["image_time"])
+                question["image"] = f"images/q{number:02d}.png"
+            except ListeningError as e:
+                logger.debug("抽帧失败（跳过该题图）：%s", e)
+                question["image"] = None
             question["image_time"] = question.pop("image_time")
-            if ocr_enabled and HAS_TESSERACT:
+            if ocr_enabled and HAS_TESSERACT and question["image"]:
                 question["ocr_text"] = _ocr_frame(frame_path, lang=target_lang)
             elif ocr_enabled and not HAS_TESSERACT:
                 question["ocr_text"] = None
                 question["ocr_note"] = "tesseract 未安装，跳过 OCR"
+            else:
+                question["ocr_text"] = None
 
         logger.info("第 %d/%d 题 完成 number=%d clip=%s", idx, len(questions), number, clip.name)
 
@@ -151,6 +158,29 @@ def import_from_url(
         "转写文件已写出：%s", ", ".join(path.name for path in transcript_files)
     )
     logger.info("导入完成 manifest=%s questions=%d", manifest_path, len(questions))
+
+    # 清理转写中间产物（16k wav 体积大，转写完成后无保留价值）
+    wav_path = download_dir / "source16k.wav"
+    if wav_path.exists():
+        wav_path.unlink()
+        logger.info("已清理中间产物 %s", wav_path.name)
+
+    # 预生成 zip 包（Store 不压缩），供管理后台直接下载，避免请求时临时打包。
+    zip_path = exam_dir / f"{exam_id}.zip"
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+            for path in exam_dir.rglob("*"):
+                if not path.is_file():
+                    continue
+                if path.name == zip_path.name:
+                    continue
+                if path.name == "source16k.wav":
+                    continue
+                zf.write(path, path.relative_to(exam_dir).as_posix())
+        logger.info("zip 包已生成：%s (%.1f MB)", zip_path.name, zip_path.stat().st_size / 1024 / 1024)
+    except OSError as e:
+        logger.warning("生成 zip 失败（不影响主流程）：%s", e)
+
     return manifest_path
 
 
@@ -640,13 +670,20 @@ def _extract_frame(source: Path, target: Path, at_time: float) -> None:
     )
 
 
+TESSERACT_LANG_MAP = {
+    "de": "deu", "en": "eng", "ja": "jpn",
+    "deu": "deu", "eng": "eng", "jpn": "jpn",
+}
+
+
 def _ocr_frame(image: Path, lang: str = "de") -> str | None:
     """用 tesseract OCR 一张帧，返回清洗后的文字；未安装或失败返回 None。"""
     if not HAS_TESSERACT:
         return None
+    tess_lang = TESSERACT_LANG_MAP.get(lang, lang)
     try:
         proc = subprocess.run(
-            ["tesseract", str(image), "-", "-l", lang, "--psm", "6"],
+            ["tesseract", str(image), "-", "-l", tess_lang, "--psm", "6"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if proc.returncode != 0:
