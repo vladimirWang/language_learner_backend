@@ -37,6 +37,7 @@ type ListeningJob struct {
 	LogPath      string     `gorm:"column:log_path" json:"log_path"`
 	ErrorMsg     string     `gorm:"column:error_msg" json:"error_msg"`
 	LastLogAt    *time.Time `gorm:"column:last_log_at" json:"last_log_at"`
+	DeletedAt    *time.Time `gorm:"column:deleted_at" json:"-"`
 	CreatedAt    time.Time  `gorm:"column:created_at" json:"created_at"`
 	UpdatedAt    time.Time  `gorm:"column:updated_at" json:"updated_at"`
 }
@@ -64,6 +65,144 @@ type LogEntry struct {
 }
 
 func (LogEntry) TableName() string { return "build_logs" }
+
+// ---------------------------------------------------------------------------
+// 关卡配置（levels / level_exams）
+// ---------------------------------------------------------------------------
+
+// Level 对应 levels 一行：管理员维护的学习关卡。
+type Level struct {
+	ID          int64     `gorm:"primaryKey;column:id" json:"id"`
+	Name        string    `gorm:"column:name" json:"name"`
+	Lang        string    `gorm:"column:lang" json:"lang"`
+	Description string    `gorm:"column:description" json:"description"`
+	SortOrder   int       `gorm:"column:sort_order" json:"sort_order"`
+	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
+}
+
+func (Level) TableName() string { return "levels" }
+
+// LevelExam 对应 level_exams 一行：关卡与听力 exam 的关联。
+type LevelExam struct {
+	ID        int64     `gorm:"primaryKey;column:id" json:"-"`
+	LevelID   int64     `gorm:"column:level_id" json:"level_id"`
+	ExamID    string    `gorm:"column:exam_id" json:"exam_id"`
+	SortOrder int       `gorm:"column:sort_order" json:"sort_order"`
+	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
+}
+
+func (LevelExam) TableName() string { return "level_exams" }
+
+// LevelExamInfo 是关卡关联的 exam 附带 exam 基本信息的视图。
+type LevelExamInfo struct {
+	ExamID    string    `gorm:"column:exam_id" json:"exam_id"`
+	Lang      string    `gorm:"column:lang" json:"lang"`
+	SourceURL string    `gorm:"column:source_url" json:"source_url"`
+	SortOrder int       `gorm:"column:sort_order" json:"sort_order"`
+	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
+}
+
+// CreateLevel 创建一个关卡，返回新 ID。
+func (s *Store) CreateLevel(ctx context.Context, name, lang, description string, sortOrder int) (int64, error) {
+	lv := Level{Name: name, Lang: lang, Description: description, SortOrder: sortOrder}
+	if err := s.db.WithContext(ctx).Create(&lv).Error; err != nil {
+		return 0, err
+	}
+	return lv.ID, nil
+}
+
+// UpdateLevel 更新关卡的名称、描述、排序。
+func (s *Store) UpdateLevel(ctx context.Context, id int64, name, description string, sortOrder int) error {
+	return s.db.WithContext(ctx).Model(&Level{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"name":        name,
+			"description": description,
+			"sort_order":  sortOrder,
+			"updated_at":  gorm.Expr("now()"),
+		}).Error
+}
+
+// DeleteLevel 删除关卡（级联删除 level_exams）。
+func (s *Store) DeleteLevel(ctx context.Context, id int64) error {
+	return s.db.WithContext(ctx).Delete(&Level{}, id).Error
+}
+
+// GetLevel 返回单个关卡。
+func (s *Store) GetLevel(ctx context.Context, id int64) (*Level, error) {
+	var lv Level
+	err := s.db.WithContext(ctx).Where("id = ?", id).Take(&lv).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &lv, nil
+}
+
+// ListLevels 返回全部关卡，按 sort_order、id 排序。
+func (s *Store) ListLevels(ctx context.Context) ([]Level, error) {
+	levels := make([]Level, 0)
+	err := s.db.WithContext(ctx).
+		Order("sort_order ASC, id ASC").
+		Find(&levels).Error
+	return levels, err
+}
+
+// ListLevelExams 返回关卡关联的 exam 列表（附带 exam 的 lang/source_url），按 sort_order 排序。
+// 已软删除的 exam 不返回。
+func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamInfo, error) {
+	rows := make([]LevelExamInfo, 0)
+	err := s.db.WithContext(ctx).
+		Table("level_exams le").
+		Select("le.exam_id, le.sort_order, le.created_at, j.lang, j.source_url").
+		Joins("JOIN listening_jobs j ON j.exam_id = le.exam_id AND j.deleted_at IS NULL").
+		Where("le.level_id = ?", levelID).
+		Order("le.sort_order ASC, le.id ASC").
+		Scan(&rows).Error
+	return rows, err
+}
+
+// AddLevelExam 给关卡添加一个 exam；已存在则更新 sort_order。
+func (s *Store) AddLevelExam(ctx context.Context, levelID int64, examID string, sortOrder int) error {
+	row := LevelExam{LevelID: levelID, ExamID: examID, SortOrder: sortOrder}
+	return s.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "level_id"}, {Name: "exam_id"}},
+		DoUpdates: clause.Assignments(map[string]any{"sort_order": sortOrder}),
+	}).Create(&row).Error
+}
+
+// RemoveLevelExam 从关卡移除一个 exam。
+func (s *Store) RemoveLevelExam(ctx context.Context, levelID int64, examID string) error {
+	return s.db.WithContext(ctx).
+		Where("level_id = ? AND exam_id = ?", levelID, examID).
+		Delete(&LevelExam{}).Error
+}
+
+// AvailableExam 是可加入关卡的听力 exam（已构建完成）。
+type AvailableExam struct {
+	ExamID    string    `gorm:"column:exam_id" json:"exam_id"`
+	Lang      string    `gorm:"column:lang" json:"lang"`
+	SourceURL string    `gorm:"column:source_url" json:"source_url"`
+	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
+}
+
+// ListAvailableExams 返回所有已构建完成、且未被指定关卡关联、未软删除的听力 exam。
+func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]AvailableExam, error) {
+	rows := make([]AvailableExam, 0)
+	q := s.db.WithContext(ctx).Table("listening_jobs").
+		Select("DISTINCT exam_id, lang, source_url, created_at").
+		Where("status = ? AND deleted_at IS NULL", "built").
+		Where("exam_id NOT IN (?)",
+			s.db.Table("level_exams").Select("exam_id").Where("level_id = ?", levelID)).
+		Order("created_at DESC")
+	if err := q.Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
 
 // Store 持有 gorm 数据库连接。
 type Store struct {
@@ -166,6 +305,16 @@ func (s *Store) FailListeningJob(ctx context.Context, jobID, errorMsg string) er
 		}).Error
 }
 
+// SoftDeleteListeningJob 软删除听力任务（标记 deleted_at，不删除文件）。
+func (s *Store) SoftDeleteListeningJob(ctx context.Context, jobID string) error {
+	return s.db.WithContext(ctx).Model(&ListeningJob{}).
+		Where("job_id = ? AND deleted_at IS NULL", jobID).
+		Updates(map[string]any{
+			"deleted_at": gorm.Expr("now()"),
+			"updated_at": gorm.Expr("now()"),
+		}).Error
+}
+
 // AppendListeningLog 追加一条任务日志，同时刷新 listening_jobs.last_log_at。
 func (s *Store) AppendListeningLog(ctx context.Context, jobID, stage, level, message string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -179,25 +328,26 @@ func (s *Store) AppendListeningLog(ctx context.Context, jobID, stage, level, mes
 	})
 }
 
-// ListListeningJobs 返回最近 N 条任务。
+// ListListeningJobs 返回最近 N 条任务（已软删除的除外）。
 func (s *Store) ListListeningJobs(ctx context.Context, limit int) ([]ListeningJob, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	var jobs []ListeningJob
+	jobs := make([]ListeningJob, 0)
 	err := s.db.WithContext(ctx).Table("listening_jobs").
 		Select(`job_id, exam_id, lang, source_url, status,
 			COALESCE(manifest_path,'') AS manifest_path,
 			COALESCE(log_path,'') AS log_path,
 			COALESCE(error_msg,'') AS error_msg,
 			last_log_at, created_at, updated_at`).
+		Where("deleted_at IS NULL").
 		Order("updated_at DESC").
 		Limit(limit).
 		Find(&jobs).Error
 	return jobs, err
 }
 
-// ListeningJobDetail 返回单个任务及其最近日志。
+// ListeningJobDetail 返回单个任务及其最近日志（已软删除的返回 not found）。
 func (s *Store) ListeningJobDetail(ctx context.Context, jobID string) (*ListeningJob, []ListeningJobLog, error) {
 	var j ListeningJob
 	err := s.db.WithContext(ctx).Table("listening_jobs").
@@ -206,7 +356,7 @@ func (s *Store) ListeningJobDetail(ctx context.Context, jobID string) (*Listenin
 			COALESCE(log_path,'') AS log_path,
 			COALESCE(error_msg,'') AS error_msg,
 			last_log_at, created_at, updated_at`).
-		Where("job_id = ?", jobID).
+		Where("job_id = ? AND deleted_at IS NULL", jobID).
 		Take(&j).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -215,7 +365,7 @@ func (s *Store) ListeningJobDetail(ctx context.Context, jobID string) (*Listenin
 		return nil, nil, err
 	}
 
-	var logs []ListeningJobLog
+	logs := make([]ListeningJobLog, 0)
 	err = s.db.WithContext(ctx).Table("listening_job_logs").
 		Select(`COALESCE(stage,'') AS stage, COALESCE(level,'') AS level, message, created_at`).
 		Where("job_id = ?", jobID).
@@ -299,7 +449,7 @@ func (s *Store) BuildStatus(ctx context.Context, version string) (*Version, []Lo
 		return nil, nil, err
 	}
 
-	var logs []LogEntry
+	logs := make([]LogEntry, 0)
 	err = s.db.WithContext(ctx).Table("build_logs").
 		Select("stage, COALESCE(level,'info') AS level, message, created_at").
 		Where("version = ?", version).

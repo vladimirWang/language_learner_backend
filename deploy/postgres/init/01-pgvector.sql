@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS listening_jobs (
 );
 -- 增量兼容：已有库补列
 ALTER TABLE listening_jobs ADD COLUMN IF NOT EXISTS last_log_at TIMESTAMPTZ;
+ALTER TABLE listening_jobs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS listening_job_logs (
     log_id    BIGSERIAL PRIMARY KEY,
@@ -68,3 +69,24 @@ CREATE TABLE IF NOT EXISTS listening_job_logs (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_listening_job_logs_job ON listening_job_logs(job_id, log_id);
+
+-- 关卡配置：管理员维护学习关卡，每个关卡关联多个听力 exam。
+CREATE TABLE IF NOT EXISTS levels (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL,
+    lang        TEXT NOT NULL DEFAULT 'de',
+    description TEXT,
+    sort_order  INT NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ DEFAULT now(),
+    updated_at  TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS level_exams (
+    id          BIGSERIAL PRIMARY KEY,
+    level_id    BIGINT NOT NULL REFERENCES levels(id) ON DELETE CASCADE,
+    exam_id     TEXT NOT NULL,
+    sort_order  INT NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(level_id, exam_id)
+);
+CREATE INDEX IF NOT EXISTS idx_level_exams_level ON level_exams(level_id, sort_order);

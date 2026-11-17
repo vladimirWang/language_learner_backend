@@ -60,6 +60,18 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/listening/job/{jobId}/download", h.listeningDownload)
 	mux.HandleFunc("GET /api/listening/job/{jobId}/archive", h.listeningArchive)
 	mux.HandleFunc("POST /api/listening/job/{jobId}/answers", h.listeningUpdateAnswers)
+	mux.HandleFunc("DELETE /api/listening/job/{jobId}", h.deleteListeningJob)
+
+	// 关卡配置
+	mux.HandleFunc("GET /api/levels", h.listLevels)
+	mux.HandleFunc("POST /api/levels", h.createLevel)
+	mux.HandleFunc("GET /api/levels/{id}", h.getLevel)
+	mux.HandleFunc("PUT /api/levels/{id}", h.updateLevel)
+	mux.HandleFunc("DELETE /api/levels/{id}", h.deleteLevel)
+	mux.HandleFunc("GET /api/levels/{id}/exams", h.listLevelExams)
+	mux.HandleFunc("POST /api/levels/{id}/exams", h.addLevelExam)
+	mux.HandleFunc("DELETE /api/levels/{id}/exams/{examId}", h.removeLevelExam)
+	mux.HandleFunc("GET /api/levels/{id}/exams/available", h.listAvailableExams)
 	return h.logRequests(mux)
 }
 
@@ -867,6 +879,21 @@ func (h *Handler) listeningUpdateAnswers(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// deleteListeningJob 软删除听力任务（标记 deleted_at，不删除产物文件）。
+func (h *Handler) deleteListeningJob(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	if jobID == "" {
+		writeError(w, http.StatusBadRequest, "missing jobId")
+		return
+	}
+	if err := h.store.SoftDeleteListeningJob(r.Context(), jobID); err != nil {
+		h.logger.Printf("soft delete listening job %s: %v", jobID, err)
+		writeError(w, http.StatusInternalServerError, "delete job failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // parseAnswerCSV 解析答案 CSV：题号,答案。
 // 答案支持：选择题 A/B/C/D；判断题 richtig/falsch（或缩写 r/f、true/false）。
 // 归一化后存储：A/B/C/D（选择）、R（正确）/F（错误）。忽略表头与非法行。
@@ -923,4 +950,207 @@ func normalizeAnswer(raw string) (string, error) {
 	default:
 		return "", fmt.Errorf("不支持的答案 %q（支持 A/B/C/D 或 richtig/falsch）", raw)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 关卡配置
+// ---------------------------------------------------------------------------
+
+type levelUpsert struct {
+	Name        string `json:"name"`
+	Lang        string `json:"lang"`
+	Description string `json:"description"`
+	SortOrder   int    `json:"sort_order"`
+}
+
+func parseLevelID(r *http.Request) (int64, error) {
+	return strconv.ParseInt(r.PathValue("id"), 10, 64)
+}
+
+// listLevels 返回全部关卡。
+func (h *Handler) listLevels(w http.ResponseWriter, r *http.Request) {
+	levels, err := h.store.ListLevels(r.Context())
+	if err != nil {
+		h.logger.Printf("list levels: %v", err)
+		writeError(w, http.StatusInternalServerError, "list levels failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"levels": levels})
+}
+
+// createLevel 创建关卡。
+func (h *Handler) createLevel(w http.ResponseWriter, r *http.Request) {
+	var req levelUpsert
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Lang = strings.TrimSpace(req.Lang)
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if req.Lang == "" {
+		req.Lang = "de"
+	}
+	if !langPattern.MatchString(req.Lang) {
+		writeError(w, http.StatusBadRequest, "invalid lang")
+		return
+	}
+	id, err := h.store.CreateLevel(r.Context(), req.Name, req.Lang, req.Description, req.SortOrder)
+	if err != nil {
+		h.logger.Printf("create level: %v", err)
+		writeError(w, http.StatusInternalServerError, "create level failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id})
+}
+
+// getLevel 返回关卡详情（含关联的 exam 列表）。
+func (h *Handler) getLevel(w http.ResponseWriter, r *http.Request) {
+	id, err := parseLevelID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid level id")
+		return
+	}
+	lv, err := h.store.GetLevel(r.Context(), id)
+	if err != nil {
+		h.logger.Printf("get level: %v", err)
+		writeError(w, http.StatusInternalServerError, "get level failed")
+		return
+	}
+	if lv == nil {
+		writeError(w, http.StatusNotFound, "level not found")
+		return
+	}
+	exams, err := h.store.ListLevelExams(r.Context(), id)
+	if err != nil {
+		h.logger.Printf("list level exams: %v", err)
+		writeError(w, http.StatusInternalServerError, "list level exams failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"level": lv, "exams": exams})
+}
+
+// updateLevel 更新关卡。
+func (h *Handler) updateLevel(w http.ResponseWriter, r *http.Request) {
+	id, err := parseLevelID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid level id")
+		return
+	}
+	var req levelUpsert
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if err := h.store.UpdateLevel(r.Context(), id, req.Name, req.Description, req.SortOrder); err != nil {
+		h.logger.Printf("update level: %v", err)
+		writeError(w, http.StatusInternalServerError, "update level failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// deleteLevel 删除关卡。
+func (h *Handler) deleteLevel(w http.ResponseWriter, r *http.Request) {
+	id, err := parseLevelID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid level id")
+		return
+	}
+	if err := h.store.DeleteLevel(r.Context(), id); err != nil {
+		h.logger.Printf("delete level: %v", err)
+		writeError(w, http.StatusInternalServerError, "delete level failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// listLevelExams 返回关卡关联的 exam 列表。
+func (h *Handler) listLevelExams(w http.ResponseWriter, r *http.Request) {
+	id, err := parseLevelID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid level id")
+		return
+	}
+	exams, err := h.store.ListLevelExams(r.Context(), id)
+	if err != nil {
+		h.logger.Printf("list level exams: %v", err)
+		writeError(w, http.StatusInternalServerError, "list level exams failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"exams": exams})
+}
+
+type addExamReq struct {
+	ExamID    string `json:"exam_id"`
+	SortOrder int    `json:"sort_order"`
+}
+
+// addLevelExam 给关卡添加一个 exam。
+func (h *Handler) addLevelExam(w http.ResponseWriter, r *http.Request) {
+	id, err := parseLevelID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid level id")
+		return
+	}
+	var req addExamReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	req.ExamID = strings.TrimSpace(req.ExamID)
+	if req.ExamID == "" {
+		writeError(w, http.StatusBadRequest, "exam_id is required")
+		return
+	}
+	if err := h.store.AddLevelExam(r.Context(), id, req.ExamID, req.SortOrder); err != nil {
+		h.logger.Printf("add level exam: %v", err)
+		writeError(w, http.StatusInternalServerError, "add level exam failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// removeLevelExam 从关卡移除一个 exam。
+func (h *Handler) removeLevelExam(w http.ResponseWriter, r *http.Request) {
+	id, err := parseLevelID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid level id")
+		return
+	}
+	examID := r.PathValue("examId")
+	if examID == "" {
+		writeError(w, http.StatusBadRequest, "examId is required")
+		return
+	}
+	if err := h.store.RemoveLevelExam(r.Context(), id, examID); err != nil {
+		h.logger.Printf("remove level exam: %v", err)
+		writeError(w, http.StatusInternalServerError, "remove level exam failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// listAvailableExams 返回可加入关卡的已完成听力 exam。
+func (h *Handler) listAvailableExams(w http.ResponseWriter, r *http.Request) {
+	id, err := parseLevelID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid level id")
+		return
+	}
+	exams, err := h.store.ListAvailableExams(r.Context(), id)
+	if err != nil {
+		h.logger.Printf("list available exams: %v", err)
+		writeError(w, http.StatusInternalServerError, "list available exams failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"exams": exams})
 }
