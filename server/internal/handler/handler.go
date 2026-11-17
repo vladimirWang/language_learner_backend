@@ -390,7 +390,8 @@ func (h *Handler) listeningImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 入库 pending
-	if err := h.store.CreateListeningJob(r.Context(), jobID, examID, lang, url); err != nil {
+	hasAnswers := answersPath != ""
+	if err := h.store.CreateListeningJob(r.Context(), jobID, examID, lang, url, hasAnswers); err != nil {
 		h.logger.Printf("create listening job: %v", err)
 		writeError(w, http.StatusInternalServerError, "create job failed")
 		return
@@ -873,6 +874,11 @@ func (h *Handler) listeningUpdateAnswers(w http.ResponseWriter, r *http.Request)
 		updatedList = append(updatedList, qBrief{Number: n, Answer: answerMap[n]})
 	}
 
+	// 上传答案后标记该素材已绑定答案
+	if err := h.store.SetListeningJobHasAnswers(r.Context(), jobID); err != nil {
+		h.logger.Printf("set has_answers for job %s: %v", jobID, err)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"updated_count": updated,
 		"answers":       updatedList,
@@ -959,17 +965,22 @@ func normalizeAnswer(raw string) (string, error) {
 type levelUpsert struct {
 	Name        string `json:"name"`
 	Lang        string `json:"lang"`
+	Difficulty  string `json:"difficulty"`
 	Description string `json:"description"`
 	SortOrder   int    `json:"sort_order"`
+	Active      bool   `json:"active"`
 }
+
+var validDifficulties = map[string]bool{"A1": true, "A2": true, "B1": true, "B2": true}
 
 func parseLevelID(r *http.Request) (int64, error) {
 	return strconv.ParseInt(r.PathValue("id"), 10, 64)
 }
 
-// listLevels 返回全部关卡。
+// listLevels 返回关卡列表。?active_only=true 时只返回已生效的关卡。
 func (h *Handler) listLevels(w http.ResponseWriter, r *http.Request) {
-	levels, err := h.store.ListLevels(r.Context())
+	activeOnly := r.URL.Query().Get("active_only") == "true"
+	levels, err := h.store.ListLevels(r.Context(), activeOnly)
 	if err != nil {
 		h.logger.Printf("list levels: %v", err)
 		writeError(w, http.StatusInternalServerError, "list levels failed")
@@ -987,6 +998,7 @@ func (h *Handler) createLevel(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	req.Lang = strings.TrimSpace(req.Lang)
+	req.Difficulty = strings.ToUpper(strings.TrimSpace(req.Difficulty))
 	if req.Name == "" {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
@@ -998,7 +1010,14 @@ func (h *Handler) createLevel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid lang")
 		return
 	}
-	id, err := h.store.CreateLevel(r.Context(), req.Name, req.Lang, req.Description, req.SortOrder)
+	if req.Difficulty == "" {
+		req.Difficulty = "A1"
+	}
+	if !validDifficulties[req.Difficulty] {
+		writeError(w, http.StatusBadRequest, "invalid difficulty (A1/A2/B1/B2)")
+		return
+	}
+	id, err := h.store.CreateLevel(r.Context(), req.Name, req.Lang, req.Difficulty, req.Description, req.SortOrder)
 	if err != nil {
 		h.logger.Printf("create level: %v", err)
 		writeError(w, http.StatusInternalServerError, "create level failed")
@@ -1046,13 +1065,21 @@ func (h *Handler) updateLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
+	req.Difficulty = strings.ToUpper(strings.TrimSpace(req.Difficulty))
 	if req.Name == "" {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	if err := h.store.UpdateLevel(r.Context(), id, req.Name, req.Description, req.SortOrder); err != nil {
+	if req.Difficulty == "" {
+		req.Difficulty = "A1"
+	}
+	if !validDifficulties[req.Difficulty] {
+		writeError(w, http.StatusBadRequest, "invalid difficulty (A1/A2/B1/B2)")
+		return
+	}
+	if err := h.store.UpdateLevel(r.Context(), id, req.Name, req.Difficulty, req.Description, req.SortOrder, req.Active); err != nil {
 		h.logger.Printf("update level: %v", err)
-		writeError(w, http.StatusInternalServerError, "update level failed")
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})

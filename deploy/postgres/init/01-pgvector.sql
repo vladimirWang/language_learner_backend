@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS listening_jobs (
 -- 增量兼容：已有库补列
 ALTER TABLE listening_jobs ADD COLUMN IF NOT EXISTS last_log_at TIMESTAMPTZ;
 ALTER TABLE listening_jobs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE listening_jobs ADD COLUMN IF NOT EXISTS has_answers BOOLEAN NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS listening_job_logs (
     log_id    BIGSERIAL PRIMARY KEY,
@@ -75,11 +76,15 @@ CREATE TABLE IF NOT EXISTS levels (
     id          BIGSERIAL PRIMARY KEY,
     name        TEXT NOT NULL,
     lang        TEXT NOT NULL DEFAULT 'de',
+    difficulty  TEXT NOT NULL DEFAULT 'A1',
     description TEXT,
     sort_order  INT NOT NULL DEFAULT 0,
     created_at  TIMESTAMPTZ DEFAULT now(),
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
+
+ALTER TABLE levels ADD COLUMN IF NOT EXISTS difficulty TEXT NOT NULL DEFAULT 'A1';
+ALTER TABLE levels ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS level_exams (
     id          BIGSERIAL PRIMARY KEY,

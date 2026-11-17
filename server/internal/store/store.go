@@ -38,6 +38,7 @@ type ListeningJob struct {
 	ErrorMsg     string     `gorm:"column:error_msg" json:"error_msg"`
 	LastLogAt    *time.Time `gorm:"column:last_log_at" json:"last_log_at"`
 	DeletedAt    *time.Time `gorm:"column:deleted_at" json:"-"`
+	HasAnswers   bool       `gorm:"column:has_answers" json:"has_answers"`
 	CreatedAt    time.Time  `gorm:"column:created_at" json:"created_at"`
 	UpdatedAt    time.Time  `gorm:"column:updated_at" json:"updated_at"`
 }
@@ -75,6 +76,8 @@ type Level struct {
 	ID          int64     `gorm:"primaryKey;column:id" json:"id"`
 	Name        string    `gorm:"column:name" json:"name"`
 	Lang        string    `gorm:"column:lang" json:"lang"`
+	Difficulty  string    `gorm:"column:difficulty" json:"difficulty"`
+	Active      bool      `gorm:"column:active" json:"active"`
 	Description string    `gorm:"column:description" json:"description"`
 	SortOrder   int       `gorm:"column:sort_order" json:"sort_order"`
 	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
@@ -104,24 +107,59 @@ type LevelExamInfo struct {
 }
 
 // CreateLevel 创建一个关卡，返回新 ID。
-func (s *Store) CreateLevel(ctx context.Context, name, lang, description string, sortOrder int) (int64, error) {
-	lv := Level{Name: name, Lang: lang, Description: description, SortOrder: sortOrder}
+func (s *Store) CreateLevel(ctx context.Context, name, lang, difficulty, description string, sortOrder int) (int64, error) {
+	lv := Level{Name: name, Lang: lang, Difficulty: difficulty, Description: description, SortOrder: sortOrder}
 	if err := s.db.WithContext(ctx).Create(&lv).Error; err != nil {
 		return 0, err
 	}
 	return lv.ID, nil
 }
 
-// UpdateLevel 更新关卡的名称、描述、排序。
-func (s *Store) UpdateLevel(ctx context.Context, id int64, name, description string, sortOrder int) error {
-	return s.db.WithContext(ctx).Model(&Level{}).
-		Where("id = ?", id).
-		Updates(map[string]any{
-			"name":        name,
-			"description": description,
-			"sort_order":  sortOrder,
-			"updated_at":  gorm.Expr("now()"),
-		}).Error
+// UpdateLevel 更新关卡的名称、难度、描述、排序、生效状态。
+// 设置 active=true 时，要求该关卡已关联至少一个 exam。
+func (s *Store) UpdateLevel(ctx context.Context, id int64, name, difficulty, description string, sortOrder int, active bool) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if active {
+			var cnt int64
+			if err := tx.Table("level_exams").Where("level_id = ?", id).Count(&cnt).Error; err != nil {
+				return err
+			}
+			if cnt == 0 {
+				return errors.New("无法生效：该关卡还没有关联任何题目")
+			}
+		}
+		return tx.Model(&Level{}).
+			Where("id = ?", id).
+			Updates(map[string]any{
+				"name":        name,
+				"difficulty":  difficulty,
+				"description": description,
+				"sort_order":  sortOrder,
+				"active":      active,
+				"updated_at":  gorm.Expr("now()"),
+			}).Error
+	})
+}
+
+// SetLevelActive 单独切换关卡生效状态；生效时校验必须有关联题目。
+func (s *Store) SetLevelActive(ctx context.Context, id int64, active bool) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if active {
+			var cnt int64
+			if err := tx.Table("level_exams").Where("level_id = ?", id).Count(&cnt).Error; err != nil {
+				return err
+			}
+			if cnt == 0 {
+				return errors.New("无法生效：该关卡还没有关联任何题目")
+			}
+		}
+		return tx.Model(&Level{}).
+			Where("id = ?", id).
+			Updates(map[string]any{
+				"active":     active,
+				"updated_at": gorm.Expr("now()"),
+			}).Error
+	})
 }
 
 // DeleteLevel 删除关卡（级联删除 level_exams）。
@@ -142,12 +180,15 @@ func (s *Store) GetLevel(ctx context.Context, id int64) (*Level, error) {
 	return &lv, nil
 }
 
-// ListLevels 返回全部关卡，按 sort_order、id 排序。
-func (s *Store) ListLevels(ctx context.Context) ([]Level, error) {
+// ListLevels 返回关卡列表，按 sort_order、id 排序。
+// activeOnly=true 时只返回已生效的关卡（供 client 端使用）。
+func (s *Store) ListLevels(ctx context.Context, activeOnly bool) ([]Level, error) {
 	levels := make([]Level, 0)
-	err := s.db.WithContext(ctx).
-		Order("sort_order ASC, id ASC").
-		Find(&levels).Error
+	q := s.db.WithContext(ctx).Order("sort_order ASC, id ASC")
+	if activeOnly {
+		q = q.Where("active = ?", true)
+	}
+	err := q.Find(&levels).Error
 	return levels, err
 }
 
@@ -189,12 +230,12 @@ type AvailableExam struct {
 	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
 }
 
-// ListAvailableExams 返回所有已构建完成、且未被指定关卡关联、未软删除的听力 exam。
+// ListAvailableExams 返回所有已构建完成、且未被指定关卡关联、未软删除、已绑定答案的听力 exam。
 func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]AvailableExam, error) {
 	rows := make([]AvailableExam, 0)
 	q := s.db.WithContext(ctx).Table("listening_jobs").
 		Select("DISTINCT exam_id, lang, source_url, created_at").
-		Where("status = ? AND deleted_at IS NULL", "built").
+		Where("status = ? AND deleted_at IS NULL AND has_answers = ?", "built", true).
 		Where("exam_id NOT IN (?)",
 			s.db.Table("level_exams").Select("exam_id").Where("level_id = ?", levelID)).
 		Order("created_at DESC")
@@ -253,13 +294,14 @@ func (s *Store) Ping(ctx context.Context) error {
 // ---------------------------------------------------------------------------
 
 // CreateListeningJob 登记一次听力导入任务。
-func (s *Store) CreateListeningJob(ctx context.Context, jobID, examID, lang, sourceURL string) error {
+func (s *Store) CreateListeningJob(ctx context.Context, jobID, examID, lang, sourceURL string, hasAnswers bool) error {
 	job := ListeningJob{
-		JobID:     jobID,
-		ExamID:    examID,
-		Lang:      lang,
-		SourceURL: sourceURL,
-		Status:    "pending",
+		JobID:      jobID,
+		ExamID:     examID,
+		Lang:       lang,
+		SourceURL:  sourceURL,
+		Status:     "pending",
+		HasAnswers: hasAnswers,
 	}
 	return s.db.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "job_id"}},
@@ -268,6 +310,7 @@ func (s *Store) CreateListeningJob(ctx context.Context, jobID, examID, lang, sou
 			"lang":          job.Lang,
 			"source_url":    job.SourceURL,
 			"status":        "pending",
+			"has_answers":   hasAnswers,
 			"error_msg":     nil,
 			"manifest_path": nil,
 			"log_path":      nil,
@@ -312,6 +355,16 @@ func (s *Store) SoftDeleteListeningJob(ctx context.Context, jobID string) error 
 		Updates(map[string]any{
 			"deleted_at": gorm.Expr("now()"),
 			"updated_at": gorm.Expr("now()"),
+		}).Error
+}
+
+// SetListeningJobHasAnswers 标记该听力素材已绑定答案。
+func (s *Store) SetListeningJobHasAnswers(ctx context.Context, jobID string) error {
+	return s.db.WithContext(ctx).Model(&ListeningJob{}).
+		Where("job_id = ?", jobID).
+		Updates(map[string]any{
+			"has_answers": true,
+			"updated_at":  gorm.Expr("now()"),
 		}).Error
 }
 
