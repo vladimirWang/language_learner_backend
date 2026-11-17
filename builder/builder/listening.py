@@ -328,7 +328,33 @@ def _download_best(url: str, out_dir: Path, cookies: Path | None) -> Path:
     ]
     if not candidates:
         raise ListeningError("下载完成后没有找到媒体文件")
-    return max(candidates, key=lambda path: path.stat().st_size)
+    media = max(candidates, key=lambda path: path.stat().st_size)
+
+    # 分离下载的视频流和音频流可能时间戳不匹配（B站常见），
+    # 导致画面倍速而音频正常。重新生成 PTS 并强制同步。
+    if _has_video_stream(media):
+        _sync_av(media)
+    return media
+
+
+def _sync_av(media: Path) -> None:
+    """重新生成时间戳并强制音视频同步，覆盖原文件。"""
+    tmp = media.with_suffix(".synced" + media.suffix)
+    try:
+        _run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(media),
+            "-c", "copy",
+            "-fflags", "+genpts",
+            "-async", "1",
+            "-movflags", "+faststart",
+            str(tmp),
+        ])
+        tmp.replace(media)
+    except ListeningError as e:
+        logger.warning("音视频同步失败，使用原始文件：%s", e)
+        if tmp.exists():
+            tmp.unlink()
 
 
 def _probe_duration(path: Path) -> float:
