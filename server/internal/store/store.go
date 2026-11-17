@@ -32,10 +32,10 @@ type ListeningJob struct {
 	Status       string    `json:"status"`
 	ManifestPath string    `json:"manifest_path"`
 	LogPath      string    `json:"log_path"`
-	ErrorMsg     string    `json:"error_msg"`
-	LastLogAt    time.Time `json:"last_log_at,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ErrorMsg     string     `json:"error_msg"`
+	LastLogAt    *time.Time `json:"last_log_at"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
 }
 
 // ListeningJobLog 对应 listening_job_logs 一行。

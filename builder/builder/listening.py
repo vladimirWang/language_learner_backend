@@ -43,6 +43,7 @@ class Segment:
     start: float
     end: float
     text: str
+    speaker: str | None = None  # 对话场景下的 A/B/C；独白为 None
 
 
 def import_from_url(
@@ -92,6 +93,11 @@ def import_from_url(
     segments = _transcribe(wav, work_root, model_name, target_lang)
     logger.info("转写完成 segments=%d", len(segments))
 
+    logger.info("开始说话人分离（对话题用 A/B/C 区分）")
+    speaker_count = assign_speakers(segments, wav)
+    is_dialogue = speaker_count > 1
+    logger.info("说话人分离完成 speakers=%d dialogue=%s", speaker_count, is_dialogue)
+
     questions = split_questions(segments, duration)
     if not questions:
         raise ListeningError("没有识别到题目分界（Nummer/Frage/Aufgabe），请检查音频或人工校对转写")
@@ -127,19 +133,22 @@ def import_from_url(
         "title": title or exam_id,
         "source_url": url,
         "media_has_video": is_video,
+        "media_file": f"source/{media.name}",
         "model": model_name,
         "duration": round(duration, 2),
         "ocr_enabled": ocr_enabled,
+        "speaker_count": speaker_count,
+        "is_dialogue": is_dialogue,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "question_count": len(questions),
         "questions": questions,
     }
     manifest_path = exam_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    transcript_path = exam_dir / "transcript.json"
-    transcript_path.write_text(
-        json.dumps([seg.__dict__ for seg in segments], ensure_ascii=False, indent=1),
-        encoding="utf-8",
+
+    transcript_files = write_transcript_files(exam_dir, manifest, questions, segments)
+    logger.info(
+        "转写文件已写出：%s", ", ".join(path.name for path in transcript_files)
     )
     logger.info("导入完成 manifest=%s questions=%d", manifest_path, len(questions))
     return manifest_path
@@ -147,10 +156,10 @@ def import_from_url(
 
 def split_questions(segments: Iterable[Segment], duration: float) -> list[dict]:
     """按题号提示切分，返回题目列表；没有可用提示时返回空列表。"""
-    rows = list(segments)
+    rows_all = list(segments)
     cues: list[tuple[int, float]] = []
     seen: set[int] = set()
-    for row in rows:
+    for row in rows_all:
         match = CUE_RE.match(row.text)
         if not match:
             continue
@@ -169,9 +178,8 @@ def split_questions(segments: Iterable[Segment], duration: float) -> list[dict]:
         clip_end = max(clip_start + 1.0, end - 0.3)
         # 视频抽帧选每题中段（题干刚出、选项画面稳定）
         image_time = clip_start + (clip_end - clip_start) * 0.45
-        text = " ".join(
-            row.text for row in rows if start - 0.2 <= (row.start + row.end) / 2 < end - 0.2
-        ).strip()
+        rows = [row for row in rows_all if start - 0.2 <= (row.start + row.end) / 2 < end - 0.2]
+        question_speakers = sorted({row.speaker for row in rows if row.speaker})
         questions.append(
             {
                 "number": number,
@@ -181,12 +189,36 @@ def split_questions(segments: Iterable[Segment], duration: float) -> list[dict]:
                 "audio": f"audio/q{number:02d}.m4a",
                 "image": None,
                 "ocr_text": None,
-                "transcript": text,
+                "transcript": _join_with_speakers(rows),
+                "speakers": question_speakers,
                 "answer": None,
                 "options": [],
             }
         )
     return questions
+
+
+def _join_with_speakers(rows: list[Segment]) -> str:
+    """把题目内的 segment 拼成文本；一位以上说话人时按 A:/B: 分行标注。"""
+    speakers = {row.speaker for row in rows if row.speaker}
+    if len(speakers) < 2:
+        return " ".join(row.text for row in rows).strip()
+
+    lines: list[str] = []
+    current: str | None = None
+    buffer: list[str] = []
+    for row in rows:
+        who = row.speaker or "?"
+        if who != current:
+            if buffer and current:
+                lines.append(f"{current}: {' '.join(buffer)}")
+            current = who
+            buffer = [row.text]
+        else:
+            buffer.append(row.text)
+    if buffer and current:
+        lines.append(f"{current}: {' '.join(buffer)}")
+    return "\n".join(lines)
 
 
 def load_answers(path: Path) -> dict[int, str]:
@@ -307,12 +339,14 @@ def _to_wav(source: Path, target: Path) -> None:
     )
 
 
-def _read_wav(path: Path) -> np.ndarray:
+def _read_wav(path: Path) -> tuple[np.ndarray, int]:
     with wave.open(str(path), "rb") as handle:
         if handle.getsampwidth() != 2:
             raise ListeningError("仅支持 16bit PCM 音频")
+        sample_rate = handle.getframerate()
         frames = handle.readframes(handle.getnframes())
-    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    return audio, sample_rate
 
 
 def _transcribe(wav: Path, work_root: Path, model_name: str, language: str) -> list[Segment]:
@@ -321,7 +355,7 @@ def _transcribe(wav: Path, work_root: Path, model_name: str, language: str) -> l
     logger.info("加载 Whisper 模型 model=%s device=cpu compute=int8 cache=%s", model_name, cache)
     model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=str(cache))
     logger.info("Whisper 模型加载完成，开始转写（可能耗时较久）")
-    audio = _read_wav(wav)
+    audio, _sample_rate = _read_wav(wav)
     segments_iter, _info = model.transcribe(
         audio,
         language=language,
@@ -342,6 +376,252 @@ def _transcribe(wav: Path, work_root: Path, model_name: str, language: str) -> l
                         len(segments), seg.end)
     logger.info("转写完成 segments=%d", len(segments))
     return [seg for seg in segments if seg.text.strip()]
+
+
+def _pitch_hz(chunk: np.ndarray, sample_rate: int, fmin: float = 60.0, fmax: float = 350.0) -> float:
+    """自相关估计基频（Hz）；静音或不可靠时返回 0。"""
+    chunk = chunk - chunk.mean()
+    if chunk.size < sample_rate // 20 or not np.any(np.abs(chunk) > 1e-4):
+        return 0.0
+    corr = np.correlate(chunk, chunk, mode="full")[chunk.size - 1:]
+    min_lag = max(1, int(sample_rate / fmax))
+    max_lag = min(corr.size - 1, int(sample_rate / fmin))
+    if max_lag <= min_lag:
+        return 0.0
+    peak = int(np.argmax(corr[min_lag:max_lag])) + min_lag
+    if corr[peak] < 0.25 * corr[0]:
+        return 0.0
+    return float(sample_rate / peak)
+
+
+def _segment_feature(audio: np.ndarray, sample_rate: int, seg: Segment) -> np.ndarray | None:
+    """取 segment 中间 1 秒，返回 [基频, 频谱质心(kHz)]；无有效语音时返回 None。"""
+    start = int(seg.start * sample_rate)
+    end = int(seg.end * sample_rate)
+    if end - start < sample_rate // 10:
+        return None
+    chunk = audio[start:end]
+    mid = chunk.size // 2
+    half = min(chunk.size // 2, sample_rate // 2)
+    chunk = chunk[mid - half: mid + half]
+    if chunk.size < sample_rate // 20:
+        return None
+
+    pitch = _pitch_hz(chunk, sample_rate)
+    if pitch <= 0:
+        return None
+
+    spectrum = np.abs(np.fft.rfft(chunk * np.hanning(chunk.size)))
+    freqs = np.fft.rfftfreq(chunk.size, 1.0 / sample_rate)
+    total = float(spectrum.sum())
+    centroid = float((spectrum * freqs).sum() / total / 1000.0) if total > 0 else 0.0
+    return np.array([pitch, centroid], dtype=np.float64)
+
+
+def _kmeans(points: np.ndarray, k: int, iterations: int = 25) -> np.ndarray:
+    """极简 k-means（k-means++ 初始化），返回每个点的簇号。"""
+    n = points.shape[0]
+    if k <= 1 or n <= k:
+        return np.zeros(n, dtype=int)
+
+    rng = np.random.default_rng(0)
+    centers = [points[int(rng.integers(n))]]
+    for _ in range(1, k):
+        dist2 = np.min(
+            ((points[:, None, :] - np.array(centers)[None, :, :]) ** 2).sum(axis=2), axis=1
+        )
+        total = float(dist2.sum())
+        if total <= 0:
+            centers.append(points[int(rng.integers(n))])
+        else:
+            centers.append(points[int(rng.choice(n, p=dist2 / total))])
+    matrix = np.array(centers, dtype=np.float64)
+
+    labels = np.zeros(n, dtype=int)
+    for _ in range(iterations):
+        dist2 = ((points[:, None, :] - matrix[None, :, :]) ** 2).sum(axis=2)
+        labels = dist2.argmin(axis=1)
+        for j in range(k):
+            members = points[labels == j]
+            if members.shape[0]:
+                matrix[j] = members.mean(axis=0)
+    return labels
+
+
+def _silhouette(points: np.ndarray, labels: np.ndarray) -> float:
+    """平均轮廓系数，用于选择聚类数；越小越不可信。"""
+    uniq = np.unique(labels)
+    if uniq.size < 2:
+        return -1.0
+    scores: list[float] = []
+    for i in range(points.shape[0]):
+        own = points[labels == labels[i]]
+        if own.shape[0] <= 1:
+            continue
+        a = float(np.linalg.norm(own - points[i], axis=1).sum() / (own.shape[0] - 1))
+        b = min(
+            float(np.linalg.norm(points[labels == other] - points[i], axis=1).mean())
+            for other in uniq
+            if other != labels[i]
+        )
+        denom = max(a, b)
+        if denom > 0:
+            scores.append((b - a) / denom)
+    return float(np.mean(scores)) if scores else -1.0
+
+
+def assign_speakers(segments: list[Segment], wav: Path, max_speakers: int = 3) -> int:
+    """轻量说话人分离：基频 + 频谱质心聚类，对话场景给 segment 打 A/B/C 标签。
+
+    不依赖 pyannote（CPU 上更快、无需模型下载）。返回识别出的说话人数；
+    返回 1 表示独白，此时所有 segment.speaker 保持 None。
+    """
+    audio, sample_rate = _read_wav(wav)
+    features: list[np.ndarray] = []
+    holders: list[Segment] = []
+    for seg in segments:
+        feature = _segment_feature(audio, sample_rate, seg)
+        if feature is not None:
+            features.append(feature)
+            holders.append(seg)
+    if len(features) < 4:
+        return 1
+
+    matrix = np.array(features)
+    std = matrix.std(axis=0)
+    std[std < 1e-6] = 1.0
+    normalized = (matrix - matrix.mean(axis=0)) / std
+
+    best_labels: np.ndarray | None = None
+    best_score = -1.0
+    for k in range(2, max_speakers + 1):
+        labels = _kmeans(normalized, k)
+        counts = np.bincount(labels, minlength=k)
+        if counts.min() < max(2, int(len(labels) * 0.1)):
+            continue
+        score = _silhouette(normalized, labels)
+        if score > best_score:
+            best_score = score
+            best_labels = labels
+
+    if best_labels is None or best_score < 0.25:
+        logger.info("说话人分离置信度不足（score=%.2f），按独白处理", best_score)
+        return 1
+
+    order: list[int] = []
+    for label in best_labels:
+        if int(label) not in order:
+            order.append(int(label))
+    letter_of = {label: chr(ord("A") + index) for index, label in enumerate(order)}
+    for seg, label in zip(holders, best_labels):
+        seg.speaker = letter_of[int(label)]
+    return len(order)
+
+
+def _fmt_time(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds % 60:05.2f}"
+
+
+def _fmt_srt_time(seconds: float) -> str:
+    total_ms = int(round(seconds * 1000))
+    hours, total_ms = divmod(total_ms, 3_600_000)
+    minutes, total_ms = divmod(total_ms, 60_000)
+    secs, millis = divmod(total_ms, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def write_transcript_files(
+    exam_dir: Path,
+    manifest: dict,
+    questions: list[dict],
+    segments: list[Segment],
+) -> list[Path]:
+    """把转写内容写成独立文件：transcript.json / transcript.txt / transcript.srt。"""
+    span_by_number = {q["number"]: (q["start"], q["end"]) for q in questions}
+
+    # 1) 结构化 JSON：整段 segment + 每题聚合
+    payload = {
+        "exam_id": manifest["exam_id"],
+        "title": manifest["title"],
+        "lang": manifest["lang"],
+        "source_url": manifest["source_url"],
+        "media_file": manifest.get("media_file"),
+        "duration": manifest["duration"],
+        "speaker_count": manifest.get("speaker_count", 1),
+        "is_dialogue": manifest.get("is_dialogue", False),
+        "speakers": sorted({seg.speaker for seg in segments if seg.speaker}),
+        "segments": [
+            {
+                "start": seg.start,
+                "end": seg.end,
+                "speaker": seg.speaker,
+                "text": seg.text,
+            }
+            for seg in segments
+        ],
+        "questions": [
+            {
+                "number": q["number"],
+                "start": q["start"],
+                "end": q["end"],
+                "answer": q.get("answer"),
+                "speakers": q.get("speakers", []),
+                "transcript": q["transcript"],
+            }
+            for q in questions
+        ],
+    }
+    json_path = exam_dir / "transcript.json"
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 2) 人类可读文本：按题分段，对话按说话人分行
+    lines: list[str] = [
+        manifest["title"],
+        f"来源: {manifest['source_url']}",
+        f"时长: {_fmt_time(manifest['duration'])}",
+        "说话人: "
+        + (
+            "、".join(payload["speakers"])
+            if payload["is_dialogue"]
+            else "独白（未检测到多人对话）"
+        ),
+        "",
+    ]
+    for question in questions:
+        start, end = span_by_number[question["number"]]
+        lines.append("=" * 76)
+        lines.append(f"Frage {question['number']}  [{_fmt_time(start)} - {_fmt_time(end)}]")
+        lines.append("=" * 76)
+        rows = [
+            seg
+            for seg in segments
+            if start - 0.2 <= (seg.start + seg.end) / 2 < end - 0.2
+        ]
+        for seg in rows:
+            prefix = f"[{seg.speaker}] " if seg.speaker else ""
+            lines.append(f"{prefix}{_fmt_time(seg.start)} - {_fmt_time(seg.end)}  {seg.text}")
+        if not rows:
+            lines.append("（本题没有识别到转写文本）")
+        if question.get("answer"):
+            lines.append(f"答案: {question['answer']}")
+        lines.append("")
+    text_path = exam_dir / "transcript.txt"
+    text_path.write_text("\n".join(lines), encoding="utf-8")
+
+    # 3) SRT 字幕：带说话人前缀，方便播放器挂载
+    srt: list[str] = []
+    for index, seg in enumerate(segments, start=1):
+        prefix = f"[{seg.speaker}] " if seg.speaker else ""
+        srt.append(str(index))
+        srt.append(f"{_fmt_srt_time(seg.start)} --> {_fmt_srt_time(seg.end)}")
+        srt.append(f"{prefix}{seg.text}")
+        srt.append("")
+    srt_path = exam_dir / "transcript.srt"
+    srt_path.write_text("\n".join(srt), encoding="utf-8")
+
+    return [json_path, text_path, srt_path]
 
 
 def _cut_clip(source: Path, target: Path, start: float, end: float) -> None:

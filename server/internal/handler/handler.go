@@ -2,12 +2,15 @@
 package handler
 
 import (
+	"archive/zip"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -50,6 +53,9 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /api/listening/import", h.listeningImport)
 	mux.HandleFunc("GET /api/listening/jobs", h.listeningJobs)
 	mux.HandleFunc("GET /api/listening/job/{jobId}", h.listeningJobDetail)
+	mux.HandleFunc("GET /api/listening/job/{jobId}/files", h.listeningFiles)
+	mux.HandleFunc("GET /api/listening/job/{jobId}/download", h.listeningDownload)
+	mux.HandleFunc("GET /api/listening/job/{jobId}/archive", h.listeningArchive)
 	return h.logRequests(mux)
 }
 
@@ -452,6 +458,168 @@ func (h *Handler) listeningJobDetail(w http.ResponseWriter, r *http.Request) {
 		"job":  job,
 		"logs": logs,
 	})
+}
+
+// listeningFile 是导入任务产物的一个可下载文件。
+type listeningFile struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+var errListeningJobNotFound = errors.New("listening job not found")
+
+// listeningExamDir 定位任务产物目录：WORK_DIR/listening/{exam_id}。
+func (h *Handler) listeningExamDir(ctx context.Context, jobID string) (string, string, error) {
+	job, _, err := h.store.ListeningJobDetail(ctx, jobID)
+	if err != nil {
+		return "", "", err
+	}
+	if job == nil {
+		return "", "", errListeningJobNotFound
+	}
+	workRoot := os.Getenv("WORK_DIR")
+	if workRoot == "" {
+		workRoot = "work"
+	}
+	return filepath.Join(workRoot, "listening", job.ExamID), job.ExamID, nil
+}
+
+// listeningFiles 列出该任务目录下的全部产物（视频、音频、图片、转写文件等）。
+func (h *Handler) listeningFiles(w http.ResponseWriter, r *http.Request) {
+	dir, examID, err := h.listeningExamDir(r.Context(), r.PathValue("jobId"))
+	switch {
+	case errors.Is(err, errListeningJobNotFound):
+		writeError(w, http.StatusNotFound, "job not found")
+		return
+	case err != nil:
+		h.logger.Printf("locate listening dir: %v", err)
+		writeError(w, http.StatusInternalServerError, "locate exam dir failed")
+		return
+	}
+
+	files := make([]listeningFile, 0, 32)
+	walkErr := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return nil
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			return nil
+		}
+		files = append(files, listeningFile{
+			Path: filepath.ToSlash(rel),
+			Name: entry.Name(),
+			Size: info.Size(),
+		})
+		return nil
+	})
+	if walkErr != nil {
+		h.logger.Printf("walk listening dir %s: %v", dir, walkErr)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"exam_id": examID,
+		"files":   files,
+	})
+}
+
+// listeningDownload 下载单个产物文件，path 必须是任务目录内的相对路径。
+func (h *Handler) listeningDownload(w http.ResponseWriter, r *http.Request) {
+	dir, _, err := h.listeningExamDir(r.Context(), r.PathValue("jobId"))
+	switch {
+	case errors.Is(err, errListeningJobNotFound):
+		writeError(w, http.StatusNotFound, "job not found")
+		return
+	case err != nil:
+		h.logger.Printf("locate listening dir: %v", err)
+		writeError(w, http.StatusInternalServerError, "locate exam dir failed")
+		return
+	}
+
+	target, err := safeJoin(dir, r.URL.Query().Get("path"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	info, err := os.Stat(target)
+	if err != nil || info.IsDir() {
+		writeError(w, http.StatusNotFound, "file not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(target)))
+	http.ServeFile(w, r, target)
+}
+
+// listeningArchive 把整个任务目录打包成 zip 下载（视频 + 音频 + 图片 + 转写）。
+func (h *Handler) listeningArchive(w http.ResponseWriter, r *http.Request) {
+	dir, examID, err := h.listeningExamDir(r.Context(), r.PathValue("jobId"))
+	switch {
+	case errors.Is(err, errListeningJobNotFound):
+		writeError(w, http.StatusNotFound, "job not found")
+		return
+	case err != nil:
+		h.logger.Printf("locate listening dir: %v", err)
+		writeError(w, http.StatusInternalServerError, "locate exam dir failed")
+		return
+	}
+	if _, err := os.Stat(dir); err != nil {
+		writeError(w, http.StatusNotFound, "exam output not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set(
+		"Content-Disposition",
+		fmt.Sprintf("attachment; filename=%q", examID+".zip"),
+	)
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+
+	_ = filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return nil
+		}
+		src, openErr := os.Open(path)
+		if openErr != nil {
+			return nil
+		}
+		defer src.Close()
+		dst, createErr := zw.Create(filepath.ToSlash(rel))
+		if createErr != nil {
+			return nil
+		}
+		_, _ = io.Copy(dst, src)
+		return nil
+	})
+}
+
+// safeJoin 把相对路径安全地拼到 root 下，拒绝越界与绝对路径。
+func safeJoin(root, relative string) (string, error) {
+	if strings.TrimSpace(relative) == "" {
+		return "", errors.New("missing path")
+	}
+	clean := filepath.Clean(filepath.FromSlash(relative))
+	if filepath.IsAbs(clean) || clean == ".." ||
+		strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", errors.New("invalid path")
+	}
+	rootClean := filepath.Clean(root)
+	full := filepath.Join(rootClean, clean)
+	if full != rootClean && !strings.HasPrefix(full, rootClean+string(os.PathSeparator)) {
+		return "", errors.New("path escapes exam dir")
+	}
+	return full, nil
 }
 
 func saveUploadedFile(src io.ReadCloser, dst string) error {
