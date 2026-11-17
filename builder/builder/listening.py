@@ -21,7 +21,12 @@ from faster_whisper import WhisperModel
 logger = logging.getLogger(__name__)
 
 # 题目分界：Goethe/telc 听力里通常是 "Nummer 1"、"Frage 2"、"Aufgabe 3"。
-CUE_RE = re.compile(r"^\s*(nummer|frage|aufgabe)\s+(\d{1,3})\b", re.IGNORECASE)
+# \b 前缀避免把 Rufnummer / Zimmernummer 这类合成词误当成题号提示。
+CUE_RE = re.compile(r"\b(nummer|frage|aufgabe)\s+(\d{1,3}|[a-zäöüß]+)", re.IGNORECASE)
+# Teil 2 的判断题常只出现裸题号（"Sieben?"、"10."），单独一行时视为题号提示。
+BARE_NUM_RE = re.compile(r"^(\d{1,3}|[a-zäöüß]+)[\s\.\!\?,;:]*$", re.IGNORECASE)
+# 相邻题号跨越过大的阈值，超过则视为 ASR 误识别（如把 "Rufnummer 089" 听成第 89 题）
+MAX_CUE_JUMP = 10
 NUMBER_WORDS = {
     "eins": 1, "zwei": 2, "drei": 3, "vier": 4, "fünf": 5, "fuenf": 5,
     "sechs": 6, "sieben": 7, "acht": 8, "neun": 9, "zehn": 10,
@@ -117,15 +122,28 @@ def import_from_url(
         # 视频抽帧 + OCR（有视频轨时）
         if is_video:
             frame_path = image_dir / f"q{number:02d}.png"
+            image_time = question.pop("image_time")
             try:
-                _extract_frame(media, frame_path, question["image_time"])
+                _extract_frame(media, frame_path, image_time)
                 question["image"] = f"images/q{number:02d}.png"
             except ListeningError as e:
                 logger.debug("抽帧失败（跳过该题图）：%s", e)
                 question["image"] = None
-            question["image_time"] = question.pop("image_time")
+            question["image_time"] = image_time
             if ocr_enabled and HAS_TESSERACT and question["image"]:
-                question["ocr_text"] = _ocr_frame(frame_path, lang=target_lang)
+                ocr_text = _ocr_frame(frame_path, lang=target_lang)
+                # 最后一题时长会延伸到片尾，可能抽到"答案页"；命中时往前重抽一帧
+                if _looks_like_answer_key(ocr_text):
+                    retry_at = question["start"] + (image_time - question["start"]) * 0.4
+                    try:
+                        _extract_frame(media, frame_path, retry_at)
+                        ocr_text = _ocr_frame(frame_path, lang=target_lang)
+                        question["image_time"] = round(retry_at, 2)
+                    except ListeningError:
+                        pass
+                question["ocr_text"] = ocr_text
+                # 从 OCR 文本中提取选项（选择题 a/b/c/d）
+                question["options"] = _parse_options(ocr_text)
             elif ocr_enabled and not HAS_TESSERACT:
                 question["ocr_text"] = None
                 question["ocr_note"] = "tesseract 未安装，跳过 OCR"
@@ -185,21 +203,48 @@ def import_from_url(
 
 
 def split_questions(segments: Iterable[Segment], duration: float) -> list[dict]:
-    """按题号提示切分，返回题目列表；没有可用提示时返回空列表。"""
+    """按题号提示切分，返回题目列表；没有可用提示时返回空列表。
+
+    转写质量不稳时会出现两类问题，这里一并处理：
+    1. 一句里挤进多个题号（"Nummer 4, Nummer 5, Nummer 6"）→ 全部收集
+    2. 题号整句被漏识别（如 "Nummer 2" 没转出来）→ 相邻锚点之间等分补齐
+    """
     rows_all = list(segments)
-    cues: list[tuple[int, float]] = []
-    seen: set[int] = set()
+    anchors: list[tuple[int, float]] = []
+
+    def accept(number: int | None, start: float) -> None:
+        if number is None:
+            return
+        if anchors and number <= anchors[-1][0]:
+            return
+        if anchors and number > anchors[-1][0] + MAX_CUE_JUMP:
+            return
+        anchors.append((number, start))
+
     for row in rows_all:
-        match = CUE_RE.match(row.text)
-        if not match:
+        matches = list(CUE_RE.finditer(row.text))
+        if matches:
+            for match in matches:
+                accept(_cue_number(match.group(2)), row.start)
             continue
-        number = _cue_number(match.group(2))
-        if number is None or number in seen:
-            continue
-        if cues and number <= cues[-1][0]:
-            continue
-        seen.add(number)
-        cues.append((number, row.start))
+        # 整句只有一个裸题号（Teil 2 常见）
+        bare = BARE_NUM_RE.match(row.text.strip())
+        if bare:
+            accept(_cue_number(bare.group(1)), row.start)
+
+    if not anchors:
+        return []
+
+    # 相邻锚点之间按题号数量等分，补齐漏识别的题号
+    cues: list[tuple[int, float]] = []
+    for index, (number, start) in enumerate(anchors):
+        if index + 1 < len(anchors):
+            next_number, next_start = anchors[index + 1]
+            count = next_number - number
+            step = (next_start - start) / count
+            cues.extend((number + k, start + step * k) for k in range(count))
+        else:
+            cues.append((number, start))
 
     questions: list[dict] = []
     for index, (number, start) in enumerate(cues):
@@ -719,6 +764,92 @@ TESSERACT_LANG_MAP = {
     "de": "deu", "en": "eng", "ja": "jpn",
     "deu": "deu", "eng": "eng", "jpn": "jpn",
 }
+
+# 答案页特征（片尾常见 "Lösungen" 或「题号-答案」对照表），抽帧命中时要重抽
+ANSWER_KEY_RE = re.compile(r"lösungen", re.IGNORECASE)
+ANSWER_PAIR_RE = re.compile(r"\b\d{1,2}\s*[-–,.\s]?\s*[rRfFa-dA-D](?![a-zA-Zäöüß])")
+
+
+def _looks_like_answer_key(ocr_text: str | None) -> bool:
+    """判断 OCR 结果是否为答案页（片尾对照表），是则说明这帧抽错了位置。"""
+    if not ocr_text:
+        return False
+    if ANSWER_KEY_RE.search(ocr_text):
+        return True
+    # 至少两组「题号+答案」，避免把正文里的孤立匹配当成答案页
+    return len(ANSWER_PAIR_RE.findall(ocr_text)) >= 2
+
+# 选项标记：真实考卷复选框被 OCR 成 "[a |"、"a]"、"[b|"、"(2 |"（2 是 a 的误识别）等形态。
+# 匹配「可选左括号 + 字母 + 右括号/竖线」，另允许行首裸字母（"a zum Arzt ..."）。
+OPTION_MARK_RE = re.compile(
+    r"(?:[\[\(I|1]\s*)?([a-cA-C2])\s*[\]\|\)]\s*"
+    r"|^([a-cA-C])\s+"
+)
+# Teil 3 的选项常各占一行，行首即为标记（"12| von Freitag..."、"Ib| von Freitagabend..."、"al Morgen"）
+OPTION_LINE_RE = re.compile(
+    r"^(?:[\[\(I|1]?\s*([a-cA-C2])\s*[\]\|\)lL1]|([a-cA-C])\s+)"
+)
+# OCR 字符 → 选项下标（a/b/c；"2" 是被误识别的 a）
+OPTION_INDEX = {"a": 0, "2": 0, "b": 1, "c": 2, "d": 3}
+# 中文/德语卷面噪声行，命中则丢弃
+OPTION_NOISE_RE = re.compile(r"(was ist richtig|kreuzen sie|sie hören|deutsch lernen|transkriptionen)", re.IGNORECASE)
+
+
+def _clean_option(text: str) -> str:
+    """去掉选项文本两端的括号、竖线、空白与残留噪声。"""
+    cleaned = re.sub(r"[\[\]\|\)\(]+", " ", text).strip(" .-—_")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _parse_options(ocr_text: str | None) -> list[str]:
+    """从 OCR 文本里提取选择题选项（a/b/c），返回按字母顺序排列的选项文本。"""
+    if not ocr_text:
+        return []
+
+    best: dict[int, str] = {}
+    for line in ocr_text.splitlines():
+        if OPTION_NOISE_RE.search(line):
+            continue
+        marks = list(OPTION_MARK_RE.finditer(line))
+        # 一行里至少两个标记才认为这行是选项行，避免把正文里的字母误当选项
+        if len(marks) < 2:
+            continue
+        found: dict[int, str] = {}
+        for index, mark in enumerate(marks):
+            letter = (mark.group(1) or mark.group(2) or "").lower()
+            slot = OPTION_INDEX.get(letter)
+            if slot is None or slot in found:
+                continue
+            end = marks[index + 1].start() if index + 1 < len(marks) else len(line)
+            text = _clean_option(line[mark.end():end])
+            if len(text) < 2 or not any(c.isalnum() for c in text):
+                continue
+            found[slot] = text
+        if len(found) > len(best):
+            best = found
+
+    # 兜底：选项各占一行时逐行收集
+    if len(best) < 2:
+        per_line: dict[int, str] = {}
+        for line in ocr_text.splitlines():
+            if OPTION_NOISE_RE.search(line):
+                continue
+            match = OPTION_LINE_RE.match(line.strip())
+            if not match:
+                continue
+            letter = (match.group(1) or match.group(2) or "").lower()
+            slot = OPTION_INDEX.get(letter)
+            if slot is None or slot in per_line:
+                continue
+            text = _clean_option(line.strip()[match.end():])
+            if len(text) < 2 or not any(c.isalnum() for c in text):
+                continue
+            per_line[slot] = text
+        if len(per_line) >= 2:
+            best = per_line
+
+    return [best[i] for i in sorted(best)]
 
 
 def _ocr_frame(image: Path, lang: str = "de") -> str | None:
