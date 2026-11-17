@@ -72,7 +72,24 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /api/levels/{id}/exams", h.addLevelExam)
 	mux.HandleFunc("DELETE /api/levels/{id}/exams/{examId}", h.removeLevelExam)
 	mux.HandleFunc("GET /api/levels/{id}/exams/available", h.listAvailableExams)
-	return h.logRequests(mux)
+	return h.logRequests(h.cors(mux))
+}
+
+// cors 允许跨域请求（供 Tauri client 端访问）。
+// TODO: 后续可改为 Tauri Rust HTTP 命令，由 Rust 端请求后端，彻底绕开浏览器跨域，
+// 届时可移除此中间件。
+func (h *Handler) cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
