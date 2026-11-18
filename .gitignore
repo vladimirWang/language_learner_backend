@@ -15,5 +15,10 @@ admin/dist/
 # Go 本地二进制
 server/version-service
 
+# 环境变量（含密钥，不入库）
+deploy/.env
+deploy/.env.*
+!deploy/.env.example
+
 # macOS
 .DS_Store
