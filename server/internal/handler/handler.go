@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wangfernando/language-learner/server/internal/llm"
 	"github.com/wangfernando/language-learner/server/internal/repo"
 	"github.com/wangfernando/language-learner/server/internal/scheduler"
 	"github.com/wangfernando/language-learner/server/internal/storage"
@@ -36,12 +37,13 @@ type Handler struct {
 	sched     *scheduler.Scheduler
 	presigner *storage.Presigner
 	repoURLs  map[string]string
+	llm       *llm.Client
 	logger    *log.Logger
 }
 
 // New 创建 HTTP 处理器。
-func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, logger *log.Logger) *Handler {
-	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, logger: logger}
+func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, logger *log.Logger) *Handler {
+	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, logger: logger}
 }
 
 // Routes 注册全部 API 路由。
@@ -80,6 +82,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /api/speaking/items", h.createSpeakingItem)
 	mux.HandleFunc("PUT /api/speaking/items/{key}", h.updateSpeakingItem)
 	mux.HandleFunc("DELETE /api/speaking/items/{key}", h.deleteSpeakingItem)
+	mux.HandleFunc("POST /api/speaking/reply", h.speakingReply)
 	return h.logRequests(h.cors(mux))
 }
 

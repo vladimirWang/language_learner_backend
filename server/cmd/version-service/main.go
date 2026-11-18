@@ -13,6 +13,7 @@ import (
 
 	"github.com/wangfernando/language-learner/server/internal/config"
 	"github.com/wangfernando/language-learner/server/internal/handler"
+	"github.com/wangfernando/language-learner/server/internal/llm"
 	"github.com/wangfernando/language-learner/server/internal/runner"
 	"github.com/wangfernando/language-learner/server/internal/scheduler"
 	"github.com/wangfernando/language-learner/server/internal/storage"
@@ -37,7 +38,13 @@ func main() {
 
 	rn := runner.New(cfg.BuilderCmd, cfg.BuilderArgs, cfg.BuilderDir)
 	sch := scheduler.New(st, rn, cfg.MinAvailMB, cfg.RepoURLs, logger)
-	h := handler.New(st, sch, presigner, cfg.RepoURLs, logger)
+	llmClient := llm.NewFromEnv()
+	if llmClient.Enabled() {
+		logger.Printf("speaking dialog: LLM enabled")
+	} else {
+		logger.Printf("speaking dialog: LLM not configured, using templates")
+	}
+	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

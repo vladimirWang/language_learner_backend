@@ -28,6 +28,10 @@ services:
     environment:
       # 容器内无交互终端：自动接受 GitHub 主机指纹，避免 ls-remote 卡在确认
       GIT_SSH_COMMAND: "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+      # 口语对话 LLM（OpenAI 兼容）；留空则自动使用模板话术
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
     ports:
       - "8080:8080"
     # 同容器内会跑一次性 Python 构建任务（含 whisper 转写 / OCR / ffmpeg），放宽到 2g
