@@ -506,10 +506,20 @@ func (s *Store) ListLevels(ctx context.Context, activeOnly bool) ([]Level, error
 	return levels, err
 }
 
+// ListSpeakingItemsByTopic 返回指定语种、等级、主题下的启用口语题。
+func (s *Store) ListSpeakingItemsByTopic(ctx context.Context, lang, level, topic string) ([]SpeakingItem, error) {
+	items := make([]SpeakingItem, 0)
+	err := s.db.WithContext(ctx).
+		Where("lang = ? AND level = ? AND topic = ? AND active = ?", lang, level, topic, true).
+		Order("exam_part ASC, sort_order ASC, item_key ASC").
+		Find(&items).Error
+	return items, err
+}
+
 // ListLevelExams 返回关卡关联的内容，按 sort_order 排序。
-// expandSpeaking=true 时把「口语话题」展开为该话题下当前等级的全部口语题（供 client 逐题练习）；
-// false 时返回话题本身（供管理台展示与移除）。已软删除的听力 exam 不返回。
-func (s *Store) ListLevelExams(ctx context.Context, levelID int64, expandSpeaking bool) ([]LevelExamInfo, error) {
+// 口语以话题为单位返回（exam_id 即话题名），由客户端进入主题对话页。
+// 已软删除的听力 exam 不返回。
+func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamInfo, error) {
 	rows := make([]LevelExamInfo, 0)
 	// 听力 exam 与历史遗留的单题口语关联。
 	if err := s.db.WithContext(ctx).
@@ -528,33 +538,16 @@ func (s *Store) ListLevelExams(ctx context.Context, levelID int64, expandSpeakin
 	}
 
 	topics := make([]LevelExamInfo, 0)
-	if expandSpeaking {
-		// 话题 → 当前等级下该话题的全部口语题，按考试部分顺序展开。
-		err := s.db.WithContext(ctx).
-			Table("level_exams le").
-			Select(`si.item_key AS exam_id, 'speaking' AS item_type, le.sort_order, le.created_at,
-				si.lang AS lang, '' AS source_url, si.prompt_de AS name`).
-			Joins("JOIN levels l ON l.id = le.level_id").
-			Joins("JOIN speaking_items si ON si.topic = le.exam_id AND si.lang = l.lang AND si.level::text = l.difficulty AND si.active").
-			Where("COALESCE(si.expected_points, '') <> ''").
-			Where("le.level_id = ? AND le.item_type = 'speaking_topic'", levelID).
-			Order("le.sort_order ASC, le.id ASC, si.exam_part ASC, si.sort_order ASC, si.item_key ASC").
-			Scan(&topics).Error
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		err := s.db.WithContext(ctx).
-			Table("level_exams le").
-			Select(`le.exam_id, le.item_type, le.sort_order, le.created_at,
-				COALESCE(l.lang, '') AS lang, '' AS source_url, le.exam_id AS name`).
-			Joins("LEFT JOIN levels l ON l.id = le.level_id").
-			Where("le.level_id = ? AND le.item_type = 'speaking_topic'", levelID).
-			Order("le.sort_order ASC, le.id ASC").
-			Scan(&topics).Error
-		if err != nil {
-			return nil, err
-		}
+	err := s.db.WithContext(ctx).
+		Table("level_exams le").
+		Select(`le.exam_id, le.item_type, le.sort_order, le.created_at,
+			COALESCE(l.lang, '') AS lang, '' AS source_url, le.exam_id AS name`).
+		Joins("LEFT JOIN levels l ON l.id = le.level_id").
+		Where("le.level_id = ? AND le.item_type = 'speaking_topic'", levelID).
+		Order("le.sort_order ASC, le.id ASC").
+		Scan(&topics).Error
+	if err != nil {
+		return nil, err
 	}
 	rows = append(rows, topics...)
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].SortOrder < rows[j].SortOrder })

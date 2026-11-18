@@ -46,6 +46,11 @@ type Handler struct {
 	tplMu      sync.RWMutex
 	tplCache   map[string][]string
 	tplCacheAt time.Time
+
+	// 主题对话编排缓存：同一主题在 TTL 内复用同一份 ≥5 轮脚本。
+	planMu    sync.RWMutex
+	planCache map[string]topicPlanResp
+	planAt    time.Time
 }
 
 // New 创建 HTTP 处理器。
@@ -115,6 +120,8 @@ func (h *Handler) Routes() http.Handler {
 		speaking.DELETE("/items/:key", h.deleteSpeakingItem)
 		speaking.POST("/reply", h.speakingReply)
 		speaking.POST("/check", h.speakingCheck)
+		speaking.POST("/topic-plan", h.speakingTopicPlan)
+		speaking.POST("/validate-item", h.validateSpeakingItem)
 		speaking.GET("/templates", h.listSpeakingTemplates)
 		speaking.POST("/templates", h.createSpeakingTemplate)
 		speaking.PUT("/templates/:id", h.updateSpeakingTemplate)
@@ -1221,6 +1228,7 @@ func (h *Handler) createSpeakingItem(c *gin.Context) {
 		return
 	}
 	writeJSON(c, http.StatusOK, map[string]any{"item_key": item.ItemKey})
+	h.invalidateTopicPlanCache()
 }
 
 // updateSpeakingItem 更新口语题目。
@@ -1247,6 +1255,7 @@ func (h *Handler) updateSpeakingItem(c *gin.Context) {
 		return
 	}
 	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
+	h.invalidateTopicPlanCache()
 }
 
 // deleteSpeakingItem 删除口语题目。
@@ -1261,6 +1270,7 @@ func (h *Handler) deleteSpeakingItem(c *gin.Context) {
 		return
 	}
 	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
+	h.invalidateTopicPlanCache()
 }
 
 // createLevel 创建关卡。
@@ -1317,7 +1327,7 @@ func (h *Handler) getLevel(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "level not found")
 		return
 	}
-	exams, err := h.store.ListLevelExams(c.Request.Context(), id, c.Query("expand_speaking") == "1")
+	exams, err := h.store.ListLevelExams(c.Request.Context(), id)
 	if err != nil {
 		h.logger.Printf("list level exams: %v", err)
 		writeError(c, http.StatusInternalServerError, "list level exams failed")
@@ -1381,7 +1391,7 @@ func (h *Handler) listLevelExams(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid level id")
 		return
 	}
-	exams, err := h.store.ListLevelExams(c.Request.Context(), id, c.Query("expand_speaking") == "1")
+	exams, err := h.store.ListLevelExams(c.Request.Context(), id)
 	if err != nil {
 		h.logger.Printf("list level exams: %v", err)
 		writeError(c, http.StatusInternalServerError, "list level exams failed")
