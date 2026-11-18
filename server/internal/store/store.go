@@ -98,6 +98,105 @@ type LevelExam struct {
 
 func (LevelExam) TableName() string { return "level_exams" }
 
+// SpeakingItem 对应 speaking_items 一行：口语固定问答题库。
+type SpeakingItem struct {
+	ItemKey        string    `gorm:"primaryKey;column:item_key" json:"item_key"`
+	Lang           string    `gorm:"column:lang" json:"lang"`
+	Level          string    `gorm:"column:level" json:"level"`
+	ExamPart       string    `gorm:"column:exam_part" json:"exam_part"`
+	Topic          string    `gorm:"column:topic" json:"topic"`
+	Role           string    `gorm:"column:role" json:"role"`
+	PromptDE       string    `gorm:"column:prompt_de" json:"prompt_de"`
+	PromptZH       string    `gorm:"column:prompt_zh" json:"prompt_zh"`
+	ExpectedPoints string    `gorm:"column:expected_points" json:"expected_points"`
+	RefAnswer      string    `gorm:"column:ref_answer" json:"ref_answer"`
+	ErrorNote      string    `gorm:"column:error_note" json:"error_note"`
+	SortOrder      int       `gorm:"column:sort_order" json:"sort_order"`
+	Active         bool      `gorm:"column:active" json:"active"`
+	CreatedAt      time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt      time.Time `gorm:"column:updated_at" json:"updated_at"`
+}
+
+func (SpeakingItem) TableName() string { return "speaking_items" }
+
+// ListSpeakingItems 返回口语题库，可按语种与等级过滤，按等级与 sort_order 排序。
+func (s *Store) ListSpeakingItems(ctx context.Context, lang, level string, activeOnly bool) ([]SpeakingItem, error) {
+	items := make([]SpeakingItem, 0)
+	q := s.db.WithContext(ctx)
+	if lang != "" {
+		q = q.Where("lang = ?", lang)
+	}
+	if level != "" {
+		q = q.Where("level = ?", level)
+	}
+	if activeOnly {
+		q = q.Where("active = ?", true)
+	}
+	err := q.Order("level ASC, sort_order ASC, item_key ASC").Find(&items).Error
+	return items, err
+}
+
+// ErrNotFound 表示目标记录不存在，供 handler 映射为 404。
+var ErrNotFound = errors.New("record not found")
+
+// GetSpeakingItem 返回单条口语题目。
+func (s *Store) GetSpeakingItem(ctx context.Context, key string) (*SpeakingItem, error) {
+	var item SpeakingItem
+	err := s.db.WithContext(ctx).Where("item_key = ?", key).Take(&item).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+// CreateSpeakingItem 新增口语题目。
+func (s *Store) CreateSpeakingItem(ctx context.Context, item SpeakingItem) error {
+	return s.db.WithContext(ctx).Create(&item).Error
+}
+
+// UpdateSpeakingItem 按 item_key 更新口语题目；记录不存在时返回 ErrRecordNotFound。
+func (s *Store) UpdateSpeakingItem(ctx context.Context, item SpeakingItem) error {
+	res := s.db.WithContext(ctx).Model(&SpeakingItem{}).
+		Where("item_key = ?", item.ItemKey).
+		Updates(map[string]any{
+			"lang":            item.Lang,
+			"level":           item.Level,
+			"exam_part":       item.ExamPart,
+			"topic":           item.Topic,
+			"role":            item.Role,
+			"prompt_de":       item.PromptDE,
+			"prompt_zh":       item.PromptZH,
+			"expected_points": item.ExpectedPoints,
+			"ref_answer":      item.RefAnswer,
+			"error_note":      item.ErrorNote,
+			"sort_order":      item.SortOrder,
+			"active":          item.Active,
+			"updated_at":      gorm.Expr("now()"),
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteSpeakingItem 按 item_key 删除口语题目。
+func (s *Store) DeleteSpeakingItem(ctx context.Context, key string) error {
+	res := s.db.WithContext(ctx).Where("item_key = ?", key).Delete(&SpeakingItem{})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // LevelExamInfo 是关卡关联的 exam 附带 exam 基本信息的视图。
 type LevelExamInfo struct {
 	ExamID    string    `gorm:"column:exam_id" json:"exam_id"`

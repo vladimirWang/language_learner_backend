@@ -73,6 +73,13 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /api/levels/{id}/exams", h.addLevelExam)
 	mux.HandleFunc("DELETE /api/levels/{id}/exams/{examId}", h.removeLevelExam)
 	mux.HandleFunc("GET /api/levels/{id}/exams/available", h.listAvailableExams)
+
+	// 口语题库
+	mux.HandleFunc("GET /api/speaking/items", h.listSpeakingItems)
+	mux.HandleFunc("GET /api/speaking/items/{key}", h.getSpeakingItem)
+	mux.HandleFunc("POST /api/speaking/items", h.createSpeakingItem)
+	mux.HandleFunc("PUT /api/speaking/items/{key}", h.updateSpeakingItem)
+	mux.HandleFunc("DELETE /api/speaking/items/{key}", h.deleteSpeakingItem)
 	return h.logRequests(h.cors(mux))
 }
 
@@ -1032,6 +1039,180 @@ func (h *Handler) listLevels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"levels": levels})
+}
+
+// listSpeakingItems 返回口语固定问答题库。支持 ?lang=de&level=A1&active_only=false。
+func (h *Handler) listSpeakingItems(w http.ResponseWriter, r *http.Request) {
+	lang := strings.TrimSpace(r.URL.Query().Get("lang"))
+	level := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("level")))
+	activeOnly := r.URL.Query().Get("active_only") != "false"
+	items, err := h.store.ListSpeakingItems(r.Context(), lang, level, activeOnly)
+	if err != nil {
+		h.logger.Printf("list speaking items: %v", err)
+		writeError(w, http.StatusInternalServerError, "list speaking items failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// speakingItemUpsert 是口语题目的创建/更新请求体。
+type speakingItemUpsert struct {
+	ItemKey        string `json:"item_key"`
+	Lang           string `json:"lang"`
+	Level          string `json:"level"`
+	ExamPart       string `json:"exam_part"`
+	Topic          string `json:"topic"`
+	Role           string `json:"role"`
+	PromptDE       string `json:"prompt_de"`
+	PromptZH       string `json:"prompt_zh"`
+	ExpectedPoints string `json:"expected_points"`
+	RefAnswer      string `json:"ref_answer"`
+	ErrorNote      string `json:"error_note"`
+	SortOrder      int    `json:"sort_order"`
+	Active         bool   `json:"active"`
+}
+
+var validExamParts = map[string]bool{
+	"part1_intro":        true,
+	"part2_presentation": true,
+	"part3_discussion":   true,
+}
+
+// speakingItemFromRequest 校验并规范化请求体。
+func speakingItemFromRequest(req speakingItemUpsert) (store.SpeakingItem, string) {
+	req.ItemKey = strings.TrimSpace(req.ItemKey)
+	req.Lang = strings.TrimSpace(req.Lang)
+	req.Level = strings.ToUpper(strings.TrimSpace(req.Level))
+	req.ExamPart = strings.TrimSpace(req.ExamPart)
+	req.Topic = strings.TrimSpace(req.Topic)
+	req.Role = strings.TrimSpace(req.Role)
+	req.PromptDE = strings.TrimSpace(req.PromptDE)
+	req.PromptZH = strings.TrimSpace(req.PromptZH)
+	req.ExpectedPoints = strings.TrimSpace(req.ExpectedPoints)
+	req.RefAnswer = strings.TrimSpace(req.RefAnswer)
+	req.ErrorNote = strings.TrimSpace(req.ErrorNote)
+
+	if req.Lang == "" {
+		req.Lang = "de"
+	}
+	if !langPattern.MatchString(req.Lang) {
+		return store.SpeakingItem{}, "invalid lang"
+	}
+	if !validDifficulties[req.Level] {
+		return store.SpeakingItem{}, "invalid level (A1/A2/B1/B2)"
+	}
+	if !validExamParts[req.ExamPart] {
+		return store.SpeakingItem{}, "invalid exam_part"
+	}
+	if req.Topic == "" {
+		return store.SpeakingItem{}, "topic is required"
+	}
+	if req.PromptDE == "" {
+		return store.SpeakingItem{}, "prompt_de is required"
+	}
+	if req.Role == "" {
+		req.Role = "examiner"
+	}
+	if req.ExpectedPoints != "" {
+		var points []string
+		if err := json.Unmarshal([]byte(req.ExpectedPoints), &points); err != nil {
+			return store.SpeakingItem{}, "expected_points 必须是 JSON 字符串数组"
+		}
+	}
+
+	return store.SpeakingItem{
+		ItemKey:        req.ItemKey,
+		Lang:           req.Lang,
+		Level:          req.Level,
+		ExamPart:       req.ExamPart,
+		Topic:          req.Topic,
+		Role:           req.Role,
+		PromptDE:       req.PromptDE,
+		PromptZH:       req.PromptZH,
+		ExpectedPoints: req.ExpectedPoints,
+		RefAnswer:      req.RefAnswer,
+		ErrorNote:      req.ErrorNote,
+		SortOrder:      req.SortOrder,
+		Active:         req.Active,
+	}, ""
+}
+
+// getSpeakingItem 返回单条口语题目。
+func (h *Handler) getSpeakingItem(w http.ResponseWriter, r *http.Request) {
+	item, err := h.store.GetSpeakingItem(r.Context(), r.PathValue("key"))
+	if err != nil {
+		h.logger.Printf("get speaking item: %v", err)
+		writeError(w, http.StatusInternalServerError, "get speaking item failed")
+		return
+	}
+	if item == nil {
+		writeError(w, http.StatusNotFound, "speaking item not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"item": item})
+}
+
+// createSpeakingItem 新增口语题目；item_key 为空时自动生成。
+func (h *Handler) createSpeakingItem(w http.ResponseWriter, r *http.Request) {
+	var req speakingItemUpsert
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	item, msg := speakingItemFromRequest(req)
+	if msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+	if item.ItemKey == "" {
+		item.ItemKey = fmt.Sprintf("%s-%s-%d", item.Lang, strings.ToLower(item.Level), time.Now().UnixNano())
+	}
+	if err := h.store.CreateSpeakingItem(r.Context(), item); err != nil {
+		h.logger.Printf("create speaking item: %v", err)
+		writeError(w, http.StatusInternalServerError, "create speaking item failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"item_key": item.ItemKey})
+}
+
+// updateSpeakingItem 更新口语题目。
+func (h *Handler) updateSpeakingItem(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	var req speakingItemUpsert
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	req.ItemKey = key
+	item, msg := speakingItemFromRequest(req)
+	if msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+	if err := h.store.UpdateSpeakingItem(r.Context(), item); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "speaking item not found")
+			return
+		}
+		h.logger.Printf("update speaking item: %v", err)
+		writeError(w, http.StatusInternalServerError, "update speaking item failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// deleteSpeakingItem 删除口语题目。
+func (h *Handler) deleteSpeakingItem(w http.ResponseWriter, r *http.Request) {
+	if err := h.store.DeleteSpeakingItem(r.Context(), r.PathValue("key")); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "speaking item not found")
+			return
+		}
+		h.logger.Printf("delete speaking item: %v", err)
+		writeError(w, http.StatusInternalServerError, "delete speaking item failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // createLevel 创建关卡。
