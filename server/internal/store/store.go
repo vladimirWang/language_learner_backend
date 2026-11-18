@@ -1318,6 +1318,7 @@ func (s *Store) CreateListeningJob(ctx context.Context, jobID, examID, lang, sou
 		JobID:      jobID,
 		ExamID:     examID,
 		Lang:       lang,
+		Level:      "A1",
 		SourceURL:  sourceURL,
 		Status:     "pending",
 		HasAnswers: hasAnswers,
