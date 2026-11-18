@@ -32,6 +32,7 @@ type ListeningJob struct {
 	ExamID       string     `gorm:"column:exam_id" json:"exam_id"`
 	Name         *string    `gorm:"column:name" json:"name"`
 	Lang         string     `gorm:"column:lang" json:"lang"`
+	Level        string     `gorm:"column:level" json:"level"`
 	SourceURL    string     `gorm:"column:source_url" json:"source_url"`
 	Status       string     `gorm:"column:status" json:"status"`
 	ManifestPath string     `gorm:"column:manifest_path" json:"manifest_path"`
@@ -48,6 +49,7 @@ func (ListeningJob) TableName() string { return "listening_jobs" }
 
 // ListeningJobLog 对应 listening_job_logs 一行。
 type ListeningJobLog struct {
+	LogID     int64     `gorm:"primaryKey;column:log_id" json:"log_id"`
 	JobID     string    `gorm:"column:job_id" json:"-"`
 	Stage     string    `gorm:"column:stage" json:"stage"`
 	Level     string    `gorm:"column:level" json:"level"`
@@ -87,11 +89,12 @@ type Level struct {
 
 func (Level) TableName() string { return "levels" }
 
-// LevelExam 对应 level_exams 一行：关卡与听力 exam 的关联。
+// LevelExam 对应 level_exams 一行：关卡与题目（听力 exam / 口语题目）的关联。
 type LevelExam struct {
 	ID        int64     `gorm:"primaryKey;column:id" json:"-"`
 	LevelID   int64     `gorm:"column:level_id" json:"level_id"`
 	ExamID    string    `gorm:"column:exam_id" json:"exam_id"`
+	ItemType  string    `gorm:"column:item_type" json:"item_type"`
 	SortOrder int       `gorm:"column:sort_order" json:"sort_order"`
 	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
 }
@@ -200,6 +203,8 @@ func (s *Store) DeleteSpeakingItem(ctx context.Context, key string) error {
 // LevelExamInfo 是关卡关联的 exam 附带 exam 基本信息的视图。
 type LevelExamInfo struct {
 	ExamID    string    `gorm:"column:exam_id" json:"exam_id"`
+	ItemType  string    `gorm:"column:item_type" json:"item_type"`
+	Name      string    `gorm:"column:name" json:"name"`
 	Lang      string    `gorm:"column:lang" json:"lang"`
 	SourceURL string    `gorm:"column:source_url" json:"source_url"`
 	SortOrder int       `gorm:"column:sort_order" json:"sort_order"`
@@ -292,58 +297,73 @@ func (s *Store) ListLevels(ctx context.Context, activeOnly bool) ([]Level, error
 	return levels, err
 }
 
-// ListLevelExams 返回关卡关联的 exam 列表（附带 exam 的 lang/source_url），按 sort_order 排序。
-// 已软删除的 exam 不返回。
+// ListLevelExams 返回关卡关联的题目列表（听力 exam / 口语题目），按 sort_order 排序。
+// 已软删除的听力 exam 不返回。
 func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamInfo, error) {
 	rows := make([]LevelExamInfo, 0)
 	err := s.db.WithContext(ctx).
 		Table("level_exams le").
-		Select("le.exam_id, le.sort_order, le.created_at, j.lang, j.source_url").
-		Joins("JOIN listening_jobs j ON j.exam_id = le.exam_id AND j.deleted_at IS NULL").
+		Select(`le.exam_id, le.item_type, le.sort_order, le.created_at,
+			COALESCE(j.lang, si.lang, '') AS lang,
+			COALESCE(j.source_url, '') AS source_url,
+			COALESCE(NULLIF(j.name, ''), si.prompt_de, '') AS name`).
+		Joins("LEFT JOIN listening_jobs j ON le.item_type = 'listening' AND j.exam_id = le.exam_id AND j.deleted_at IS NULL").
+		Joins("LEFT JOIN speaking_items si ON le.item_type = 'speaking' AND si.item_key = le.exam_id").
 		Where("le.level_id = ?", levelID).
+		Where("(le.item_type = 'listening' AND j.exam_id IS NOT NULL) OR (le.item_type = 'speaking' AND si.item_key IS NOT NULL)").
 		Order("le.sort_order ASC, le.id ASC").
 		Scan(&rows).Error
 	return rows, err
 }
 
-// AddLevelExam 给关卡添加一个 exam；已存在则更新 sort_order。
-func (s *Store) AddLevelExam(ctx context.Context, levelID int64, examID string, sortOrder int) error {
-	row := LevelExam{LevelID: levelID, ExamID: examID, SortOrder: sortOrder}
+// AddLevelExam 给关卡添加一个题目（听力或口语）；已存在则更新 sort_order。
+func (s *Store) AddLevelExam(ctx context.Context, levelID int64, itemType, examID string, sortOrder int) error {
+	row := LevelExam{LevelID: levelID, ExamID: examID, ItemType: itemType, SortOrder: sortOrder}
 	return s.db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "level_id"}, {Name: "exam_id"}},
+		Columns:   []clause.Column{{Name: "level_id"}, {Name: "item_type"}, {Name: "exam_id"}},
 		DoUpdates: clause.Assignments(map[string]any{"sort_order": sortOrder}),
 	}).Create(&row).Error
 }
 
-// RemoveLevelExam 从关卡移除一个 exam。
-func (s *Store) RemoveLevelExam(ctx context.Context, levelID int64, examID string) error {
+// RemoveLevelExam 从关卡移除一个题目。
+func (s *Store) RemoveLevelExam(ctx context.Context, levelID int64, itemType, examID string) error {
 	return s.db.WithContext(ctx).
-		Where("level_id = ? AND exam_id = ?", levelID, examID).
+		Where("level_id = ? AND item_type = ? AND exam_id = ?", levelID, itemType, examID).
 		Delete(&LevelExam{}).Error
 }
 
-// AvailableExam 是可加入关卡的听力 exam（已构建完成）。
+// AvailableExam 是可加入关卡的题目：已构建完成且绑定答案的听力 exam，
+// 或已填写要点（expected_points）的启用口语题目。
 type AvailableExam struct {
 	ExamID    string    `gorm:"column:exam_id" json:"exam_id"`
+	ItemType  string    `gorm:"column:item_type" json:"item_type"`
 	Name      *string   `gorm:"column:name" json:"name"`
 	Lang      string    `gorm:"column:lang" json:"lang"`
 	SourceURL string    `gorm:"column:source_url" json:"source_url"`
 	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
 }
 
-// ListAvailableExams 返回所有已构建完成、且未被指定关卡关联、未软删除、已绑定答案的听力 exam。
+// ListAvailableExams 返回可加入指定关卡且尚未关联的听力与口语题目。
 func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]AvailableExam, error) {
 	rows := make([]AvailableExam, 0)
-	q := s.db.WithContext(ctx).Table("listening_jobs").
-		Select("DISTINCT exam_id, name, lang, source_url, created_at").
-		Where("status = ? AND deleted_at IS NULL AND has_answers = ?", "built", true).
-		Where("exam_id NOT IN (?)",
-			s.db.Table("level_exams").Select("exam_id").Where("level_id = ?", levelID)).
-		Order("created_at DESC")
-	if err := q.Scan(&rows).Error; err != nil {
-		return nil, err
-	}
-	return rows, nil
+	err := s.db.WithContext(ctx).Raw(`
+		SELECT 'listening' AS item_type, exam_id, name, lang, source_url, created_at
+		FROM listening_jobs
+		WHERE status = 'built' AND deleted_at IS NULL AND has_answers = true
+		  AND exam_id NOT IN (
+		      SELECT exam_id FROM level_exams WHERE level_id = ? AND item_type = 'listening'
+		  )
+		UNION ALL
+		SELECT 'speaking' AS item_type, item_key AS exam_id, prompt_de AS name,
+		       lang, prompt_de AS source_url, created_at
+		FROM speaking_items
+		WHERE active = true AND COALESCE(expected_points, '') <> ''
+		  AND item_key NOT IN (
+		      SELECT exam_id FROM level_exams WHERE level_id = ? AND item_type = 'speaking'
+		  )
+		ORDER BY item_type ASC, created_at DESC
+	`, levelID, levelID).Scan(&rows).Error
+	return rows, err
 }
 
 // Store 持有 gorm 数据库连接。
@@ -449,14 +469,18 @@ func (s *Store) FailListeningJob(ctx context.Context, jobID, errorMsg string) er
 		}).Error
 }
 
-// UpdateListeningJobName 更新听力任务名称；nil 表示清除自定义名称。
-func (s *Store) UpdateListeningJobName(ctx context.Context, jobID string, name *string) error {
+// UpdateListeningJobMeta 更新听力任务名称与等级；name 为 nil 表示清除自定义名称。
+func (s *Store) UpdateListeningJobMeta(ctx context.Context, jobID string, name *string, level string) error {
+	updates := map[string]any{
+		"name":       name,
+		"updated_at": gorm.Expr("now()"),
+	}
+	if level != "" {
+		updates["level"] = level
+	}
 	return s.db.WithContext(ctx).Model(&ListeningJob{}).
 		Where("job_id = ? AND deleted_at IS NULL", jobID).
-		Updates(map[string]any{
-			"name":       name,
-			"updated_at": gorm.Expr("now()"),
-		}).Error
+		Updates(updates).Error
 }
 
 // SoftDeleteListeningJob 软删除听力任务（标记 deleted_at，不删除文件）。
@@ -499,7 +523,7 @@ func (s *Store) ListListeningJobs(ctx context.Context, limit int) ([]ListeningJo
 	}
 	jobs := make([]ListeningJob, 0)
 	err := s.db.WithContext(ctx).Table("listening_jobs").
-		Select(`job_id, exam_id, name, lang, source_url, status,
+		Select(`job_id, exam_id, name, lang, level, source_url, status,
 			COALESCE(manifest_path,'') AS manifest_path,
 			COALESCE(log_path,'') AS log_path,
 			COALESCE(error_msg,'') AS error_msg,
@@ -511,11 +535,12 @@ func (s *Store) ListListeningJobs(ctx context.Context, limit int) ([]ListeningJo
 	return jobs, err
 }
 
-// ListeningJobDetail 返回单个任务及其最近日志（已软删除的返回 not found）。
-func (s *Store) ListeningJobDetail(ctx context.Context, jobID string) (*ListeningJob, []ListeningJobLog, error) {
+// ListeningJobDetail 返回单个任务及其日志（已软删除的返回 not found）。
+// afterLogID > 0 时只返回该日志 ID 之后的增量日志（升序）；否则返回最近 300 条（降序）。
+func (s *Store) ListeningJobDetail(ctx context.Context, jobID string, afterLogID int64) (*ListeningJob, []ListeningJobLog, error) {
 	var j ListeningJob
 	err := s.db.WithContext(ctx).Table("listening_jobs").
-		Select(`job_id, exam_id, name, lang, source_url, status,
+		Select(`job_id, exam_id, name, lang, level, source_url, status,
 			COALESCE(manifest_path,'') AS manifest_path,
 			COALESCE(log_path,'') AS log_path,
 			COALESCE(error_msg,'') AS error_msg,
@@ -530,13 +555,15 @@ func (s *Store) ListeningJobDetail(ctx context.Context, jobID string) (*Listenin
 	}
 
 	logs := make([]ListeningJobLog, 0)
-	err = s.db.WithContext(ctx).Table("listening_job_logs").
-		Select(`COALESCE(stage,'') AS stage, COALESCE(level,'') AS level, message, created_at`).
-		Where("job_id = ?", jobID).
-		Order("log_id DESC").
-		Limit(300).
-		Find(&logs).Error
-	if err != nil {
+	q := s.db.WithContext(ctx).Table("listening_job_logs").
+		Select(`log_id, COALESCE(stage,'') AS stage, COALESCE(level,'') AS level, message, created_at`).
+		Where("job_id = ?", jobID)
+	if afterLogID > 0 {
+		q = q.Where("log_id > ?", afterLogID).Order("log_id ASC").Limit(1000)
+	} else {
+		q = q.Order("log_id DESC").Limit(300)
+	}
+	if err := q.Find(&logs).Error; err != nil {
 		return nil, nil, err
 	}
 	return &j, logs, nil

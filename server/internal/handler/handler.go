@@ -60,7 +60,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/listening/job/{jobId}/download", h.listeningDownload)
 	mux.HandleFunc("GET /api/listening/job/{jobId}/archive", h.listeningArchive)
 	mux.HandleFunc("POST /api/listening/job/{jobId}/answers", h.listeningUpdateAnswers)
-	mux.HandleFunc("PATCH /api/listening/job/{jobId}", h.updateListeningJobName)
+	mux.HandleFunc("PATCH /api/listening/job/{jobId}", h.updateListeningJobMeta)
 	mux.HandleFunc("DELETE /api/listening/job/{jobId}", h.deleteListeningJob)
 
 	// 关卡配置
@@ -486,7 +486,8 @@ func (h *Handler) listeningJobDetail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing jobId")
 		return
 	}
-	job, logs, err := h.store.ListeningJobDetail(r.Context(), jobID)
+	afterLogID, _ := strconv.ParseInt(r.URL.Query().Get("after_log_id"), 10, 64)
+	job, logs, err := h.store.ListeningJobDetail(r.Context(), jobID, afterLogID)
 	if err != nil {
 		h.logger.Printf("listening job detail %s: %v", jobID, err)
 		writeError(w, http.StatusInternalServerError, "query job failed")
@@ -513,7 +514,7 @@ var errListeningJobNotFound = errors.New("listening job not found")
 
 // listeningExamDir 定位任务产物目录：WORK_DIR/listening/{exam_id}。
 func (h *Handler) listeningExamDir(ctx context.Context, jobID string) (string, string, error) {
-	job, _, err := h.store.ListeningJobDetail(ctx, jobID)
+	job, _, err := h.store.ListeningJobDetail(ctx, jobID, 0)
 	if err != nil {
 		return "", "", err
 	}
@@ -910,28 +911,34 @@ func (h *Handler) listeningUpdateAnswers(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// updateListeningJobName 更新听力任务的显示名称；空名称表示恢复使用 Exam ID。
-func (h *Handler) updateListeningJobName(w http.ResponseWriter, r *http.Request) {
+// updateListeningJobMeta 更新听力任务的显示名称与等级；空名称表示恢复使用 Exam ID。
+func (h *Handler) updateListeningJobMeta(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
 	if jobID == "" {
 		writeError(w, http.StatusBadRequest, "missing jobId")
 		return
 	}
 	var req struct {
-		Name string `json:"name"`
+		Name  string `json:"name"`
+		Level string `json:"level"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
+	req.Level = strings.ToUpper(strings.TrimSpace(req.Level))
 	var name *string
 	if req.Name != "" {
 		name = &req.Name
 	}
-	if err := h.store.UpdateListeningJobName(r.Context(), jobID, name); err != nil {
-		h.logger.Printf("update listening job name %s: %v", jobID, err)
-		writeError(w, http.StatusInternalServerError, "update job name failed")
+	if req.Level != "" && !validCefrLevels[req.Level] {
+		writeError(w, http.StatusBadRequest, "invalid level (A1/A2/B1/B2/C1/C2)")
+		return
+	}
+	if err := h.store.UpdateListeningJobMeta(r.Context(), jobID, name, req.Level); err != nil {
+		h.logger.Printf("update listening job meta %s: %v", jobID, err)
+		writeError(w, http.StatusInternalServerError, "update job failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -1025,6 +1032,11 @@ type levelUpsert struct {
 
 var validDifficulties = map[string]bool{"A1": true, "A2": true, "B1": true, "B2": true}
 
+// validCefrLevels 是听力/口语试题共用的等级枚举，对应数据库类型 cefr_level。
+var validCefrLevels = map[string]bool{
+	"A1": true, "A2": true, "B1": true, "B2": true, "C1": true, "C2": true,
+}
+
 func parseLevelID(r *http.Request) (int64, error) {
 	return strconv.ParseInt(r.PathValue("id"), 10, 64)
 }
@@ -1098,8 +1110,8 @@ func speakingItemFromRequest(req speakingItemUpsert) (store.SpeakingItem, string
 	if !langPattern.MatchString(req.Lang) {
 		return store.SpeakingItem{}, "invalid lang"
 	}
-	if !validDifficulties[req.Level] {
-		return store.SpeakingItem{}, "invalid level (A1/A2/B1/B2)"
+	if !validCefrLevels[req.Level] {
+		return store.SpeakingItem{}, "invalid level (A1/A2/B1/B2/C1/C2)"
 	}
 	if !validExamParts[req.ExamPart] {
 		return store.SpeakingItem{}, "invalid exam_part"
@@ -1344,10 +1356,13 @@ func (h *Handler) listLevelExams(w http.ResponseWriter, r *http.Request) {
 
 type addExamReq struct {
 	ExamID    string `json:"exam_id"`
+	ItemType  string `json:"item_type"`
 	SortOrder int    `json:"sort_order"`
 }
 
-// addLevelExam 给关卡添加一个 exam。
+var validItemTypes = map[string]bool{"listening": true, "speaking": true}
+
+// addLevelExam 给关卡添加一个题目（听力或口语）。
 func (h *Handler) addLevelExam(w http.ResponseWriter, r *http.Request) {
 	id, err := parseLevelID(r)
 	if err != nil {
@@ -1360,11 +1375,19 @@ func (h *Handler) addLevelExam(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.ExamID = strings.TrimSpace(req.ExamID)
+	req.ItemType = strings.ToLower(strings.TrimSpace(req.ItemType))
 	if req.ExamID == "" {
 		writeError(w, http.StatusBadRequest, "exam_id is required")
 		return
 	}
-	if err := h.store.AddLevelExam(r.Context(), id, req.ExamID, req.SortOrder); err != nil {
+	if req.ItemType == "" {
+		req.ItemType = "listening"
+	}
+	if !validItemTypes[req.ItemType] {
+		writeError(w, http.StatusBadRequest, "invalid item_type (listening/speaking)")
+		return
+	}
+	if err := h.store.AddLevelExam(r.Context(), id, req.ItemType, req.ExamID, req.SortOrder); err != nil {
 		h.logger.Printf("add level exam: %v", err)
 		writeError(w, http.StatusInternalServerError, "add level exam failed")
 		return
@@ -1372,7 +1395,7 @@ func (h *Handler) addLevelExam(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// removeLevelExam 从关卡移除一个 exam。
+// removeLevelExam 从关卡移除一个题目。?item_type=listening|speaking，默认 listening。
 func (h *Handler) removeLevelExam(w http.ResponseWriter, r *http.Request) {
 	id, err := parseLevelID(r)
 	if err != nil {
@@ -1384,7 +1407,15 @@ func (h *Handler) removeLevelExam(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "examId is required")
 		return
 	}
-	if err := h.store.RemoveLevelExam(r.Context(), id, examID); err != nil {
+	itemType := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("item_type")))
+	if itemType == "" {
+		itemType = "listening"
+	}
+	if !validItemTypes[itemType] {
+		writeError(w, http.StatusBadRequest, "invalid item_type (listening/speaking)")
+		return
+	}
+	if err := h.store.RemoveLevelExam(r.Context(), id, itemType, examID); err != nil {
 		h.logger.Printf("remove level exam: %v", err)
 		writeError(w, http.StatusInternalServerError, "remove level exam failed")
 		return
@@ -1392,7 +1423,7 @@ func (h *Handler) removeLevelExam(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// listAvailableExams 返回可加入关卡的已完成听力 exam。
+// listAvailableExams 返回可加入关卡的听力与口语题目。
 func (h *Handler) listAvailableExams(w http.ResponseWriter, r *http.Request) {
 	id, err := parseLevelID(r)
 	if err != nil {
