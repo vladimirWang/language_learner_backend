@@ -144,9 +144,32 @@ func contentWordSet(text string) map[string]bool {
 	return set
 }
 
-// similarToAny 判断候选句是否与既有句子高度相似（词集合 Jaccard ≥ 0.6）。
-// 只做字面近似，用于拦住换汤不换药的重复提问。
+// similarToAny 判断候选句是否与既有句子重复。
+// 先做归一化后的包含判定：短问句（如「Woher kommen Sie?」）
+// 往往只有两个实词，且常被更长的问句完整包含，靠实词集合拦不住。
+// 再用词集合相似度兜住「换汤不换药」的改写。
 func similarToAny(candidate string, existing []string) bool {
+	candNorm := normalizeText(candidate)
+	if candNorm == "" {
+		return false
+	}
+	for _, sentence := range existing {
+		existNorm := normalizeText(sentence)
+		if existNorm == "" {
+			continue
+		}
+		if existNorm == candNorm {
+			return true
+		}
+		shorter, longer := candNorm, existNorm
+		if len(shorter) > len(longer) {
+			shorter, longer = longer, shorter
+		}
+		// 太短的片段（如单个词）不做包含判定，避免误杀。
+		if utf8.RuneCountInString(shorter) >= 8 && strings.Contains(longer, shorter) {
+			return true
+		}
+	}
 	candWords := contentWordSet(candidate)
 	if len(candWords) < 3 {
 		return false
@@ -166,6 +189,14 @@ func similarToAny(candidate string, existing []string) bool {
 		if union > 0 && float64(inter)/float64(union) >= 0.6 {
 			return true
 		}
+		// 短问句的 Jaccard 容易偏低，包含度（交集 / 较小集合）≥0.75 也视为重复。
+		smaller := len(candWords)
+		if len(words) < smaller {
+			smaller = len(words)
+		}
+		if float64(inter)/float64(smaller) >= 0.75 {
+			return true
+		}
 	}
 	return false
 }
@@ -180,17 +211,21 @@ func normalizeText(text string) string {
 	return strings.Join(strings.Fields(replacer.Replace(text)), " ")
 }
 
-// pickTemplate 在模板池中轮转，优先选择本轮对话里没出现过的句子。
-func pickTemplate(pool []string, followupCount int, used map[string]bool) string {
+// pickTemplate 在模板池中轮转，跳过本轮对话里出现过（含近似重复）的句子。
+func pickTemplate(pool []string, followupCount int, used map[string]bool, past []string) string {
 	if len(pool) == 0 {
 		return "Können Sie das noch etwas genauer erklären?"
 	}
 	start := followupCount % len(pool)
 	for i := 0; i < len(pool); i++ {
 		candidate := pool[(start+i)%len(pool)]
-		if !used[normalizeText(candidate)] {
-			return candidate
+		if used[normalizeText(candidate)] {
+			continue
 		}
+		if similarToAny(candidate, past) {
+			continue
+		}
+		return candidate
 	}
 	return pool[start]
 }
@@ -359,7 +394,19 @@ func (h *Handler) speakingReply(c *gin.Context) {
 		}
 	}
 
-	fallback := pickTemplate(h.templatePool(c.Request.Context(), req.ExamPart, req.Role), req.FollowupCount, used)
+	// 已出现过的问句（含题库当前问句），用于拦截重复提问。
+	// 注意：只依赖调用方传入的完整历史，历史被截断会直接导致判重失效。
+	past := make([]string, 0, len(req.History)+1)
+	if strings.TrimSpace(req.PromptDE) != "" {
+		past = append(past, req.PromptDE)
+	}
+	for _, turn := range req.History {
+		if turn.Role != "user" && strings.TrimSpace(turn.Text) != "" {
+			past = append(past, turn.Text)
+		}
+	}
+
+	fallback := pickTemplate(h.templatePool(c.Request.Context(), req.ExamPart, req.Role), req.FollowupCount, used, past)
 
 	if !h.llm.Enabled() {
 		writeJSON(c, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
@@ -397,17 +444,6 @@ func (h *Handler) speakingReply(c *gin.Context) {
 			sb.WriteString("- ")
 			sb.WriteString(ref)
 			sb.WriteString("\n")
-		}
-	}
-
-	// 已出现过的问句（含题库当前问句），用于拦截重复提问。
-	past := make([]string, 0, len(req.History)+1)
-	if strings.TrimSpace(req.PromptDE) != "" {
-		past = append(past, req.PromptDE)
-	}
-	for _, turn := range req.History {
-		if turn.Role != "user" && strings.TrimSpace(turn.Text) != "" {
-			past = append(past, turn.Text)
 		}
 	}
 
