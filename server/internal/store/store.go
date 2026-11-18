@@ -1092,6 +1092,15 @@ func (s *Store) FinishPDFImportJob(ctx context.Context, jobID, status, message s
 		}).Error
 }
 
+// UpdatePDFImportResult 更新解析摘要（人工校对后回写）。
+func (s *Store) UpdatePDFImportResult(ctx context.Context, jobID string, result json.RawMessage) error {
+	return s.db.WithContext(ctx).Model(&PDFImportJob{}).Where("job_id = ?", jobID).
+		Updates(map[string]any{
+			"result_json": aidExpr(result),
+			"updated_at":  gorm.Expr("now()"),
+		}).Error
+}
+
 // ResetPDFImportJob 把失败任务重置为待解析，供重新投递。
 func (s *Store) ResetPDFImportJob(ctx context.Context, jobID string) error {
 	return s.db.WithContext(ctx).Model(&PDFImportJob{}).Where("job_id = ?", jobID).
