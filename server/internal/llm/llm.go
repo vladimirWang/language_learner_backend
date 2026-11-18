@@ -63,11 +63,16 @@ type chatMessage struct {
 	Content string `json:"content"`
 }
 
+type responseFormat struct {
+	Type string `json:"type"`
+}
+
 type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
-	MaxTokens   int           `json:"max_tokens"`
+	Model          string          `json:"model"`
+	Messages       []chatMessage   `json:"messages"`
+	Temperature    float64         `json:"temperature"`
+	MaxTokens      int             `json:"max_tokens"`
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
 }
 
 type chatResponse struct {
@@ -81,6 +86,18 @@ type chatResponse struct {
 
 // Chat 发送一次对话请求，返回模型文本。
 func (c *Client) Chat(ctx context.Context, system, user string) (string, error) {
+	return c.chat(ctx, system, user, 0.7, 120, false)
+}
+
+// ChatJSON 以低温度请求结构化输出，用于语法批改等需要解析 JSON 的场景。
+func (c *Client) ChatJSON(ctx context.Context, system, user string, maxTokens int) (string, error) {
+	if maxTokens <= 0 || maxTokens > 2000 {
+		maxTokens = 800
+	}
+	return c.chat(ctx, system, user, 0.2, maxTokens, true)
+}
+
+func (c *Client) chat(ctx context.Context, system, user string, temperature float64, maxTokens int, jsonMode bool) (string, error) {
 	if !c.Enabled() {
 		return "", errors.New("llm not configured")
 	}
@@ -90,8 +107,11 @@ func (c *Client) Chat(ctx context.Context, system, user string) (string, error) 
 			{Role: "system", Content: system},
 			{Role: "user", Content: user},
 		},
-		Temperature: 0.7,
-		MaxTokens:   120,
+		Temperature: temperature,
+		MaxTokens:   maxTokens,
+	}
+	if jsonMode {
+		payload.ResponseFormat = &responseFormat{Type: "json_object"}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

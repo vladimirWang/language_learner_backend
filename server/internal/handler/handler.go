@@ -114,6 +114,7 @@ func (h *Handler) Routes() http.Handler {
 		speaking.PUT("/items/:key", h.updateSpeakingItem)
 		speaking.DELETE("/items/:key", h.deleteSpeakingItem)
 		speaking.POST("/reply", h.speakingReply)
+		speaking.POST("/check", h.speakingCheck)
 		speaking.GET("/templates", h.listSpeakingTemplates)
 		speaking.POST("/templates", h.createSpeakingTemplate)
 		speaking.PUT("/templates/:id", h.updateSpeakingTemplate)

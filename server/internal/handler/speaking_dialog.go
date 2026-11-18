@@ -55,6 +55,37 @@ func (h *Handler) speakingReferences(ctx context.Context, req speakingReplyReq) 
 	return out
 }
 
+// grammarReferences 从语法库检索与当前对话相关的规范切片。
+// 用于约束机器提问，以及作为批改考生回答的判定依据。
+func (h *Handler) grammarReferences(ctx context.Context, level string, texts ...string) []string {
+	if h.store == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	keywords := make([]string, 0, 8)
+	for _, word := range ragKeywordRe.FindAllString(strings.Join(texts, " "), -1) {
+		kw := strings.ToLower(word)
+		if seen[kw] {
+			continue
+		}
+		seen[kw] = true
+		keywords = append(keywords, kw)
+		if len(keywords) >= 8 {
+			break
+		}
+	}
+	chunks, err := h.store.GrammarChunks(ctx, "de", level, keywords, 4)
+	if err != nil {
+		h.logger.Printf("speaking grammar refs: %v", err)
+		return nil
+	}
+	out := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		out = append(out, "【"+chunk.Title+"】"+chunk.Content)
+	}
+	return out
+}
+
 // speakingReplyReq 是「受控追问 / 搭档回应」的请求体。
 type speakingReplyReq struct {
 	Lang          string            `json:"lang"`
@@ -294,7 +325,7 @@ func examinerSystemPrompt(level, topic string) string {
 	return fmt.Sprintf(`你是歌德学院 %s 级别口语考试的考官，与考生进行德语对话。
 
 必须做到：
-1. 只使用 %s 等级范围内的词汇与句式，禁止超纲。
+1. 只使用 %s 等级范围内的词汇与句式，禁止超纲；提问必须语法正确（冠词、格、介词支配、语序、动词变位）。
 2. 每轮只输出一到两句德语提问，围绕话题 %s，不要跳到其他话题。
 3. 不做语法讲解，只做自然的追问与引导。
 4. 不评价对错、不打分。
@@ -446,6 +477,14 @@ func (h *Handler) speakingReply(c *gin.Context) {
 			sb.WriteString("\n")
 		}
 	}
+	if refs := h.grammarReferences(c.Request.Context(), req.Level, req.Topic, req.PromptDE); len(refs) > 0 {
+		sb.WriteString("\n\n语法规范参考（你的提问必须符合，不得出现违反这些规范的表达）：\n")
+		for _, ref := range refs {
+			sb.WriteString("- ")
+			sb.WriteString(ref)
+			sb.WriteString("\n")
+		}
+	}
 
 	basePrompt := sb.String()
 	reply, err := h.llm.Chat(c.Request.Context(), system, basePrompt)
@@ -481,6 +520,184 @@ func (h *Handler) speakingReply(c *gin.Context) {
 		h.logger.Printf("speaking llm: %v", err)
 	}
 	writeJSON(c, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
+}
+
+// ---------------------------------------------------------------------------
+// 语法批改（口语回答）
+// ---------------------------------------------------------------------------
+
+type speakingCheckReq struct {
+	Lang           string `json:"lang"`
+	Level          string `json:"level"`
+	Topic          string `json:"topic"`
+	PromptDE       string `json:"prompt_de"`
+	Answer         string `json:"answer"`
+	ExpectedPoints string `json:"expected_points"`
+}
+
+type grammarIssue struct {
+	Type        string `json:"type"`        // 冠词 / 格 / 介词 / 语序 / 动词变位 / 搭配
+	Snippet     string `json:"snippet"`     // 原句中的错误片段
+	Fix         string `json:"fix"`         // 正确写法
+	Explanation string `json:"explanation"` // 中文解释
+}
+
+type speakingCheckResp struct {
+	Corrected string         `json:"corrected"`
+	Errors    []grammarIssue `json:"errors"`
+	Rules     []string       `json:"rules"`
+	Comment   string         `json:"comment"`
+	Source    string         `json:"source"` // llm / template
+}
+
+func grammarCheckSystemPrompt() string {
+	return `你是歌德学院德语口语考试的语法批改老师，负责检查考生回答的语法、用词与固定搭配。
+
+必须做到：
+1. 只依据「语法规范参考」和标准德语语法判断，规范没有覆盖的条目不得臆造规则。
+2. 只检查语法与搭配，不评价内容好坏，不打分。
+3. 输出严格为 JSON，不要使用代码块，不要输出 JSON 以外的任何文字。
+4. JSON 结构：
+{"corrected":"语法正确的改写（尽量保留原意与原句结构）","errors":[{"type":"冠词/格/介词/语序/动词变位/搭配/其他","snippet":"原句中的错误片段","fix":"正确写法","explanation":"中文简短解释"}],"rules":["引用的规范标题"],"comment":"一句中文总评"}
+5. type、explanation 与 comment 必须使用简体中文；corrected、snippet、fix 使用德语。
+6. 没有语法错误时 errors 为空数组，corrected 可与原句相同，comment 说明表达正确。
+7. 最多列出 4 处错误；考生回答过短或与题目无关时只在 comment 里提示，不要编造错误。
+
+示例（只示范格式与语言，不要照抄内容）：
+输入：Ich komme aus Thailand, bin nicht Spanien.
+输出：{"corrected":"Ich komme aus Thailand, aber ich bin nicht aus Spanien.","errors":[{"type":"搭配","snippet":"bin nicht Spanien","fix":"aber ich bin nicht aus Spanien","explanation":"表示来自某地要用 aus + 第三格，sein 不能直接接国名。"}],"rules":["只跟第三格的介词"],"comment":"漏掉了介词 aus，两个分句之间缺少连词 aber。"}`
+}
+
+func grammarCheckUserPrompt(req speakingCheckReq, refs []string) string {
+	var sb strings.Builder
+	sb.WriteString("等级：")
+	sb.WriteString(req.Level)
+	sb.WriteString("\n话题：")
+	sb.WriteString(req.Topic)
+	sb.WriteString("\n考官问题：")
+	sb.WriteString(req.PromptDE)
+	sb.WriteString("\n考生回答：")
+	sb.WriteString(req.Answer)
+	if req.ExpectedPoints != "" {
+		sb.WriteString("\n本题应覆盖的要点：")
+		sb.WriteString(req.ExpectedPoints)
+	}
+	if len(refs) > 0 {
+		sb.WriteString("\n\n语法规范参考：\n")
+		for _, ref := range refs {
+			sb.WriteString("- ")
+			sb.WriteString(ref)
+			sb.WriteString("\n")
+		}
+	}
+	sb.WriteString("\n注意：type、explanation、comment 必须用简体中文书写；corrected、snippet、fix 用德语。请只输出 JSON。")
+	return sb.String()
+}
+
+// clipText 按字符数截断，避免 LLM 输出过长撑爆前端。
+func clipText(text string, max int) string {
+	text = strings.TrimSpace(text)
+	if max <= 0 || utf8.RuneCountInString(text) <= max {
+		return text
+	}
+	return string([]rune(text)[:max]) + "…"
+}
+
+func parseGrammarCheckReply(raw string) (speakingCheckResp, bool) {
+	resp := speakingCheckResp{Errors: []grammarIssue{}, Rules: []string{}}
+	raw = strings.TrimSpace(raw)
+	start := strings.Index(raw, "{")
+	end := strings.LastIndex(raw, "}")
+	if start < 0 || end <= start {
+		return resp, false
+	}
+	if err := json.Unmarshal([]byte(raw[start:end+1]), &resp); err != nil {
+		return resp, false
+	}
+	resp.Corrected = clipText(resp.Corrected, 300)
+	resp.Comment = clipText(resp.Comment, 200)
+	if resp.Errors == nil {
+		resp.Errors = []grammarIssue{}
+	}
+	if len(resp.Errors) > 4 {
+		resp.Errors = resp.Errors[:4]
+	}
+	for i := range resp.Errors {
+		item := &resp.Errors[i]
+		item.Type = clipText(item.Type, 20)
+		item.Snippet = clipText(item.Snippet, 120)
+		item.Fix = clipText(item.Fix, 120)
+		item.Explanation = clipText(item.Explanation, 160)
+		// 模型偶尔会用德语解释；没有中文时退回通用中文提示，避免前端出现纯德语说明。
+		if item.Explanation != "" && !cjkRe.MatchString(item.Explanation) {
+			item.Explanation = "此处不符合标准德语语法，请参考修改后的写法。"
+		}
+	}
+	if resp.Rules == nil {
+		resp.Rules = []string{}
+	}
+	if len(resp.Rules) > 4 {
+		resp.Rules = resp.Rules[:4]
+	}
+	for i := range resp.Rules {
+		// 模型可能沿用提示词里的「【文档名 · 小节】」格式，展示时去掉方括号。
+		resp.Rules[i] = clipText(strings.Trim(resp.Rules[i], "【】 "), 60)
+	}
+	return resp, true
+}
+
+// speakingCheck 依据语法规范批改考生回答；LLM 不可用时返回空结果，由前端降级。
+func (h *Handler) speakingCheck(c *gin.Context) {
+	var req speakingCheckReq
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	req.Level = strings.ToUpper(strings.TrimSpace(req.Level))
+	req.Topic = strings.TrimSpace(req.Topic)
+	req.PromptDE = strings.TrimSpace(req.PromptDE)
+	req.Answer = strings.TrimSpace(req.Answer)
+	req.ExpectedPoints = strings.TrimSpace(req.ExpectedPoints)
+	if !validCefrLevels[req.Level] {
+		writeError(c, http.StatusBadRequest, "invalid level")
+		return
+	}
+	if req.Answer == "" {
+		writeError(c, http.StatusBadRequest, "answer is required")
+		return
+	}
+	if utf8.RuneCountInString(req.Answer) > 600 {
+		writeError(c, http.StatusBadRequest, "answer is too long")
+		return
+	}
+
+	empty := speakingCheckResp{Errors: []grammarIssue{}, Rules: []string{}, Source: "template"}
+	if !h.llm.Enabled() {
+		writeJSON(c, http.StatusOK, empty)
+		return
+	}
+	refs := h.grammarReferences(c.Request.Context(), req.Level, req.Topic, req.PromptDE, req.Answer, req.ExpectedPoints)
+	raw, err := h.llm.ChatJSON(c.Request.Context(), grammarCheckSystemPrompt(), grammarCheckUserPrompt(req, refs), 800)
+	if err != nil {
+		h.logger.Printf("speaking grammar check: %v", err)
+		writeJSON(c, http.StatusOK, empty)
+		return
+	}
+	resp, ok := parseGrammarCheckReply(raw)
+	if !ok {
+		h.logger.Printf("speaking grammar check unparsable: %q", raw)
+		writeJSON(c, http.StatusOK, empty)
+		return
+	}
+	resp.Source = "llm"
+	if resp.Comment == "" || !cjkRe.MatchString(resp.Comment) {
+		if len(resp.Errors) == 0 {
+			resp.Comment = "语法正确，表达自然。"
+		} else {
+			resp.Comment = "存在语法或搭配问题，请参考上面的修改建议。"
+		}
+	}
+	writeJSON(c, http.StatusOK, resp)
 }
 
 // ---------------------------------------------------------------------------

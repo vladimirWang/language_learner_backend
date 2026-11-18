@@ -4,8 +4,11 @@ package store
 import (
 	"context"
 	"errors"
+	"path"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -242,6 +245,110 @@ func (s *Store) SearchRagChunks(ctx context.Context, lang, level string, keyword
 		return nil, err
 	}
 	return contents, nil
+}
+
+// GrammarChunk 是一条语法规范切片。
+type GrammarChunk struct {
+	Title   string
+	Content string
+}
+
+// GrammarChunks 取出当前等级可用的语法规范，按关键词命中数排序后返回前 limit 条。
+// 语法讲解以中文为主，关键词主要用于命中德语例句；命中不足时按等级兜底，
+// 低等级没有对应文档时回退到全部语法文档。
+func (s *Store) GrammarChunks(ctx context.Context, lang, level string, keywords []string, limit int) ([]GrammarChunk, error) {
+	if limit <= 0 || limit > 6 {
+		limit = 4
+	}
+	type row struct {
+		ChunkID    int64
+		Title      string
+		Content    string
+		SourcePath string
+	}
+	rows := make([]row, 0, 128)
+	load := func(withLevel bool) error {
+		tx := s.db.WithContext(ctx).Table("rag_chunks").
+			Select("chunk_id, title, content, source_path").
+			Where("lang = ? AND chunk_type = 'grammar'", lang)
+		if withLevel && level != "" {
+			tx = tx.Where("(level LIKE ? OR level IS NULL OR level = '')", "%"+level+"%")
+		}
+		return tx.Order("chunk_id ASC").Limit(200).Scan(&rows).Error
+	}
+	if err := load(true); err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 && level != "" {
+		rows = rows[:0]
+		if err := load(false); err != nil {
+			return nil, err
+		}
+	}
+
+	words := make([]string, 0, len(keywords))
+	for _, kw := range keywords {
+		if k := strings.ToLower(strings.TrimSpace(kw)); k != "" {
+			words = append(words, k)
+		}
+	}
+	type scored struct {
+		chunk  GrammarChunk
+		source string
+		score  int
+		id     int64
+	}
+	list := make([]scored, 0, len(rows))
+	for _, r := range rows {
+		body := strings.ToLower(r.Title + " " + r.Content)
+		score := 0
+		for _, kw := range words {
+			if strings.Contains(body, kw) {
+				score++
+			}
+		}
+		content := strings.Join(strings.Fields(r.Content), " ")
+		if utf8.RuneCountInString(content) > 420 {
+			content = string([]rune(content)[:420]) + "…"
+		}
+		// 切片标题只是二级标题，补上文档名才能让模型知道引用的是哪条规范。
+		docName := strings.TrimSuffix(path.Base(r.SourcePath), ".md")
+		title := r.Title
+		if docName != "" {
+			title = docName + " · " + r.Title
+		}
+		list = append(list, scored{
+			chunk:  GrammarChunk{Title: title, Content: content},
+			source: r.SourcePath,
+			score:  score,
+			id:     r.ChunkID,
+		})
+	}
+	sort.SliceStable(list, func(i, j int) bool {
+		if list[i].score != list[j].score {
+			return list[i].score > list[j].score
+		}
+		return list[i].id < list[j].id
+	})
+	// 无命中时每个文档只取一条，保证覆盖冠词、介词、语序等不同规则；
+	// 有命中时允许同一文档最多取两条，保留上下文完整性。
+	out := make([]GrammarChunk, 0, limit)
+	used := make(map[string]int)
+	for _, item := range list {
+		capPerDoc := 1
+		if item.score > 0 {
+			capPerDoc = 2
+		}
+		if used[item.source] >= capPerDoc {
+			continue
+		}
+		used[item.source]++
+		out = append(out, item.chunk)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 // GetSpeakingItem 返回单条口语题目。
