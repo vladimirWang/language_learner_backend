@@ -32,6 +32,8 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-}
+      # 口语语音输入转写模型（复用 LLM 凭证，默认 qwen3-asr-flash）
+      ASR_MODEL: ${ASR_MODEL:-}
       # PDF 解析队列：dev 复用 infra compose 中已运行的 rabbitmq（宿主机 5672）
       RABBITMQ_URL: ${RABBITMQ_URL:-amqp://root:1234@host.docker.internal:5672/}
       PDF_IMPORT_QUEUE: ${PDF_IMPORT_QUEUE:-pdf.import}

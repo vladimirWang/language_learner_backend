@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -757,6 +758,46 @@ func (h *Handler) speakingCheck(c *gin.Context) {
 		}
 	}
 	writeJSON(c, http.StatusOK, resp)
+}
+
+// speakingTranscribe 把考生录音转写为文本，供客户端语音输入使用。
+func (h *Handler) speakingTranscribe(c *gin.Context) {
+	if h.llm == nil || !h.llm.Enabled() {
+		writeError(c, http.StatusServiceUnavailable, "transcription unavailable")
+		return
+	}
+	// 单段录音限制 20MB，足够 60 秒语音且避免异常请求占满内存。
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 20<<20)
+	file, header, err := c.Request.FormFile("audio")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "audio file is required")
+		return
+	}
+	defer file.Close()
+	audio, err := io.ReadAll(io.LimitReader(file, 20<<20))
+	if err != nil || len(audio) == 0 {
+		writeError(c, http.StatusBadRequest, "audio file is empty")
+		return
+	}
+	mime := strings.TrimSpace(header.Header.Get("Content-Type"))
+	if !strings.HasPrefix(mime, "audio/") {
+		mime = "audio/wav"
+	}
+	// 客户端传入题目语种，避免模型自动检测后把外语回答转写成中文。
+	lang := strings.TrimSpace(c.Request.FormValue("lang"))
+	if lang != "" && !langPattern.MatchString(lang) {
+		writeError(c, http.StatusBadRequest, "invalid lang")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+	text, err := h.llm.Transcribe(ctx, audio, mime, lang)
+	if err != nil {
+		h.logger.Printf("speaking transcribe: %v", err)
+		writeError(c, http.StatusBadGateway, "transcription failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"text": text})
 }
 
 // ---------------------------------------------------------------------------

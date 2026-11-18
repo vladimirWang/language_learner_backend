@@ -5,6 +5,7 @@ package llm
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -145,6 +146,83 @@ func (c *Client) chat(ctx context.Context, system, user string, temperature floa
 	}
 	if len(parsed.Choices) == 0 {
 		return "", errors.New("llm returned no choices")
+	}
+	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
+}
+
+// Transcribe 用语音识别模型把音频转写为文本。
+// 走 OpenAI 兼容的 chat/completions：DashScope 的 qwen3-asr 系列以 input_audio 传入音频。
+// 模型可用 ASR_MODEL 覆盖，便于切换到其他兼容实现。
+// lang 指定音频语种（如 de/en/ja）；为空则由模型自动检测。
+func (c *Client) Transcribe(ctx context.Context, audio []byte, mime, lang string) (string, error) {
+	if !c.Enabled() {
+		return "", errors.New("llm not configured")
+	}
+	if len(audio) == 0 {
+		return "", errors.New("empty audio")
+	}
+	if mime == "" {
+		mime = "audio/wav"
+	}
+	model := strings.TrimSpace(os.Getenv("ASR_MODEL"))
+	if model == "" {
+		model = "qwen3-asr-flash"
+	}
+	payload := map[string]any{
+		"model": model,
+		"messages": []map[string]any{
+			{
+				"role": "user",
+				"content": []map[string]any{
+					{
+						"type": "input_audio",
+						"input_audio": map[string]string{
+							"data": "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(audio),
+						},
+					},
+				},
+			},
+		},
+		"stream": false,
+	}
+	// 不指定语种时模型会自行检测，容易把外语回答识别/翻译成中文；
+	// 已知语种时显式传入，保证按原语种转写。
+	if lang = strings.TrimSpace(lang); lang != "" {
+		payload["asr_options"] = map[string]any{"language": lang}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	// 音频上传与转写耗时远高于文本对话，单独放宽超时。
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	var parsed chatResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", fmt.Errorf("decode asr response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if parsed.Error != nil && parsed.Error.Message != "" {
+			return "", fmt.Errorf("asr http %d: %s", resp.StatusCode, parsed.Error.Message)
+		}
+		return "", fmt.Errorf("asr http %d", resp.StatusCode)
+	}
+	if len(parsed.Choices) == 0 {
+		return "", errors.New("asr returned no choices")
 	}
 	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
 }
