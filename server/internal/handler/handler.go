@@ -4,6 +4,7 @@ package handler
 import (
 	"archive/zip"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/csv"
 	"encoding/hex"
@@ -34,6 +35,11 @@ import (
 
 var langPattern = regexp.MustCompile(`^[a-z]{2,5}$`)
 
+// JobPublisher 抽象异步任务投递，便于在未配置 MQ 时降级。
+type JobPublisher interface {
+	Publish(ctx context.Context, payload any) error
+}
+
 // Handler 聚合依赖并构造路由。
 type Handler struct {
 	store     *store.Store
@@ -41,6 +47,7 @@ type Handler struct {
 	presigner *storage.Presigner
 	repoURLs  map[string]string
 	llm       *llm.Client
+	pdfPub    JobPublisher
 	logger    *log.Logger
 
 	// 口语兜底话术缓存：启动/读写后按 TTL 重新加载，避免每次追问都查库。
@@ -55,8 +62,8 @@ type Handler struct {
 }
 
 // New 创建 HTTP 处理器。
-func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, logger *log.Logger) *Handler {
-	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, logger: logger}
+func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, pdfPub JobPublisher, logger *log.Logger) *Handler {
+	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, pdfPub: pdfPub, logger: logger}
 }
 
 // Routes 注册全部 API 路由。gin.Engine 实现了 http.Handler，签名保持不变。
@@ -81,6 +88,12 @@ func (h *Handler) Routes() http.Handler {
 		// 构建触发与构建状态
 		api.POST("/build/trigger", h.trigger)
 		api.GET("/build/status", h.buildStatus)
+
+		// PDF 试卷导入：先落盘入库，再由 RabbitMQ 异步解析
+		api.POST("/pdf/import", h.pdfImport)
+		api.GET("/pdf/jobs", h.pdfJobs)
+		api.GET("/pdf/job/:jobId", h.pdfJobDetail)
+		api.POST("/pdf/job/:jobId/retry", h.pdfJobRetry)
 	}
 
 	// 听力导入任务
@@ -120,6 +133,11 @@ func (h *Handler) Routes() http.Handler {
 		speaking.POST("/exam-parts", h.createSpeakingExamPart)
 		speaking.PUT("/exam-parts/:id", h.updateSpeakingExamPart)
 		speaking.DELETE("/exam-parts/:id", h.deleteSpeakingExamPart)
+		speaking.GET("/plans", h.listSpeakingPlans)
+		speaking.GET("/plans/:id", h.getSpeakingPlan)
+		speaking.POST("/plans", h.createSpeakingPlan)
+		speaking.PUT("/plans/:id", h.updateSpeakingPlan)
+		speaking.DELETE("/plans/:id", h.deleteSpeakingPlan)
 		speaking.GET("/items/:key", h.getSpeakingItem)
 		speaking.POST("/items", h.createSpeakingItem)
 		speaking.PUT("/items/:key", h.updateSpeakingItem)
@@ -133,11 +151,6 @@ func (h *Handler) Routes() http.Handler {
 		speaking.POST("/templates", h.createSpeakingTemplate)
 		speaking.PUT("/templates/:id", h.updateSpeakingTemplate)
 		speaking.DELETE("/templates/:id", h.deleteSpeakingTemplate)
-		speaking.GET("/plans", h.listSpeakingPlans)
-		speaking.GET("/plans/:id", h.getSpeakingPlan)
-		speaking.POST("/plans", h.createSpeakingPlan)
-		speaking.PUT("/plans/:id", h.updateSpeakingPlan)
-		speaking.DELETE("/plans/:id", h.deleteSpeakingPlan)
 	}
 	return r
 }
@@ -1064,6 +1077,195 @@ func (h *Handler) deleteListeningJob(c *gin.Context) {
 	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
+var unsafeFilenamePattern = regexp.MustCompile(`[^\p{L}\p{N}._-]+`)
+
+// workRoot 返回构建/上传工作目录。
+func workRoot() string {
+	if v := strings.TrimSpace(os.Getenv("WORK_DIR")); v != "" {
+		return v
+	}
+	return "work"
+}
+
+// pdfImport 接收 PDF：先保存文件并登记数据库，再投递 RabbitMQ。
+func (h *Handler) pdfImport(c *gin.Context) {
+	lang := strings.TrimSpace(c.Request.FormValue("lang"))
+	if lang == "" {
+		lang = "de"
+	}
+	if !langPattern.MatchString(lang) {
+		writeError(c, http.StatusBadRequest, "invalid lang")
+		return
+	}
+
+	src, header, err := c.Request.FormFile("file")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "file is required")
+		return
+	}
+	defer src.Close()
+
+	magic := make([]byte, 5)
+	if _, err := io.ReadFull(src, magic); err != nil || string(magic) != "%PDF-" {
+		writeError(c, http.StatusBadRequest, "仅支持 PDF 文件")
+		return
+	}
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		writeError(c, http.StatusBadRequest, "cannot read uploaded file")
+		return
+	}
+
+	raw := make([]byte, 8)
+	if _, err := rand.Read(raw); err != nil {
+		writeError(c, http.StatusInternalServerError, "generate job id failed")
+		return
+	}
+	jobID := fmt.Sprintf("pdf-%s-%s", time.Now().Format("20060102-150405"), hex.EncodeToString(raw))
+
+	dir := filepath.Join(workRoot(), "pdf", jobID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		h.logger.Printf("mkdir pdf dir %s: %v", dir, err)
+		writeError(c, http.StatusInternalServerError, "prepare upload dir failed")
+		return
+	}
+
+	name := unsafeFilenamePattern.ReplaceAllString(filepath.Base(header.Filename), "_")
+	if name == "" || name == "." || name == "/" {
+		name = "paper.pdf"
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".pdf") {
+		name += ".pdf"
+	}
+	dst := filepath.Join(dir, name)
+
+	out, err := os.Create(dst)
+	if err != nil {
+		h.logger.Printf("create pdf %s: %v", dst, err)
+		writeError(c, http.StatusInternalServerError, "save pdf failed")
+		return
+	}
+	hash := md5.New()
+	size, copyErr := io.Copy(io.MultiWriter(out, hash), src)
+	closeErr := out.Close()
+	if copyErr != nil || closeErr != nil {
+		_ = os.Remove(dst)
+		h.logger.Printf("save pdf %s: %v / %v", dst, copyErr, closeErr)
+		writeError(c, http.StatusInternalServerError, "save pdf failed")
+		return
+	}
+
+	job := store.PDFImportJob{
+		JobID:        jobID,
+		OriginalName: header.Filename,
+		StoredPath:   dst,
+		SizeBytes:    size,
+		FileMD5:      hex.EncodeToString(hash.Sum(nil)),
+		Lang:         lang,
+		Status:       "pending",
+	}
+	if err := h.store.CreatePDFImportJob(c.Request.Context(), job); err != nil {
+		h.logger.Printf("create pdf import job: %v", err)
+		writeError(c, http.StatusInternalServerError, "create job failed")
+		return
+	}
+
+	if h.pdfPub == nil {
+		writeJSON(c, http.StatusAccepted, map[string]any{
+			"job_id": jobID, "status": "pending", "message": "消息队列未配置，任务等待手动重试",
+		})
+		return
+	}
+	pubCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.pdfPub.Publish(pubCtx, map[string]string{"job_id": jobID}); err != nil {
+		h.logger.Printf("publish pdf job %s: %v", jobID, err)
+		writeJSON(c, http.StatusInternalServerError, map[string]any{
+			"job_id": jobID, "status": "pending", "error": "PDF 已保存，但消息投递失败，可在任务列表重试",
+		})
+		return
+	}
+	_ = h.store.MarkPDFImportQueued(c.Request.Context(), jobID)
+	writeJSON(c, http.StatusAccepted, map[string]any{"job_id": jobID, "status": "queued"})
+}
+
+// pdfJobs 返回最近的 PDF 导入任务。
+func (h *Handler) pdfJobs(c *gin.Context) {
+	limit := 50
+	if raw := c.Query("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 500 {
+			limit = n
+		} else {
+			writeError(c, http.StatusBadRequest, "limit must be 1..500")
+			return
+		}
+	}
+	jobs, err := h.store.ListPDFImportJobs(c.Request.Context(), limit)
+	if err != nil {
+		h.logger.Printf("list pdf jobs: %v", err)
+		writeError(c, http.StatusInternalServerError, "query jobs failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"jobs": jobs})
+}
+
+// pdfJobDetail 返回任务与日志；after_log_id 用于增量刷新。
+func (h *Handler) pdfJobDetail(c *gin.Context) {
+	jobID := c.Param("jobId")
+	afterLogID, _ := strconv.ParseInt(c.Query("after_log_id"), 10, 64)
+	job, err := h.store.GetPDFImportJob(c.Request.Context(), jobID)
+	if err != nil {
+		h.logger.Printf("get pdf job %s: %v", jobID, err)
+		writeError(c, http.StatusInternalServerError, "query job failed")
+		return
+	}
+	if job == nil {
+		writeError(c, http.StatusNotFound, "job not found")
+		return
+	}
+	logs, err := h.store.ListPDFImportLogs(c.Request.Context(), jobID, afterLogID)
+	if err != nil {
+		h.logger.Printf("list pdf logs %s: %v", jobID, err)
+		writeError(c, http.StatusInternalServerError, "query logs failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"job": job, "logs": logs})
+}
+
+// pdfJobRetry 重新投递失败或待处理的任务。
+func (h *Handler) pdfJobRetry(c *gin.Context) {
+	jobID := c.Param("jobId")
+	job, err := h.store.GetPDFImportJob(c.Request.Context(), jobID)
+	if err != nil {
+		h.logger.Printf("get pdf job %s: %v", jobID, err)
+		writeError(c, http.StatusInternalServerError, "query job failed")
+		return
+	}
+	if job == nil {
+		writeError(c, http.StatusNotFound, "job not found")
+		return
+	}
+	if job.Status == "running" {
+		writeError(c, http.StatusConflict, "任务正在执行，请稍后再试")
+		return
+	}
+	if h.pdfPub == nil {
+		writeError(c, http.StatusServiceUnavailable, "消息队列未配置")
+		return
+	}
+	if err := h.store.ResetPDFImportJob(c.Request.Context(), jobID); err != nil {
+		h.logger.Printf("reset pdf job %s: %v", jobID, err)
+		writeError(c, http.StatusInternalServerError, "reset job failed")
+		return
+	}
+	if err := h.pdfPub.Publish(c.Request.Context(), map[string]string{"job_id": jobID}); err != nil {
+		h.logger.Printf("republish pdf job %s: %v", jobID, err)
+		writeError(c, http.StatusInternalServerError, "消息投递失败："+err.Error())
+		return
+	}
+	_ = h.store.MarkPDFImportQueued(c.Request.Context(), jobID)
+	writeJSON(c, http.StatusAccepted, map[string]any{"job_id": jobID, "status": "queued"})
+}
+
 // parseAnswerCSV 解析答案 CSV：题号,答案。
 // 答案支持：选择题 A/B/C/D；判断题 richtig/falsch（或缩写 r/f、true/false）。
 // 归一化后存储：A/B/C/D（选择）、R（正确）/F（错误）。忽略表头与非法行。
@@ -1379,208 +1581,6 @@ func (h *Handler) deleteSpeakingExamPart(c *gin.Context) {
 	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
-// speakingItemUpsert 是口语题目的创建/更新请求体。
-type speakingItemUpsert struct {
-	ItemKey        string `json:"item_key"`
-	Lang           string `json:"lang"`
-	Level          string `json:"level"`
-	ExamPart       string `json:"exam_part"`
-	Topic          string `json:"topic"`
-	Role           string `json:"role"`
-	PromptDE       string `json:"prompt_de"`
-	PromptZH       string `json:"prompt_zh"`
-	ExpectedPoints string `json:"expected_points"`
-	RefAnswer      string `json:"ref_answer"`
-	ErrorNote      string `json:"error_note"`
-	SortOrder      int    `json:"sort_order"`
-	Active         bool   `json:"active"`
-}
-
-var validExamParts = map[string]bool{
-	"part1_intro":        true,
-	"part2_presentation": true,
-	"part3_discussion":   true,
-}
-
-// speakingItemFromRequest 校验并规范化请求体。
-func speakingItemFromRequest(req speakingItemUpsert) (store.SpeakingItem, string) {
-	req.ItemKey = strings.TrimSpace(req.ItemKey)
-	req.Lang = strings.TrimSpace(req.Lang)
-	req.Level = strings.ToUpper(strings.TrimSpace(req.Level))
-	req.ExamPart = strings.TrimSpace(req.ExamPart)
-	req.Topic = strings.TrimSpace(req.Topic)
-	req.Role = strings.TrimSpace(req.Role)
-	req.PromptDE = strings.TrimSpace(req.PromptDE)
-	req.PromptZH = strings.TrimSpace(req.PromptZH)
-	req.ExpectedPoints = strings.TrimSpace(req.ExpectedPoints)
-	req.RefAnswer = strings.TrimSpace(req.RefAnswer)
-	req.ErrorNote = strings.TrimSpace(req.ErrorNote)
-
-	if req.Lang == "" {
-		req.Lang = "de"
-	}
-	if !langPattern.MatchString(req.Lang) {
-		return store.SpeakingItem{}, "invalid lang"
-	}
-	if !validCefrLevels[req.Level] {
-		return store.SpeakingItem{}, "invalid level (A1/A2/B1/B2/C1/C2)"
-	}
-	if !validExamParts[req.ExamPart] {
-		return store.SpeakingItem{}, "invalid exam_part"
-	}
-	if req.Topic == "" {
-		return store.SpeakingItem{}, "topic is required"
-	}
-	if req.PromptDE == "" {
-		return store.SpeakingItem{}, "prompt_de is required"
-	}
-	if req.Role == "" {
-		req.Role = "examiner"
-	}
-	if req.ExpectedPoints != "" {
-		var points []string
-		if err := json.Unmarshal([]byte(req.ExpectedPoints), &points); err != nil {
-			return store.SpeakingItem{}, "expected_points 必须是 JSON 字符串数组"
-		}
-	}
-
-	return store.SpeakingItem{
-		ItemKey:        req.ItemKey,
-		Lang:           req.Lang,
-		Level:          req.Level,
-		ExamPart:       req.ExamPart,
-		Topic:          req.Topic,
-		Role:           req.Role,
-		PromptDE:       req.PromptDE,
-		PromptZH:       req.PromptZH,
-		ExpectedPoints: req.ExpectedPoints,
-		RefAnswer:      req.RefAnswer,
-		ErrorNote:      req.ErrorNote,
-		SortOrder:      req.SortOrder,
-		Active:         req.Active,
-	}, ""
-}
-
-// getSpeakingItem 返回单条口语题目。
-func (h *Handler) getSpeakingItem(c *gin.Context) {
-	item, err := h.store.GetSpeakingItem(c.Request.Context(), c.Param("key"))
-	if err != nil {
-		h.logger.Printf("get speaking item: %v", err)
-		writeError(c, http.StatusInternalServerError, "get speaking item failed")
-		return
-	}
-	if item == nil {
-		writeError(c, http.StatusNotFound, "speaking item not found")
-		return
-	}
-	writeJSON(c, http.StatusOK, map[string]any{"item": item})
-}
-
-// createSpeakingItem 新增口语题目；item_key 为空时自动生成。
-func (h *Handler) createSpeakingItem(c *gin.Context) {
-	var req speakingItemUpsert
-	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
-		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
-		return
-	}
-	item, msg := speakingItemFromRequest(req)
-	if msg != "" {
-		writeError(c, http.StatusBadRequest, msg)
-		return
-	}
-	if item.ItemKey == "" {
-		item.ItemKey = fmt.Sprintf("%s-%s-%d", item.Lang, strings.ToLower(item.Level), time.Now().UnixNano())
-	}
-	if err := h.store.CreateSpeakingItem(c.Request.Context(), item); err != nil {
-		h.logger.Printf("create speaking item: %v", err)
-		writeError(c, http.StatusInternalServerError, "create speaking item failed")
-		return
-	}
-	writeJSON(c, http.StatusOK, map[string]any{"item_key": item.ItemKey})
-	h.invalidateTopicPlanCache()
-}
-
-// updateSpeakingItem 更新口语题目。
-func (h *Handler) updateSpeakingItem(c *gin.Context) {
-	key := c.Param("key")
-	var req speakingItemUpsert
-	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
-		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
-		return
-	}
-	req.ItemKey = key
-	item, msg := speakingItemFromRequest(req)
-	if msg != "" {
-		writeError(c, http.StatusBadRequest, msg)
-		return
-	}
-	if err := h.store.UpdateSpeakingItem(c.Request.Context(), item); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(c, http.StatusNotFound, "speaking item not found")
-			return
-		}
-		h.logger.Printf("update speaking item: %v", err)
-		writeError(c, http.StatusInternalServerError, "update speaking item failed")
-		return
-	}
-	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
-	h.invalidateTopicPlanCache()
-}
-
-// deleteSpeakingItem 删除口语题目。
-func (h *Handler) deleteSpeakingItem(c *gin.Context) {
-	if err := h.store.DeleteSpeakingItem(c.Request.Context(), c.Param("key")); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(c, http.StatusNotFound, "speaking item not found")
-			return
-		}
-		h.logger.Printf("delete speaking item: %v", err)
-		writeError(c, http.StatusInternalServerError, "delete speaking item failed")
-		return
-	}
-	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
-	h.invalidateTopicPlanCache()
-}
-
-// createLevel 创建关卡。
-func (h *Handler) createLevel(c *gin.Context) {
-	var req levelUpsert
-	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
-		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
-		return
-	}
-	req.Name = strings.TrimSpace(req.Name)
-	req.Lang = strings.TrimSpace(req.Lang)
-	req.Difficulty = strings.ToUpper(strings.TrimSpace(req.Difficulty))
-	if req.Name == "" {
-		writeError(c, http.StatusBadRequest, "name is required")
-		return
-	}
-	if req.Lang == "" {
-		req.Lang = "de"
-	}
-	if !langPattern.MatchString(req.Lang) {
-		writeError(c, http.StatusBadRequest, "invalid lang")
-		return
-	}
-	if req.Difficulty == "" {
-		req.Difficulty = "A1"
-	}
-	if !validDifficulties[req.Difficulty] {
-		writeError(c, http.StatusBadRequest, "invalid difficulty (A1/A2/B1/B2)")
-		return
-	}
-	id, err := h.store.CreateLevel(c.Request.Context(), req.Name, req.Lang, req.Difficulty, req.Description, req.SortOrder)
-	if err != nil {
-		h.logger.Printf("create level: %v", err)
-		writeError(c, http.StatusInternalServerError, "create level failed")
-		return
-	}
-	writeJSON(c, http.StatusOK, map[string]any{"id": id})
-}
-
-// getLevel 返回关卡详情（含关联的 exam 列表）。
-func (h *Handler) getLevel(c *gin.Context) {
 // speakingPlanUpsert 是口语方案的创建/更新请求体。
 type speakingPlanUpsert struct {
 	Lang        string   `json:"lang"`
@@ -1789,6 +1789,208 @@ func (h *Handler) deleteSpeakingPlan(c *gin.Context) {
 	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
+// speakingItemUpsert 是口语题目的创建/更新请求体。
+type speakingItemUpsert struct {
+	ItemKey        string `json:"item_key"`
+	Lang           string `json:"lang"`
+	Level          string `json:"level"`
+	ExamPart       string `json:"exam_part"`
+	Topic          string `json:"topic"`
+	Role           string `json:"role"`
+	PromptDE       string `json:"prompt_de"`
+	PromptZH       string `json:"prompt_zh"`
+	ExpectedPoints string `json:"expected_points"`
+	RefAnswer      string `json:"ref_answer"`
+	ErrorNote      string `json:"error_note"`
+	SortOrder      int    `json:"sort_order"`
+	Active         bool   `json:"active"`
+}
+
+var validExamParts = map[string]bool{
+	"part1_intro":        true,
+	"part2_presentation": true,
+	"part3_discussion":   true,
+}
+
+// speakingItemFromRequest 校验并规范化请求体。
+func speakingItemFromRequest(req speakingItemUpsert) (store.SpeakingItem, string) {
+	req.ItemKey = strings.TrimSpace(req.ItemKey)
+	req.Lang = strings.TrimSpace(req.Lang)
+	req.Level = strings.ToUpper(strings.TrimSpace(req.Level))
+	req.ExamPart = strings.TrimSpace(req.ExamPart)
+	req.Topic = strings.TrimSpace(req.Topic)
+	req.Role = strings.TrimSpace(req.Role)
+	req.PromptDE = strings.TrimSpace(req.PromptDE)
+	req.PromptZH = strings.TrimSpace(req.PromptZH)
+	req.ExpectedPoints = strings.TrimSpace(req.ExpectedPoints)
+	req.RefAnswer = strings.TrimSpace(req.RefAnswer)
+	req.ErrorNote = strings.TrimSpace(req.ErrorNote)
+
+	if req.Lang == "" {
+		req.Lang = "de"
+	}
+	if !langPattern.MatchString(req.Lang) {
+		return store.SpeakingItem{}, "invalid lang"
+	}
+	if !validCefrLevels[req.Level] {
+		return store.SpeakingItem{}, "invalid level (A1/A2/B1/B2/C1/C2)"
+	}
+	if !validExamParts[req.ExamPart] {
+		return store.SpeakingItem{}, "invalid exam_part"
+	}
+	if req.Topic == "" {
+		return store.SpeakingItem{}, "topic is required"
+	}
+	if req.PromptDE == "" {
+		return store.SpeakingItem{}, "prompt_de is required"
+	}
+	if req.Role == "" {
+		req.Role = "examiner"
+	}
+	if req.ExpectedPoints != "" {
+		var points []string
+		if err := json.Unmarshal([]byte(req.ExpectedPoints), &points); err != nil {
+			return store.SpeakingItem{}, "expected_points 必须是 JSON 字符串数组"
+		}
+	}
+
+	return store.SpeakingItem{
+		ItemKey:        req.ItemKey,
+		Lang:           req.Lang,
+		Level:          req.Level,
+		ExamPart:       req.ExamPart,
+		Topic:          req.Topic,
+		Role:           req.Role,
+		PromptDE:       req.PromptDE,
+		PromptZH:       req.PromptZH,
+		ExpectedPoints: req.ExpectedPoints,
+		RefAnswer:      req.RefAnswer,
+		ErrorNote:      req.ErrorNote,
+		SortOrder:      req.SortOrder,
+		Active:         req.Active,
+	}, ""
+}
+
+// getSpeakingItem 返回单条口语题目。
+func (h *Handler) getSpeakingItem(c *gin.Context) {
+	item, err := h.store.GetSpeakingItem(c.Request.Context(), c.Param("key"))
+	if err != nil {
+		h.logger.Printf("get speaking item: %v", err)
+		writeError(c, http.StatusInternalServerError, "get speaking item failed")
+		return
+	}
+	if item == nil {
+		writeError(c, http.StatusNotFound, "speaking item not found")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"item": item})
+}
+
+// createSpeakingItem 新增口语题目；item_key 为空时自动生成。
+func (h *Handler) createSpeakingItem(c *gin.Context) {
+	var req speakingItemUpsert
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	item, msg := speakingItemFromRequest(req)
+	if msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
+		return
+	}
+	if item.ItemKey == "" {
+		item.ItemKey = fmt.Sprintf("%s-%s-%d", item.Lang, strings.ToLower(item.Level), time.Now().UnixNano())
+	}
+	if err := h.store.CreateSpeakingItem(c.Request.Context(), item); err != nil {
+		h.logger.Printf("create speaking item: %v", err)
+		writeError(c, http.StatusInternalServerError, "create speaking item failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"item_key": item.ItemKey})
+	h.invalidateTopicPlanCache()
+}
+
+// updateSpeakingItem 更新口语题目。
+func (h *Handler) updateSpeakingItem(c *gin.Context) {
+	key := c.Param("key")
+	var req speakingItemUpsert
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	req.ItemKey = key
+	item, msg := speakingItemFromRequest(req)
+	if msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
+		return
+	}
+	if err := h.store.UpdateSpeakingItem(c.Request.Context(), item); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "speaking item not found")
+			return
+		}
+		h.logger.Printf("update speaking item: %v", err)
+		writeError(c, http.StatusInternalServerError, "update speaking item failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
+	h.invalidateTopicPlanCache()
+}
+
+// deleteSpeakingItem 删除口语题目。
+func (h *Handler) deleteSpeakingItem(c *gin.Context) {
+	if err := h.store.DeleteSpeakingItem(c.Request.Context(), c.Param("key")); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "speaking item not found")
+			return
+		}
+		h.logger.Printf("delete speaking item: %v", err)
+		writeError(c, http.StatusInternalServerError, "delete speaking item failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
+	h.invalidateTopicPlanCache()
+}
+
+// createLevel 创建关卡。
+func (h *Handler) createLevel(c *gin.Context) {
+	var req levelUpsert
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Lang = strings.TrimSpace(req.Lang)
+	req.Difficulty = strings.ToUpper(strings.TrimSpace(req.Difficulty))
+	if req.Name == "" {
+		writeError(c, http.StatusBadRequest, "name is required")
+		return
+	}
+	if req.Lang == "" {
+		req.Lang = "de"
+	}
+	if !langPattern.MatchString(req.Lang) {
+		writeError(c, http.StatusBadRequest, "invalid lang")
+		return
+	}
+	if req.Difficulty == "" {
+		req.Difficulty = "A1"
+	}
+	if !validDifficulties[req.Difficulty] {
+		writeError(c, http.StatusBadRequest, "invalid difficulty (A1/A2/B1/B2)")
+		return
+	}
+	id, err := h.store.CreateLevel(c.Request.Context(), req.Name, req.Lang, req.Difficulty, req.Description, req.SortOrder)
+	if err != nil {
+		h.logger.Printf("create level: %v", err)
+		writeError(c, http.StatusInternalServerError, "create level failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"id": id})
+}
+
+// getLevel 返回关卡详情（含关联的 exam 列表）。
+func (h *Handler) getLevel(c *gin.Context) {
 	id, err := parseLevelID(c)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "invalid level id")

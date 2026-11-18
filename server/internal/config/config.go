@@ -30,19 +30,27 @@ type Config struct {
 
 	// RepoURLs 各语种素材仓库地址（用于监听变更），如 de -> git@github.com:user/de.git
 	RepoURLs map[string]string
+
+	// RabbitMQURL / PDFQueue 用于 PDF 试卷导入的异步解析。
+	RabbitMQURL string
+	PDFQueue    string
+	WorkDir     string
 }
 
 // Load 读取环境变量并做缺省处理；不因缺少可选项而失败。
 func Load() Config {
 	cfg := Config{
-		Addr:       envOr("LISTEN_ADDR", ":8080"),
-		PGMaxConns: int32(envInt("PG_MAX_CONNS", 4)),
-		S3Endpoint: os.Getenv("S3_ENDPOINT"),
-		S3Bucket:   os.Getenv("S3_BUCKET"),
-		S3UseSSL:   strings.HasPrefix(strings.ToLower(os.Getenv("S3_ENDPOINT")), "https://"),
-		MinAvailMB: int64(envInt("MIN_AVAILABLE_MEM_MB", 120)),
-		BuilderCmd: envOr("BUILDER_CMD", "uv"),
-		BuilderDir: envOr("BUILDER_DIR", "../builder"),
+		Addr:        envOr("LISTEN_ADDR", ":8080"),
+		PGMaxConns:  int32(envInt("PG_MAX_CONNS", 4)),
+		S3Endpoint:  os.Getenv("S3_ENDPOINT"),
+		S3Bucket:    os.Getenv("S3_BUCKET"),
+		S3UseSSL:    strings.HasPrefix(strings.ToLower(os.Getenv("S3_ENDPOINT")), "https://"),
+		MinAvailMB:  int64(envInt("MIN_AVAILABLE_MEM_MB", 120)),
+		BuilderCmd:  envOr("BUILDER_CMD", "uv"),
+		BuilderDir:  envOr("BUILDER_DIR", "../builder"),
+		RabbitMQURL: envOr("RABBITMQ_URL", "amqp://root:1234@rabbitmq:5672/"),
+		PDFQueue:    envOr("PDF_IMPORT_QUEUE", "pdf.import"),
+		WorkDir:     envOr("WORK_DIR", "work"),
 	}
 	cfg.S3AccessKey = os.Getenv("S3_ACCESS_KEY")
 	cfg.S3SecretKey = os.Getenv("S3_SECRET_KEY")

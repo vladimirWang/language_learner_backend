@@ -14,6 +14,8 @@ import (
 	"github.com/wangfernando/language-learner/server/internal/config"
 	"github.com/wangfernando/language-learner/server/internal/handler"
 	"github.com/wangfernando/language-learner/server/internal/llm"
+	"github.com/wangfernando/language-learner/server/internal/mq"
+	"github.com/wangfernando/language-learner/server/internal/pdfworker"
 	"github.com/wangfernando/language-learner/server/internal/runner"
 	"github.com/wangfernando/language-learner/server/internal/scheduler"
 	"github.com/wangfernando/language-learner/server/internal/storage"
@@ -44,7 +46,12 @@ func main() {
 	} else {
 		logger.Printf("speaking dialog: LLM not configured, using templates")
 	}
-	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, logger)
+	publisher := mq.NewPublisher(cfg.RabbitMQURL, cfg.PDFQueue, logger)
+	defer publisher.Close()
+	pdfWorker := pdfworker.New(st, rn, cfg.RabbitMQURL, cfg.PDFQueue, cfg.WorkDir, logger)
+	pdfWorker.Start(ctx)
+
+	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, publisher, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

@@ -974,6 +974,138 @@ func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]Availa
 	return rows, err
 }
 
+// PDFImportJob 记录一次 PDF 试卷导入：文件先落盘登记，再异步解析。
+type PDFImportJob struct {
+	JobID        string          `gorm:"column:job_id;primaryKey" json:"job_id"`
+	OriginalName string          `gorm:"column:original_name" json:"original_name"`
+	StoredPath   string          `gorm:"column:stored_path" json:"stored_path"`
+	SizeBytes    int64           `gorm:"column:size_bytes" json:"size_bytes"`
+	FileMD5      string          `gorm:"column:file_md5" json:"file_md5"`
+	Lang         string          `gorm:"column:lang" json:"lang"`
+	Status       string          `gorm:"column:status" json:"status"`
+	Message      string          `gorm:"column:message" json:"message"`
+	PageCount    int             `gorm:"column:page_count" json:"page_count"`
+	Result       json.RawMessage `gorm:"column:result_json" json:"result"`
+	CreatedAt    time.Time       `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt    time.Time       `gorm:"column:updated_at" json:"updated_at"`
+	StartedAt    *time.Time      `gorm:"column:started_at" json:"started_at"`
+	FinishedAt   *time.Time      `gorm:"column:finished_at" json:"finished_at"`
+}
+
+func (PDFImportJob) TableName() string { return "pdf_import_jobs" }
+
+// PDFImportLog 是 PDF 解析子进程的一行日志。
+type PDFImportLog struct {
+	LogID     int64     `gorm:"column:log_id;primaryKey" json:"log_id"`
+	JobID     string    `gorm:"column:job_id" json:"job_id"`
+	Level     string    `gorm:"column:level" json:"level"`
+	Message   string    `gorm:"column:message" json:"message"`
+	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
+}
+
+func (PDFImportLog) TableName() string { return "pdf_import_logs" }
+
+// CreatePDFImportJob 登记一个待解析任务。
+func (s *Store) CreatePDFImportJob(ctx context.Context, job PDFImportJob) error {
+	return s.db.WithContext(ctx).Model(&PDFImportJob{}).Create(map[string]any{
+		"job_id":        job.JobID,
+		"original_name": job.OriginalName,
+		"stored_path":   job.StoredPath,
+		"size_bytes":    job.SizeBytes,
+		"file_md5":      job.FileMD5,
+		"lang":          job.Lang,
+		"status":        job.Status,
+		"message":       job.Message,
+	}).Error
+}
+
+// GetPDFImportJob 返回单个任务；不存在返回 nil。
+func (s *Store) GetPDFImportJob(ctx context.Context, jobID string) (*PDFImportJob, error) {
+	var job PDFImportJob
+	err := s.db.WithContext(ctx).Where("job_id = ?", jobID).Take(&job).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &job, nil
+}
+
+// ListPDFImportJobs 返回最近的导入任务。
+func (s *Store) ListPDFImportJobs(ctx context.Context, limit int) ([]PDFImportJob, error) {
+	jobs := make([]PDFImportJob, 0)
+	err := s.db.WithContext(ctx).Order("created_at DESC").Limit(limit).Find(&jobs).Error
+	return jobs, err
+}
+
+// ListPDFImportLogs 返回任务日志；afterLogID > 0 时只返回更新的部分。
+func (s *Store) ListPDFImportLogs(ctx context.Context, jobID string, afterLogID int64) ([]PDFImportLog, error) {
+	logs := make([]PDFImportLog, 0)
+	q := s.db.WithContext(ctx).Where("job_id = ?", jobID)
+	if afterLogID > 0 {
+		q = q.Where("log_id > ?", afterLogID)
+	}
+	err := q.Order("log_id ASC").Find(&logs).Error
+	return logs, err
+}
+
+// AppendPDFImportLog 追加一行解析日志。
+func (s *Store) AppendPDFImportLog(ctx context.Context, jobID, level, message string) error {
+	return s.db.WithContext(ctx).Model(&PDFImportLog{}).Create(map[string]any{
+		"job_id":  jobID,
+		"level":   level,
+		"message": message,
+	}).Error
+}
+
+// MarkPDFImportQueued 标记消息已成功投递。
+func (s *Store) MarkPDFImportQueued(ctx context.Context, jobID string) error {
+	return s.db.WithContext(ctx).Model(&PDFImportJob{}).Where("job_id = ?", jobID).
+		Updates(map[string]any{
+			"status":     "queued",
+			"updated_at": gorm.Expr("now()"),
+		}).Error
+}
+
+// StartPDFImportJob 标记任务开始执行。
+func (s *Store) StartPDFImportJob(ctx context.Context, jobID string) error {
+	return s.db.WithContext(ctx).Model(&PDFImportJob{}).Where("job_id = ?", jobID).
+		Updates(map[string]any{
+			"status":     "running",
+			"message":    "",
+			"started_at": gorm.Expr("now()"),
+			"updated_at": gorm.Expr("now()"),
+		}).Error
+}
+
+// FinishPDFImportJob 写入解析结果或失败原因。
+func (s *Store) FinishPDFImportJob(ctx context.Context, jobID, status, message string, pages int, result json.RawMessage) error {
+	return s.db.WithContext(ctx).Model(&PDFImportJob{}).Where("job_id = ?", jobID).
+		Updates(map[string]any{
+			"status":      status,
+			"message":     message,
+			"page_count":  pages,
+			"result_json": aidExpr(result),
+			"finished_at": gorm.Expr("now()"),
+			"updated_at":  gorm.Expr("now()"),
+		}).Error
+}
+
+// ResetPDFImportJob 把失败任务重置为待解析，供重新投递。
+func (s *Store) ResetPDFImportJob(ctx context.Context, jobID string) error {
+	return s.db.WithContext(ctx).Model(&PDFImportJob{}).Where("job_id = ?", jobID).
+		Updates(map[string]any{
+			"status":      "pending",
+			"message":     "",
+			"page_count":  0,
+			"result_json": gorm.Expr("NULL::jsonb"),
+			"started_at":  nil,
+			"finished_at": nil,
+			"updated_at":  gorm.Expr("now()"),
+		}).Error
+}
+
 // Store 持有 gorm 数据库连接。
 type Store struct {
 	db *gorm.DB
