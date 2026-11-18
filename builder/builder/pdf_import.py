@@ -26,6 +26,14 @@ import tempfile
 from pathlib import Path
 
 SECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    # 书末“Lösungen und Hörtexte / Texte zum Diktat”属于答案与听力原文页，需优先识别，
+    # 避免其中的 Diktat 标题把答案页并入听写正文。
+    (
+        "answers",
+        re.compile(
+            r"l[oö]sungen\s+und\s+h[oö]rtexte|texte\s+zum\s+diktat", re.IGNORECASE
+        ),
+    ),
     ("diktat", re.compile(r"\bdiktat\b", re.IGNORECASE)),
     ("hoeren", re.compile(r"h[oö]rverstehen", re.IGNORECASE)),
     ("lesen", re.compile(r"leseverstehen", re.IGNORECASE)),
@@ -36,7 +44,10 @@ SECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("writing", re.compile(r"schriftlicher\s+ausdruck", re.IGNORECASE)),
 ]
 
-PAPER_PATTERN = re.compile(r"PGG\s*[-_]?\s*(20\d{2})\s*([AB])?", re.IGNORECASE)
+# 题头形如 “PGG 2013 (B)”“PGG 2015 BEER)”，OCR 常丢失左括号，需容忍。
+PAPER_PATTERN = re.compile(
+    r"PGG\s*[-_]?\s*(20\d{2})\s*[\(\[]?\s*([AB])?", re.IGNORECASE
+)
 
 # 扫描页 OCR：文字量低于阈值且页面有图片时触发。
 OCR_MIN_CHARS = 40
@@ -45,8 +56,11 @@ OCR_TIMEOUT_SEC = 180
 # tesseract 语言代码与项目 lang 的映射。
 OCR_LANG_MAP = {"de": "deu", "en": "eng", "ja": "jpn", "zh": "chi_sim"}
 
+# 仅识别真正的答案页；不能匹配 “Lösungen auf dem Antwortbogen” 这类答题指令，
+# 否则会把听力/阅读题干页整页跳过。
 ANSWER_MARKER = re.compile(
-    r"(l[oö]sungsschl[üu]ssel|antwortschl[üu]ssel|参考答案|答案|听力原文|h[oö]rtext|transkript)",
+    r"l[oö]sungen\s+und\s+h[oö]rtexte|texte\s+zum\s+diktat|"
+    r"l[oö]sungsschl[üu]ssel|antwortschl[üu]ssel|参考答案",
     re.IGNORECASE,
 )
 QUESTION_NO = re.compile(r"(?m)^\s*(\d{1,3})\s*[.)]\s+")
@@ -303,6 +317,10 @@ def extract_exam(result: dict, version: str) -> dict:
         if ANSWER_MARKER.search(text):
             answers_by_paper.setdefault(paper_id, {}).update(parse_answers(text))
 
+    # 听写 / 写作原文可能跨页，先按页收集再按套卷合并。
+    diktat_texts: dict[str, list[str]] = {}
+    writing_prompts: dict[str, dict] = {}
+
     for block in result.get("blocks", []):
         paper_id = block.get("paper_id")
         text = block.get("raw_text") or ""
@@ -326,25 +344,39 @@ def extract_exam(result: dict, version: str) -> dict:
                 )
         elif section == "diktat":
             full_text = text.strip()
-            if len(full_text) > 40:
-                diktat.append(
-                    {
-                        "paper_id": paper_id,
-                        "full_text": full_text,
-                        "word_count": len(full_text.split()),
-                    }
-                )
+            if full_text:
+                diktat_texts.setdefault(paper_id, []).append(full_text)
         elif section == "writing":
-            limit_match = WORD_LIMIT.search(text)
             prompt = text.strip()
             if prompt:
-                writing.append(
-                    {
-                        "paper_id": paper_id,
-                        "prompt": prompt,
-                        "word_limit": int(limit_match.group(1)) if limit_match else None,
-                    }
+                entry = writing_prompts.setdefault(
+                    paper_id, {"chunks": [], "word_limit": None}
                 )
+                entry["chunks"].append(prompt)
+                limit_match = WORD_LIMIT.search(text)
+                if limit_match and entry["word_limit"] is None:
+                    entry["word_limit"] = int(limit_match.group(1))
+
+    for paper_id, chunks in diktat_texts.items():
+        full_text = "\n".join(chunks).strip()
+        if len(full_text) > 40:
+            diktat.append(
+                {
+                    "paper_id": paper_id,
+                    "full_text": full_text,
+                    "word_count": len(full_text.split()),
+                }
+            )
+    for paper_id, entry in writing_prompts.items():
+        prompt = "\n".join(entry["chunks"]).strip()
+        if prompt:
+            writing.append(
+                {
+                    "paper_id": paper_id,
+                    "prompt": prompt,
+                    "word_limit": entry["word_limit"],
+                }
+            )
 
     # 题号去重，保留首次出现（同一套卷同一题型）。
     seen: set[tuple[str, str, str]] = set()
