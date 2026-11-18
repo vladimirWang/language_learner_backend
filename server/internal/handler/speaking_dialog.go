@@ -3,11 +3,17 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
+
+	"github.com/gin-gonic/gin"
+	"github.com/wangfernando/language-learner/server/internal/store"
 )
 
 var ragKeywordRe = regexp.MustCompile(`[A-Za-zÄÖÜäöüß]{5,}`)
@@ -175,15 +181,7 @@ func normalizeText(text string) string {
 }
 
 // pickTemplate 在模板池中轮转，优先选择本轮对话里没出现过的句子。
-func pickTemplate(part, role string, followupCount int, used map[string]bool) string {
-	pool := partnerTemplates
-	if role != "partner" {
-		if p, ok := examinerTemplates[part]; ok && len(p) > 0 {
-			pool = p
-		} else {
-			pool = examinerTemplates["part1_intro"]
-		}
-	}
+func pickTemplate(pool []string, followupCount int, used map[string]bool) string {
 	if len(pool) == 0 {
 		return "Können Sie das noch etwas genauer erklären?"
 	}
@@ -195,6 +193,66 @@ func pickTemplate(part, role string, followupCount int, used map[string]bool) st
 		}
 	}
 	return pool[start]
+}
+
+const templateCacheTTL = 60 * time.Second
+
+// templatePool 从数据库读取兜底话术（60 秒缓存）；表为空或查询失败时回退代码内默认值。
+func (h *Handler) templatePool(ctx context.Context, part, role string) []string {
+	key := part
+	if role == "partner" {
+		key = "partner"
+	}
+	h.tplMu.RLock()
+	pool := h.tplCache[key]
+	loadedAt := h.tplCacheAt
+	h.tplMu.RUnlock()
+	if len(pool) > 0 && time.Since(loadedAt) < templateCacheTTL {
+		return pool
+	}
+	if h.store != nil {
+		items, err := h.store.ListSpeakingReplyTemplates(ctx, true)
+		if err == nil {
+			next := make(map[string][]string)
+			for _, item := range items {
+				if item.Lang != "" && item.Lang != "de" {
+					continue
+				}
+				k := item.ExamPart
+				if item.Role == "partner" {
+					k = "partner"
+				}
+				next[k] = append(next[k], item.Text)
+			}
+			h.tplMu.Lock()
+			h.tplCache = next
+			h.tplCacheAt = time.Now()
+			h.tplMu.Unlock()
+			if len(next[key]) > 0 {
+				return next[key]
+			}
+		} else {
+			h.logger.Printf("load speaking templates: %v", err)
+		}
+	}
+	return defaultTemplatePool(part, role)
+}
+
+func defaultTemplatePool(part, role string) []string {
+	if role == "partner" {
+		return partnerTemplates
+	}
+	if pool, ok := examinerTemplates[part]; ok && len(pool) > 0 {
+		return pool
+	}
+	return examinerTemplates["part1_intro"]
+}
+
+// invalidateTemplateCache 在管理台增删改后清空缓存，下一次请求重新加载。
+func (h *Handler) invalidateTemplateCache() {
+	h.tplMu.Lock()
+	h.tplCacheAt = time.Time{}
+	h.tplMu.Unlock()
 }
 
 func examinerSystemPrompt(level, topic string) string {
@@ -265,10 +323,10 @@ func validGermanReply(text, level string) bool {
 }
 
 // speakingReply 生成追问或搭档回应：优先 LLM，异常时回退模板。
-func (h *Handler) speakingReply(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) speakingReply(c *gin.Context) {
 	var req speakingReplyReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
 	req.Level = strings.ToUpper(strings.TrimSpace(req.Level))
@@ -276,11 +334,11 @@ func (h *Handler) speakingReply(w http.ResponseWriter, r *http.Request) {
 	req.Topic = strings.TrimSpace(req.Topic)
 	req.Role = strings.TrimSpace(req.Role)
 	if !validCefrLevels[req.Level] {
-		writeError(w, http.StatusBadRequest, "invalid level")
+		writeError(c, http.StatusBadRequest, "invalid level")
 		return
 	}
 	if !validExamParts[req.ExamPart] {
-		writeError(w, http.StatusBadRequest, "invalid exam_part")
+		writeError(c, http.StatusBadRequest, "invalid exam_part")
 		return
 	}
 	if req.Role != "partner" {
@@ -301,10 +359,10 @@ func (h *Handler) speakingReply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	fallback := pickTemplate(req.ExamPart, req.Role, req.FollowupCount, used)
+	fallback := pickTemplate(h.templatePool(c.Request.Context(), req.ExamPart, req.Role), req.FollowupCount, used)
 
 	if !h.llm.Enabled() {
-		writeJSON(w, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
+		writeJSON(c, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
 		return
 	}
 
@@ -333,7 +391,7 @@ func (h *Handler) speakingReply(w http.ResponseWriter, r *http.Request) {
 	} else {
 		sb.WriteString("\n请生成考官对考生最后一句话的追问（德语，一到两句）。")
 	}
-	if refs := h.speakingReferences(r.Context(), req); len(refs) > 0 {
+	if refs := h.speakingReferences(c.Request.Context(), req); len(refs) > 0 {
 		sb.WriteString("\n\n参考资料（仅可借鉴表达，不要照抄）：\n")
 		for _, ref := range refs {
 			sb.WriteString("- ")
@@ -354,11 +412,11 @@ func (h *Handler) speakingReply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	basePrompt := sb.String()
-	reply, err := h.llm.Chat(r.Context(), system, basePrompt)
+	reply, err := h.llm.Chat(c.Request.Context(), system, basePrompt)
 	if err == nil {
 		reply = sanitizeReply(reply)
 		if validGermanReply(reply, req.Level) && !similarToAny(reply, past) {
-			writeJSON(w, http.StatusOK, speakingReplyResp{Reply: reply, Source: "llm"})
+			writeJSON(c, http.StatusOK, speakingReplyResp{Reply: reply, Source: "llm"})
 			return
 		}
 		if err == nil && validGermanReply(reply, req.Level) {
@@ -370,13 +428,13 @@ func (h *Handler) speakingReply(w http.ResponseWriter, r *http.Request) {
 				ban.WriteString(past[i])
 				ban.WriteString("\n")
 			}
-			retry, retryErr := h.llm.Chat(r.Context(), system,
+			retry, retryErr := h.llm.Chat(c.Request.Context(), system,
 				basePrompt+"\n\n以下句子已经问过，严禁重复或改写：\n"+ban.String()+
 					"\n请换一个完全不同的角度提问。")
 			if retryErr == nil {
 				retry = sanitizeReply(retry)
 				if validGermanReply(retry, req.Level) && !similarToAny(retry, past) {
-					writeJSON(w, http.StatusOK, speakingReplyResp{Reply: retry, Source: "llm"})
+					writeJSON(c, http.StatusOK, speakingReplyResp{Reply: retry, Source: "llm"})
 					return
 				}
 			}
@@ -386,5 +444,136 @@ func (h *Handler) speakingReply(w http.ResponseWriter, r *http.Request) {
 	} else {
 		h.logger.Printf("speaking llm: %v", err)
 	}
-	writeJSON(w, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
+	writeJSON(c, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
+}
+
+// ---------------------------------------------------------------------------
+// 兜底话术管理（管理台）
+// ---------------------------------------------------------------------------
+
+type speakingTemplateReq struct {
+	ExamPart  string `json:"exam_part"`
+	Role      string `json:"role"`
+	Text      string `json:"text"`
+	Active    *bool  `json:"active"`
+	SortOrder int    `json:"sort_order"`
+}
+
+func (req speakingTemplateReq) validate() (store.SpeakingReplyTemplate, error) {
+	item := store.SpeakingReplyTemplate{}
+	if !validExamParts[strings.TrimSpace(req.ExamPart)] {
+		return item, errors.New("invalid exam_part")
+	}
+	role := strings.TrimSpace(req.Role)
+	if role != "examiner" && role != "partner" {
+		return item, errors.New("invalid role")
+	}
+	text := strings.TrimSpace(req.Text)
+	if text == "" {
+		return item, errors.New("text is required")
+	}
+	if utf8.RuneCountInString(text) > 300 {
+		return item, errors.New("text is too long")
+	}
+	active := true
+	if req.Active != nil {
+		active = *req.Active
+	}
+	return store.SpeakingReplyTemplate{
+		Lang:      "de",
+		ExamPart:  strings.TrimSpace(req.ExamPart),
+		Role:      role,
+		Text:      text,
+		Active:    active,
+		SortOrder: req.SortOrder,
+	}, nil
+}
+
+func (h *Handler) listSpeakingTemplates(c *gin.Context) {
+	activeOnly := c.Query("active_only") == "true"
+	items, err := h.store.ListSpeakingReplyTemplates(c.Request.Context(), activeOnly)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"templates": items})
+}
+
+func (h *Handler) createSpeakingTemplate(c *gin.Context) {
+	var req speakingTemplateReq
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	item, err := req.validate()
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.store.CreateSpeakingReplyTemplate(c.Request.Context(), &item); err != nil {
+		writeError(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.invalidateTemplateCache()
+	writeJSON(c, http.StatusOK, map[string]any{"id": item.ID})
+}
+
+func (h *Handler) updateSpeakingTemplate(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var req speakingTemplateReq
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	item, err := req.validate()
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	item.ID = id
+	// 未传 active 时保留原状态，避免误把停用话术重新启用。
+	if req.Active == nil {
+		existing, getErr := h.store.GetSpeakingReplyTemplate(c.Request.Context(), id)
+		if getErr != nil {
+			if errors.Is(getErr, store.ErrNotFound) {
+				writeError(c, http.StatusNotFound, "template not found")
+				return
+			}
+			writeError(c, http.StatusInternalServerError, getErr.Error())
+			return
+		}
+		item.Active = existing.Active
+	}
+	if err := h.store.UpdateSpeakingReplyTemplate(c.Request.Context(), &item); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "template not found")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.invalidateTemplateCache()
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (h *Handler) deleteSpeakingTemplate(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if err := h.store.DeleteSpeakingReplyTemplate(c.Request.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "template not found")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.invalidateTemplateCache()
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }

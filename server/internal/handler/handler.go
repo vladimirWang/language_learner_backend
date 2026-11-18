@@ -20,8 +20,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/wangfernando/language-learner/server/internal/llm"
 	"github.com/wangfernando/language-learner/server/internal/repo"
 	"github.com/wangfernando/language-learner/server/internal/scheduler"
@@ -39,6 +41,11 @@ type Handler struct {
 	repoURLs  map[string]string
 	llm       *llm.Client
 	logger    *log.Logger
+
+	// 口语兜底话术缓存：启动/读写后按 TTL 重新加载，避免每次追问都查库。
+	tplMu      sync.RWMutex
+	tplCache   map[string][]string
+	tplCacheAt time.Time
 }
 
 // New 创建 HTTP 处理器。
@@ -46,99 +53,128 @@ func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoU
 	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, logger: logger}
 }
 
-// Routes 注册全部 API 路由。
+// Routes 注册全部 API 路由。gin.Engine 实现了 http.Handler，签名保持不变。
 func (h *Handler) Routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/health", h.health)
-	mux.HandleFunc("GET /api/version", h.version)
-	mux.HandleFunc("GET /api/material/{lang}/{file}", h.material)
-	mux.HandleFunc("POST /api/build/trigger", h.trigger)
-	mux.HandleFunc("GET /api/build/status", h.buildStatus)
-	mux.HandleFunc("GET /api/repos", h.repos)
-	mux.HandleFunc("POST /api/listening/import", h.listeningImport)
-	mux.HandleFunc("GET /api/listening/jobs", h.listeningJobs)
-	mux.HandleFunc("GET /api/listening/job/{jobId}", h.listeningJobDetail)
-	mux.HandleFunc("GET /api/listening/job/{jobId}/files", h.listeningFiles)
-	mux.HandleFunc("GET /api/listening/job/{jobId}/download", h.listeningDownload)
-	mux.HandleFunc("GET /api/listening/job/{jobId}/archive", h.listeningArchive)
-	mux.HandleFunc("POST /api/listening/job/{jobId}/answers", h.listeningUpdateAnswers)
-	mux.HandleFunc("PATCH /api/listening/job/{jobId}", h.updateListeningJobMeta)
-	mux.HandleFunc("DELETE /api/listening/job/{jobId}", h.deleteListeningJob)
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	// 中间件顺序与原实现一致：最外层记录日志，其次处理 CORS。
+	r.Use(h.logRequests(), h.cors())
+	// 与 net/http ServeMux 保持一致：关闭尾斜杠/路径自动纠正重定向，路径存在但方法不匹配时返回 405。
+	r.RedirectTrailingSlash = false
+	r.RedirectFixedPath = false
+	r.HandleMethodNotAllowed = true
+
+	api := r.Group("/api")
+	{
+		// 基础：健康检查、版本清单、素材下载、仓库状态
+		api.GET("/health", h.health)
+		api.GET("/version", h.version)
+		api.GET("/material/:lang/:file", h.material)
+		api.GET("/repos", h.repos)
+
+		// 构建触发与构建状态
+		api.POST("/build/trigger", h.trigger)
+		api.GET("/build/status", h.buildStatus)
+	}
+
+	// 听力导入任务
+	listening := api.Group("/listening")
+	{
+		listening.POST("/import", h.listeningImport)
+		listening.GET("/jobs", h.listeningJobs)
+		listening.GET("/job/:jobId", h.listeningJobDetail)
+		listening.GET("/job/:jobId/files", h.listeningFiles)
+		listening.GET("/job/:jobId/download", h.listeningDownload)
+		listening.GET("/job/:jobId/archive", h.listeningArchive)
+		listening.POST("/job/:jobId/answers", h.listeningUpdateAnswers)
+		listening.PATCH("/job/:jobId", h.updateListeningJobMeta)
+		listening.DELETE("/job/:jobId", h.deleteListeningJob)
+	}
 
 	// 关卡配置
-	mux.HandleFunc("GET /api/levels", h.listLevels)
-	mux.HandleFunc("POST /api/levels", h.createLevel)
-	mux.HandleFunc("GET /api/levels/{id}", h.getLevel)
-	mux.HandleFunc("PUT /api/levels/{id}", h.updateLevel)
-	mux.HandleFunc("DELETE /api/levels/{id}", h.deleteLevel)
-	mux.HandleFunc("GET /api/levels/{id}/exams", h.listLevelExams)
-	mux.HandleFunc("POST /api/levels/{id}/exams", h.addLevelExam)
-	mux.HandleFunc("DELETE /api/levels/{id}/exams/{examId}", h.removeLevelExam)
-	mux.HandleFunc("GET /api/levels/{id}/exams/available", h.listAvailableExams)
+	levels := api.Group("/levels")
+	{
+		levels.GET("", h.listLevels)
+		levels.POST("", h.createLevel)
+		levels.GET("/:id", h.getLevel)
+		levels.PUT("/:id", h.updateLevel)
+		levels.DELETE("/:id", h.deleteLevel)
+		levels.GET("/:id/exams", h.listLevelExams)
+		levels.POST("/:id/exams", h.addLevelExam)
+		levels.DELETE("/:id/exams/:examId", h.removeLevelExam)
+		levels.GET("/:id/exams/available", h.listAvailableExams)
+	}
 
-	// 口语题库
-	mux.HandleFunc("GET /api/speaking/items", h.listSpeakingItems)
-	mux.HandleFunc("GET /api/speaking/items/{key}", h.getSpeakingItem)
-	mux.HandleFunc("POST /api/speaking/items", h.createSpeakingItem)
-	mux.HandleFunc("PUT /api/speaking/items/{key}", h.updateSpeakingItem)
-	mux.HandleFunc("DELETE /api/speaking/items/{key}", h.deleteSpeakingItem)
-	mux.HandleFunc("POST /api/speaking/reply", h.speakingReply)
-	return h.logRequests(h.cors(mux))
+	// 口语题库与兜底话术
+	speaking := api.Group("/speaking")
+	{
+		speaking.GET("/items", h.listSpeakingItems)
+		speaking.GET("/items/:key", h.getSpeakingItem)
+		speaking.POST("/items", h.createSpeakingItem)
+		speaking.PUT("/items/:key", h.updateSpeakingItem)
+		speaking.DELETE("/items/:key", h.deleteSpeakingItem)
+		speaking.POST("/reply", h.speakingReply)
+		speaking.GET("/templates", h.listSpeakingTemplates)
+		speaking.POST("/templates", h.createSpeakingTemplate)
+		speaking.PUT("/templates/:id", h.updateSpeakingTemplate)
+		speaking.DELETE("/templates/:id", h.deleteSpeakingTemplate)
+	}
+	return r
 }
 
 // cors 允许跨域请求（供 Tauri client 端访问）。
 // TODO: 后续可改为 Tauri Rust HTTP 命令，由 Rust 端请求后端，彻底绕开浏览器跨域，
 // 届时可移除此中间件。
-func (h *Handler) cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+func (h *Handler) cors() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		c.Header("Access-Control-Max-Age", "86400")
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
-		next.ServeHTTP(w, r)
-	})
+		c.Next()
+	}
 }
 
-func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) health(c *gin.Context) {
 	resp := map[string]any{
 		"status":       "ok",
 		"available_mb": h.sched.AvailableMB(),
 		"build_busy":   h.sched.Busy(),
 		"postgres":     "ok",
 	}
-	if err := h.store.Ping(r.Context()); err != nil {
+	if err := h.store.Ping(c.Request.Context()); err != nil {
 		resp["status"] = "degraded"
 		resp["postgres"] = err.Error()
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(c, http.StatusOK, resp)
 }
 
-func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
-	lang := r.URL.Query().Get("lang")
+func (h *Handler) version(c *gin.Context) {
+	lang := c.Query("lang")
 	if !langPattern.MatchString(lang) {
-		writeError(w, http.StatusBadRequest, "invalid or missing lang")
+		writeError(c, http.StatusBadRequest, "invalid or missing lang")
 		return
 	}
 
-	v, err := h.store.LatestVersion(r.Context(), lang)
+	v, err := h.store.LatestVersion(c.Request.Context(), lang)
 	if err != nil {
 		h.logger.Printf("query version lang=%s: %v", lang, err)
-		writeError(w, http.StatusInternalServerError, "query version failed")
+		writeError(c, http.StatusInternalServerError, "query version failed")
 		return
 	}
 	if v == nil {
-		writeError(w, http.StatusNotFound, "no built version for lang "+lang)
+		writeError(c, http.StatusNotFound, "no built version for lang "+lang)
 		return
 	}
 
-	dbURL, vecURL, err := h.presign(r, v.DBURL, v.VectorURL)
+	dbURL, vecURL, err := h.presign(c.Request.Context(), v.DBURL, v.VectorURL)
 	if err != nil {
 		h.logger.Printf("presign version=%s: %v", v.Version, err)
-		writeError(w, http.StatusInternalServerError, "sign download url failed")
+		writeError(c, http.StatusInternalServerError, "sign download url failed")
 		return
 	}
 	// 未配置对象存储时，构建产物落在服务端本地目录：改由本服务直接提供下载。
@@ -148,7 +184,7 @@ func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(vecURL, "/") {
 		vecURL = "/api/material/" + lang + "/vectors.jsonl"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(c, http.StatusOK, map[string]any{
 		"lang":    v.Lang,
 		"version": v.Version,
 		"ground_truth": map[string]string{
@@ -163,57 +199,57 @@ func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) trigger(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) trigger(c *gin.Context) {
 	var req struct {
 		Lang    string `json:"lang"`
 		Version string `json:"version"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json body")
+	if err := json.NewDecoder(io.LimitReader(c.Request.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json body")
 		return
 	}
 	if !langPattern.MatchString(req.Lang) {
-		writeError(w, http.StatusBadRequest, "invalid or missing lang")
+		writeError(c, http.StatusBadRequest, "invalid or missing lang")
 		return
 	}
 
 	version, err := h.sched.Trigger(req.Lang, req.Version)
 	switch {
 	case errors.Is(err, scheduler.ErrBusy):
-		writeError(w, http.StatusConflict, err.Error())
+		writeError(c, http.StatusConflict, err.Error())
 		return
 	case errors.Is(err, scheduler.ErrLowMemory):
-		writeError(w, http.StatusServiceUnavailable, err.Error())
+		writeError(c, http.StatusServiceUnavailable, err.Error())
 		return
 	case err != nil:
 		h.logger.Printf("trigger build: %v", err)
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(c, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]string{
+	writeJSON(c, http.StatusAccepted, map[string]string{
 		"lang":    req.Lang,
 		"version": version,
 		"status":  "building",
 	})
 }
 
-func (h *Handler) buildStatus(w http.ResponseWriter, r *http.Request) {
-	version := r.URL.Query().Get("version")
+func (h *Handler) buildStatus(c *gin.Context) {
+	version := c.Query("version")
 	if version == "" {
-		writeError(w, http.StatusBadRequest, "missing version")
+		writeError(c, http.StatusBadRequest, "missing version")
 		return
 	}
-	v, logs, err := h.store.BuildStatus(r.Context(), version)
+	v, logs, err := h.store.BuildStatus(c.Request.Context(), version)
 	if err != nil {
 		h.logger.Printf("query build status %s: %v", version, err)
-		writeError(w, http.StatusInternalServerError, "query build status failed")
+		writeError(c, http.StatusInternalServerError, "query build status failed")
 		return
 	}
 	if v == nil {
-		writeError(w, http.StatusNotFound, "version not found")
+		writeError(c, http.StatusNotFound, "version not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(c, http.StatusOK, map[string]any{
 		"version":             v.Version,
 		"lang":                v.Lang,
 		"status":              v.Status,
@@ -226,26 +262,26 @@ func (h *Handler) buildStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) material(w http.ResponseWriter, r *http.Request) {
-	lang := r.PathValue("lang")
-	name := r.PathValue("file")
+func (h *Handler) material(c *gin.Context) {
+	lang := c.Param("lang")
+	name := c.Param("file")
 	if !langPattern.MatchString(lang) {
-		writeError(w, http.StatusBadRequest, "invalid or missing lang")
+		writeError(c, http.StatusBadRequest, "invalid or missing lang")
 		return
 	}
 	if name != "ground_truth.db" && name != "vectors.jsonl" {
-		writeError(w, http.StatusNotFound, "unknown material file")
+		writeError(c, http.StatusNotFound, "unknown material file")
 		return
 	}
 
-	v, err := h.store.LatestVersion(r.Context(), lang)
+	v, err := h.store.LatestVersion(c.Request.Context(), lang)
 	if err != nil {
 		h.logger.Printf("query version lang=%s: %v", lang, err)
-		writeError(w, http.StatusInternalServerError, "query version failed")
+		writeError(c, http.StatusInternalServerError, "query version failed")
 		return
 	}
 	if v == nil {
-		writeError(w, http.StatusNotFound, "no built version for lang "+lang)
+		writeError(c, http.StatusNotFound, "no built version for lang "+lang)
 		return
 	}
 
@@ -256,49 +292,45 @@ func (h *Handler) material(w http.ResponseWriter, r *http.Request) {
 	// 只有落在本机构建目录的产物才能直出；对象存储 key 交给预签名 URL。
 	if !filepath.IsAbs(path) || strings.Contains(path, "..") ||
 		!strings.HasSuffix(filepath.Clean(path), "/"+lang+"/"+name) {
-		writeError(w, http.StatusConflict, "material is not served as a local file")
+		writeError(c, http.StatusConflict, "material is not served as a local file")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", "attachment; filename="+name)
-	http.ServeFile(w, r, path)
+	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Disposition", "attachment; filename="+name)
+	http.ServeFile(c.Writer, c.Request, path)
 }
 
-func (h *Handler) presign(r *http.Request, dbKey, vecKey string) (string, string, error) {
-	dbURL, err := h.presigner.URL(r.Context(), dbKey)
+func (h *Handler) presign(ctx context.Context, dbKey, vecKey string) (string, string, error) {
+	dbURL, err := h.presigner.URL(ctx, dbKey)
 	if err != nil {
 		return "", "", err
 	}
-	vecURL, err := h.presigner.URL(r.Context(), vecKey)
+	vecURL, err := h.presigner.URL(ctx, vecKey)
 	if err != nil {
 		return "", "", err
 	}
 	return dbURL, vecURL, nil
 }
 
-func (h *Handler) logRequests(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) logRequests() gin.HandlerFunc {
+	return func(c *gin.Context) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		h.logger.Printf("%s %s %s", r.Method, r.URL.RequestURI(), time.Since(start))
-	})
-}
-
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		log.Printf("write response: %v", err)
+		c.Next()
+		h.logger.Printf("%s %s %d %s", c.Request.Method, c.Request.URL.RequestURI(), c.Writer.Status(), time.Since(start))
 	}
 }
 
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{"error": message})
+func writeJSON(c *gin.Context, status int, payload any) {
+	c.JSON(status, payload)
+}
+
+func writeError(c *gin.Context, status int, message string) {
+	c.AbortWithStatusJSON(status, map[string]string{"error": message})
 }
 
 // repos 返回各语种素材仓库的远程状态，以及与最近一次构建的对比。
-func (h *Handler) repos(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) repos(c *gin.Context) {
 	result := make([]map[string]any, 0, len(h.repoURLs))
 	for lang, url := range h.repoURLs {
 		item := map[string]any{
@@ -307,7 +339,7 @@ func (h *Handler) repos(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 查询远程最新 commit
-		commit, err := repo.LatestCommit(r.Context(), url)
+		commit, err := repo.LatestCommit(c.Request.Context(), url)
 		if err != nil {
 			item["error"] = err.Error()
 			item["latest_commit"] = ""
@@ -317,7 +349,7 @@ func (h *Handler) repos(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 查询最近一次构建的 source_commit
-		lastVersion, err := h.store.LatestVersion(r.Context(), lang)
+		lastVersion, err := h.store.LatestVersion(c.Request.Context(), lang)
 		if err != nil {
 			h.logger.Printf("query latest version lang=%s: %v", lang, err)
 			lastVersion = nil
@@ -342,32 +374,32 @@ func (h *Handler) repos(w http.ResponseWriter, r *http.Request) {
 
 		result = append(result, item)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"repos": result})
+	writeJSON(c, http.StatusOK, map[string]any{"repos": result})
 }
 
 // listeningImport 接收音视频 URL + 可选的 answers/cookies 文件，异步启动 builder.listen。
 // multipart 字段：url(examId/lang/model) 文本 + answers/cookies 文件（可选）。
-func (h *Handler) listeningImport(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(50 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid multipart: "+err.Error())
+func (h *Handler) listeningImport(c *gin.Context) {
+	if err := c.Request.ParseMultipartForm(50 << 20); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid multipart: "+err.Error())
 		return
 	}
 
-	url := strings.TrimSpace(r.FormValue("url"))
-	examID := strings.TrimSpace(r.FormValue("examId"))
-	lang := strings.TrimSpace(r.FormValue("lang"))
-	model := strings.TrimSpace(r.FormValue("model"))
+	url := strings.TrimSpace(c.Request.FormValue("url"))
+	examID := strings.TrimSpace(c.Request.FormValue("examId"))
+	lang := strings.TrimSpace(c.Request.FormValue("lang"))
+	model := strings.TrimSpace(c.Request.FormValue("model"))
 
 	if url == "" {
-		writeError(w, http.StatusBadRequest, "url is required")
+		writeError(c, http.StatusBadRequest, "url is required")
 		return
 	}
 	if examID == "" {
-		writeError(w, http.StatusBadRequest, "examId is required")
+		writeError(c, http.StatusBadRequest, "examId is required")
 		return
 	}
 	if !langPattern.MatchString(lang) {
-		writeError(w, http.StatusBadRequest, "invalid or missing lang (e.g. de/en/ja)")
+		writeError(c, http.StatusBadRequest, "invalid or missing lang (e.g. de/en/ja)")
 		return
 	}
 	if model == "" {
@@ -377,7 +409,7 @@ func (h *Handler) listeningImport(w http.ResponseWriter, r *http.Request) {
 	// 生成 job_id
 	jobIDBytes := make([]byte, 8)
 	if _, err := rand.Read(jobIDBytes); err != nil {
-		writeError(w, http.StatusInternalServerError, "generate job id failed")
+		writeError(c, http.StatusInternalServerError, "generate job id failed")
 		return
 	}
 	jobID := fmt.Sprintf("listen-%s-%s-%s",
@@ -391,26 +423,26 @@ func (h *Handler) listeningImport(w http.ResponseWriter, r *http.Request) {
 	uploadDir := filepath.Join(workRoot, "uploads", jobID)
 	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
 		h.logger.Printf("mkdir uploads %s: %v", uploadDir, err)
-		writeError(w, http.StatusInternalServerError, "prepare upload dir failed")
+		writeError(c, http.StatusInternalServerError, "prepare upload dir failed")
 		return
 	}
 
 	var answersPath, cookiesPath string
-	if fh, _, err := r.FormFile("answers"); err == nil {
+	if fh, _, err := c.Request.FormFile("answers"); err == nil {
 		dst := filepath.Join(uploadDir, "answers.csv")
 		if err := saveUploadedFile(fh, dst); err != nil {
 			fh.Close()
-			writeError(w, http.StatusInternalServerError, "save answers failed: "+err.Error())
+			writeError(c, http.StatusInternalServerError, "save answers failed: "+err.Error())
 			return
 		}
 		fh.Close()
 		answersPath = dst
 	}
-	if fh, _, err := r.FormFile("cookies"); err == nil {
+	if fh, _, err := c.Request.FormFile("cookies"); err == nil {
 		dst := filepath.Join(uploadDir, "cookies.txt")
 		if err := saveUploadedFile(fh, dst); err != nil {
 			fh.Close()
-			writeError(w, http.StatusInternalServerError, "save cookies failed: "+err.Error())
+			writeError(c, http.StatusInternalServerError, "save cookies failed: "+err.Error())
 			return
 		}
 		fh.Close()
@@ -419,9 +451,9 @@ func (h *Handler) listeningImport(w http.ResponseWriter, r *http.Request) {
 
 	// 入库 pending
 	hasAnswers := answersPath != ""
-	if err := h.store.CreateListeningJob(r.Context(), jobID, examID, lang, url, hasAnswers); err != nil {
+	if err := h.store.CreateListeningJob(c.Request.Context(), jobID, examID, lang, url, hasAnswers); err != nil {
 		h.logger.Printf("create listening job: %v", err)
-		writeError(w, http.StatusInternalServerError, "create job failed")
+		writeError(c, http.StatusInternalServerError, "create job failed")
 		return
 	}
 
@@ -445,18 +477,18 @@ func (h *Handler) listeningImport(w http.ResponseWriter, r *http.Request) {
 	err := h.sched.TriggerListening(jobID, examID, lang, args, nil)
 	switch {
 	case errors.Is(err, scheduler.ErrBusy):
-		writeError(w, http.StatusConflict, err.Error())
+		writeError(c, http.StatusConflict, err.Error())
 		return
 	case errors.Is(err, scheduler.ErrLowMemory):
-		writeError(w, http.StatusServiceUnavailable, err.Error())
+		writeError(c, http.StatusServiceUnavailable, err.Error())
 		return
 	case err != nil:
 		h.logger.Printf("trigger listening: %v", err)
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(c, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]any{
+	writeJSON(c, http.StatusAccepted, map[string]any{
 		"job_id":  jobID,
 		"exam_id": examID,
 		"lang":    lang,
@@ -464,43 +496,43 @@ func (h *Handler) listeningImport(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) listeningJobs(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) listeningJobs(c *gin.Context) {
 	limit := 50
-	if raw := r.URL.Query().Get("limit"); raw != "" {
+	if raw := c.Query("limit"); raw != "" {
 		if n, err := fmt.Sscanf(raw, "%d", &limit); n == 1 && err == nil && limit > 0 && limit <= 500 {
 			// ok
 		} else {
-			writeError(w, http.StatusBadRequest, "limit must be 1..500")
+			writeError(c, http.StatusBadRequest, "limit must be 1..500")
 			return
 		}
 	}
-	jobs, err := h.store.ListListeningJobs(r.Context(), limit)
+	jobs, err := h.store.ListListeningJobs(c.Request.Context(), limit)
 	if err != nil {
 		h.logger.Printf("list listening jobs: %v", err)
-		writeError(w, http.StatusInternalServerError, "query jobs failed")
+		writeError(c, http.StatusInternalServerError, "query jobs failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+	writeJSON(c, http.StatusOK, map[string]any{"jobs": jobs})
 }
 
-func (h *Handler) listeningJobDetail(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobId")
+func (h *Handler) listeningJobDetail(c *gin.Context) {
+	jobID := c.Param("jobId")
 	if jobID == "" {
-		writeError(w, http.StatusBadRequest, "missing jobId")
+		writeError(c, http.StatusBadRequest, "missing jobId")
 		return
 	}
-	afterLogID, _ := strconv.ParseInt(r.URL.Query().Get("after_log_id"), 10, 64)
-	job, logs, err := h.store.ListeningJobDetail(r.Context(), jobID, afterLogID)
+	afterLogID, _ := strconv.ParseInt(c.Query("after_log_id"), 10, 64)
+	job, logs, err := h.store.ListeningJobDetail(c.Request.Context(), jobID, afterLogID)
 	if err != nil {
 		h.logger.Printf("listening job detail %s: %v", jobID, err)
-		writeError(w, http.StatusInternalServerError, "query job failed")
+		writeError(c, http.StatusInternalServerError, "query job failed")
 		return
 	}
 	if job == nil {
-		writeError(w, http.StatusNotFound, "job not found: "+jobID)
+		writeError(c, http.StatusNotFound, "job not found: "+jobID)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(c, http.StatusOK, map[string]any{
 		"job":  job,
 		"logs": logs,
 	})
@@ -532,15 +564,15 @@ func (h *Handler) listeningExamDir(ctx context.Context, jobID string) (string, s
 }
 
 // listeningFiles 列出该任务目录下的全部产物（视频、音频、图片、转写文件等）。
-func (h *Handler) listeningFiles(w http.ResponseWriter, r *http.Request) {
-	dir, examID, err := h.listeningExamDir(r.Context(), r.PathValue("jobId"))
+func (h *Handler) listeningFiles(c *gin.Context) {
+	dir, examID, err := h.listeningExamDir(c.Request.Context(), c.Param("jobId"))
 	switch {
 	case errors.Is(err, errListeningJobNotFound):
-		writeError(w, http.StatusNotFound, "job not found")
+		writeError(c, http.StatusNotFound, "job not found")
 		return
 	case err != nil:
 		h.logger.Printf("locate listening dir: %v", err)
-		writeError(w, http.StatusInternalServerError, "locate exam dir failed")
+		writeError(c, http.StatusInternalServerError, "locate exam dir failed")
 		return
 	}
 
@@ -582,28 +614,28 @@ func (h *Handler) listeningFiles(w http.ResponseWriter, r *http.Request) {
 		h.logger.Printf("walk listening dir %s: %v", dir, walkErr)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(c, http.StatusOK, map[string]any{
 		"exam_id": examID,
 		"files":   files,
 	})
 }
 
 // listeningDownload 下载单个产物文件，path 必须是任务目录内的相对路径。
-func (h *Handler) listeningDownload(w http.ResponseWriter, r *http.Request) {
-	dir, _, err := h.listeningExamDir(r.Context(), r.PathValue("jobId"))
+func (h *Handler) listeningDownload(c *gin.Context) {
+	dir, _, err := h.listeningExamDir(c.Request.Context(), c.Param("jobId"))
 	switch {
 	case errors.Is(err, errListeningJobNotFound):
-		writeError(w, http.StatusNotFound, "job not found")
+		writeError(c, http.StatusNotFound, "job not found")
 		return
 	case err != nil:
 		h.logger.Printf("locate listening dir: %v", err)
-		writeError(w, http.StatusInternalServerError, "locate exam dir failed")
+		writeError(c, http.StatusInternalServerError, "locate exam dir failed")
 		return
 	}
 
-	target, err := safeJoin(dir, r.URL.Query().Get("path"))
+	target, err := safeJoin(dir, c.Query("path"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -613,7 +645,7 @@ func (h *Handler) listeningDownload(w http.ResponseWriter, r *http.Request) {
 		if _, statErr := os.Stat(target); statErr != nil {
 			if buildErr := buildListeningZip(dir, target); buildErr != nil {
 				h.logger.Printf("build listening zip on download failed: %v", buildErr)
-				writeError(w, http.StatusInternalServerError, "build zip failed")
+				writeError(c, http.StatusInternalServerError, "build zip failed")
 				return
 			}
 		}
@@ -621,19 +653,19 @@ func (h *Handler) listeningDownload(w http.ResponseWriter, r *http.Request) {
 
 	info, err := os.Stat(target)
 	if err != nil || info.IsDir() {
-		writeError(w, http.StatusNotFound, "file not found")
+		writeError(c, http.StatusNotFound, "file not found")
 		return
 	}
 
-	w.Header().Set("Content-Type", contentTypeFor(target))
+	c.Header("Content-Type", contentTypeFor(target))
 	if isInlinePlayable(target) {
 		// 音视频、图片、文本等可在浏览器内联展示，方便管理后台直接试听/预览。
-		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filepath.Base(target)))
+		c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", filepath.Base(target)))
 	} else {
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(target)))
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(target)))
 	}
-	w.Header().Set("X-Accel-Buffering", "no")
-	http.ServeFile(w, r, target)
+	c.Header("X-Accel-Buffering", "no")
+	http.ServeFile(c.Writer, c.Request, target)
 }
 
 // contentTypeFor 根据扩展名返回合适的 MIME type，容器里 mime.types 可能不全，
@@ -694,19 +726,19 @@ func isInlinePlayable(path string) bool {
 // listeningArchive 把整个任务目录打包成 zip 下载（视频 + 音频 + 图片 + 转写）。
 // 策略：首次请求时把 zip 预生成到任务目录下并持久化（不删除），之后直接 ServeFile。
 // 这样 zip 下载与单文件下载走完全相同的 ServeFile 路径，避免流式打包导致的下载卡住。
-func (h *Handler) listeningArchive(w http.ResponseWriter, r *http.Request) {
-	dir, examID, err := h.listeningExamDir(r.Context(), r.PathValue("jobId"))
+func (h *Handler) listeningArchive(c *gin.Context) {
+	dir, examID, err := h.listeningExamDir(c.Request.Context(), c.Param("jobId"))
 	switch {
 	case errors.Is(err, errListeningJobNotFound):
-		writeError(w, http.StatusNotFound, "job not found")
+		writeError(c, http.StatusNotFound, "job not found")
 		return
 	case err != nil:
 		h.logger.Printf("locate listening dir: %v", err)
-		writeError(w, http.StatusInternalServerError, "locate exam dir failed")
+		writeError(c, http.StatusInternalServerError, "locate exam dir failed")
 		return
 	}
 	if _, err := os.Stat(dir); err != nil {
-		writeError(w, http.StatusNotFound, "exam output not found")
+		writeError(c, http.StatusNotFound, "exam output not found")
 		return
 	}
 
@@ -717,14 +749,14 @@ func (h *Handler) listeningArchive(w http.ResponseWriter, r *http.Request) {
 	if _, statErr := os.Stat(zipPath); statErr != nil {
 		if err := buildListeningZip(dir, zipPath); err != nil {
 			h.logger.Printf("build listening zip failed: %v", err)
-			writeError(w, http.StatusInternalServerError, "build zip failed")
+			writeError(c, http.StatusInternalServerError, "build zip failed")
 			return
 		}
 	}
 
 	// 告诉 nginx 等反向代理不要缓冲此响应，否则大文件下载会卡在代理缓冲阶段。
-	w.Header().Set("X-Accel-Buffering", "no")
-	http.ServeFile(w, r, zipPath)
+	c.Header("X-Accel-Buffering", "no")
+	http.ServeFile(c.Writer, c.Request, zipPath)
 }
 
 // buildListeningZip 把 dir 下的文件（排除 source16k.wav）用 Store 模式打包到 zipPath。
@@ -812,58 +844,58 @@ func saveUploadedFile(src io.ReadCloser, dst string) error {
 
 // listeningUpdateAnswers 允许管理员在任务完成后补充答案 CSV。
 // CSV 格式：题号,答案（选择 A/B/C/D；判断 richtig/falsch）。更新 manifest.json 中对应题目的 answer 字段。
-func (h *Handler) listeningUpdateAnswers(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobId")
+func (h *Handler) listeningUpdateAnswers(c *gin.Context) {
+	jobID := c.Param("jobId")
 	if jobID == "" {
-		writeError(w, http.StatusBadRequest, "missing jobId")
+		writeError(c, http.StatusBadRequest, "missing jobId")
 		return
 	}
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid multipart: "+err.Error())
+	if err := c.Request.ParseMultipartForm(10 << 20); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid multipart: "+err.Error())
 		return
 	}
-	file, _, err := r.FormFile("answers")
+	file, _, err := c.Request.FormFile("answers")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "missing answers.csv")
+		writeError(c, http.StatusBadRequest, "missing answers.csv")
 		return
 	}
 	defer file.Close()
 
 	answerMap, err := parseAnswerCSV(file)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
 	if len(answerMap) == 0 {
-		writeError(w, http.StatusBadRequest, "答案文件里没有解析到任何题号")
+		writeError(c, http.StatusBadRequest, "答案文件里没有解析到任何题号")
 		return
 	}
 
-	dir, _, err := h.listeningExamDir(r.Context(), jobID)
+	dir, _, err := h.listeningExamDir(c.Request.Context(), jobID)
 	switch {
 	case err == errListeningJobNotFound:
-		writeError(w, http.StatusNotFound, "job not found")
+		writeError(c, http.StatusNotFound, "job not found")
 		return
 	case err != nil:
 		h.logger.Printf("listening exam dir: %v", err)
-		writeError(w, http.StatusInternalServerError, "locate exam dir failed")
+		writeError(c, http.StatusInternalServerError, "locate exam dir failed")
 		return
 	}
 
 	manifestPath := filepath.Join(dir, "manifest.json")
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "manifest not found")
+		writeError(c, http.StatusInternalServerError, "manifest not found")
 		return
 	}
 	var manifest map[string]any
 	if err := json.Unmarshal(raw, &manifest); err != nil {
-		writeError(w, http.StatusInternalServerError, "manifest parse failed")
+		writeError(c, http.StatusInternalServerError, "manifest parse failed")
 		return
 	}
 	questions, ok := manifest["questions"].([]any)
 	if !ok {
-		writeError(w, http.StatusInternalServerError, "manifest questions invalid")
+		writeError(c, http.StatusInternalServerError, "manifest questions invalid")
 		return
 	}
 
@@ -886,11 +918,11 @@ func (h *Handler) listeningUpdateAnswers(w http.ResponseWriter, r *http.Request)
 
 	out, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "manifest encode failed")
+		writeError(c, http.StatusInternalServerError, "manifest encode failed")
 		return
 	}
 	if err := os.WriteFile(manifestPath, out, 0o644); err != nil {
-		writeError(w, http.StatusInternalServerError, "manifest write failed")
+		writeError(c, http.StatusInternalServerError, "manifest write failed")
 		return
 	}
 
@@ -904,29 +936,29 @@ func (h *Handler) listeningUpdateAnswers(w http.ResponseWriter, r *http.Request)
 	}
 
 	// 上传答案后标记该素材已绑定答案
-	if err := h.store.SetListeningJobHasAnswers(r.Context(), jobID); err != nil {
+	if err := h.store.SetListeningJobHasAnswers(c.Request.Context(), jobID); err != nil {
 		h.logger.Printf("set has_answers for job %s: %v", jobID, err)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(c, http.StatusOK, map[string]any{
 		"updated_count": updated,
 		"answers":       updatedList,
 	})
 }
 
 // updateListeningJobMeta 更新听力任务的显示名称与等级；空名称表示恢复使用 Exam ID。
-func (h *Handler) updateListeningJobMeta(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobId")
+func (h *Handler) updateListeningJobMeta(c *gin.Context) {
+	jobID := c.Param("jobId")
 	if jobID == "" {
-		writeError(w, http.StatusBadRequest, "missing jobId")
+		writeError(c, http.StatusBadRequest, "missing jobId")
 		return
 	}
 	var req struct {
 		Name  string `json:"name"`
 		Level string `json:"level"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
@@ -936,30 +968,30 @@ func (h *Handler) updateListeningJobMeta(w http.ResponseWriter, r *http.Request)
 		name = &req.Name
 	}
 	if req.Level != "" && !validCefrLevels[req.Level] {
-		writeError(w, http.StatusBadRequest, "invalid level (A1/A2/B1/B2/C1/C2)")
+		writeError(c, http.StatusBadRequest, "invalid level (A1/A2/B1/B2/C1/C2)")
 		return
 	}
-	if err := h.store.UpdateListeningJobMeta(r.Context(), jobID, name, req.Level); err != nil {
+	if err := h.store.UpdateListeningJobMeta(c.Request.Context(), jobID, name, req.Level); err != nil {
 		h.logger.Printf("update listening job meta %s: %v", jobID, err)
-		writeError(w, http.StatusInternalServerError, "update job failed")
+		writeError(c, http.StatusInternalServerError, "update job failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // deleteListeningJob 软删除听力任务（标记 deleted_at，不删除产物文件）。
-func (h *Handler) deleteListeningJob(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobId")
+func (h *Handler) deleteListeningJob(c *gin.Context) {
+	jobID := c.Param("jobId")
 	if jobID == "" {
-		writeError(w, http.StatusBadRequest, "missing jobId")
+		writeError(c, http.StatusBadRequest, "missing jobId")
 		return
 	}
-	if err := h.store.SoftDeleteListeningJob(r.Context(), jobID); err != nil {
+	if err := h.store.SoftDeleteListeningJob(c.Request.Context(), jobID); err != nil {
 		h.logger.Printf("soft delete listening job %s: %v", jobID, err)
-		writeError(w, http.StatusInternalServerError, "delete job failed")
+		writeError(c, http.StatusInternalServerError, "delete job failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // parseAnswerCSV 解析答案 CSV：题号,答案。
@@ -1040,34 +1072,34 @@ var validCefrLevels = map[string]bool{
 	"A1": true, "A2": true, "B1": true, "B2": true, "C1": true, "C2": true,
 }
 
-func parseLevelID(r *http.Request) (int64, error) {
-	return strconv.ParseInt(r.PathValue("id"), 10, 64)
+func parseLevelID(c *gin.Context) (int64, error) {
+	return strconv.ParseInt(c.Param("id"), 10, 64)
 }
 
 // listLevels 返回关卡列表。?active_only=true 时只返回已生效的关卡。
-func (h *Handler) listLevels(w http.ResponseWriter, r *http.Request) {
-	activeOnly := r.URL.Query().Get("active_only") == "true"
-	levels, err := h.store.ListLevels(r.Context(), activeOnly)
+func (h *Handler) listLevels(c *gin.Context) {
+	activeOnly := c.Query("active_only") == "true"
+	levels, err := h.store.ListLevels(c.Request.Context(), activeOnly)
 	if err != nil {
 		h.logger.Printf("list levels: %v", err)
-		writeError(w, http.StatusInternalServerError, "list levels failed")
+		writeError(c, http.StatusInternalServerError, "list levels failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"levels": levels})
+	writeJSON(c, http.StatusOK, map[string]any{"levels": levels})
 }
 
 // listSpeakingItems 返回口语固定问答题库。支持 ?lang=de&level=A1&active_only=false。
-func (h *Handler) listSpeakingItems(w http.ResponseWriter, r *http.Request) {
-	lang := strings.TrimSpace(r.URL.Query().Get("lang"))
-	level := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("level")))
-	activeOnly := r.URL.Query().Get("active_only") != "false"
-	items, err := h.store.ListSpeakingItems(r.Context(), lang, level, activeOnly)
+func (h *Handler) listSpeakingItems(c *gin.Context) {
+	lang := strings.TrimSpace(c.Query("lang"))
+	level := strings.ToUpper(strings.TrimSpace(c.Query("level")))
+	activeOnly := c.Query("active_only") != "false"
+	items, err := h.store.ListSpeakingItems(c.Request.Context(), lang, level, activeOnly)
 	if err != nil {
 		h.logger.Printf("list speaking items: %v", err)
-		writeError(w, http.StatusInternalServerError, "list speaking items failed")
+		writeError(c, http.StatusInternalServerError, "list speaking items failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(c, http.StatusOK, map[string]any{"items": items})
 }
 
 // speakingItemUpsert 是口语题目的创建/更新请求体。
@@ -1153,208 +1185,208 @@ func speakingItemFromRequest(req speakingItemUpsert) (store.SpeakingItem, string
 }
 
 // getSpeakingItem 返回单条口语题目。
-func (h *Handler) getSpeakingItem(w http.ResponseWriter, r *http.Request) {
-	item, err := h.store.GetSpeakingItem(r.Context(), r.PathValue("key"))
+func (h *Handler) getSpeakingItem(c *gin.Context) {
+	item, err := h.store.GetSpeakingItem(c.Request.Context(), c.Param("key"))
 	if err != nil {
 		h.logger.Printf("get speaking item: %v", err)
-		writeError(w, http.StatusInternalServerError, "get speaking item failed")
+		writeError(c, http.StatusInternalServerError, "get speaking item failed")
 		return
 	}
 	if item == nil {
-		writeError(w, http.StatusNotFound, "speaking item not found")
+		writeError(c, http.StatusNotFound, "speaking item not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"item": item})
+	writeJSON(c, http.StatusOK, map[string]any{"item": item})
 }
 
 // createSpeakingItem 新增口语题目；item_key 为空时自动生成。
-func (h *Handler) createSpeakingItem(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) createSpeakingItem(c *gin.Context) {
 	var req speakingItemUpsert
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
 	item, msg := speakingItemFromRequest(req)
 	if msg != "" {
-		writeError(w, http.StatusBadRequest, msg)
+		writeError(c, http.StatusBadRequest, msg)
 		return
 	}
 	if item.ItemKey == "" {
 		item.ItemKey = fmt.Sprintf("%s-%s-%d", item.Lang, strings.ToLower(item.Level), time.Now().UnixNano())
 	}
-	if err := h.store.CreateSpeakingItem(r.Context(), item); err != nil {
+	if err := h.store.CreateSpeakingItem(c.Request.Context(), item); err != nil {
 		h.logger.Printf("create speaking item: %v", err)
-		writeError(w, http.StatusInternalServerError, "create speaking item failed")
+		writeError(c, http.StatusInternalServerError, "create speaking item failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"item_key": item.ItemKey})
+	writeJSON(c, http.StatusOK, map[string]any{"item_key": item.ItemKey})
 }
 
 // updateSpeakingItem 更新口语题目。
-func (h *Handler) updateSpeakingItem(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("key")
+func (h *Handler) updateSpeakingItem(c *gin.Context) {
+	key := c.Param("key")
 	var req speakingItemUpsert
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
 	req.ItemKey = key
 	item, msg := speakingItemFromRequest(req)
 	if msg != "" {
-		writeError(w, http.StatusBadRequest, msg)
+		writeError(c, http.StatusBadRequest, msg)
 		return
 	}
-	if err := h.store.UpdateSpeakingItem(r.Context(), item); err != nil {
+	if err := h.store.UpdateSpeakingItem(c.Request.Context(), item); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "speaking item not found")
+			writeError(c, http.StatusNotFound, "speaking item not found")
 			return
 		}
 		h.logger.Printf("update speaking item: %v", err)
-		writeError(w, http.StatusInternalServerError, "update speaking item failed")
+		writeError(c, http.StatusInternalServerError, "update speaking item failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // deleteSpeakingItem 删除口语题目。
-func (h *Handler) deleteSpeakingItem(w http.ResponseWriter, r *http.Request) {
-	if err := h.store.DeleteSpeakingItem(r.Context(), r.PathValue("key")); err != nil {
+func (h *Handler) deleteSpeakingItem(c *gin.Context) {
+	if err := h.store.DeleteSpeakingItem(c.Request.Context(), c.Param("key")); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "speaking item not found")
+			writeError(c, http.StatusNotFound, "speaking item not found")
 			return
 		}
 		h.logger.Printf("delete speaking item: %v", err)
-		writeError(w, http.StatusInternalServerError, "delete speaking item failed")
+		writeError(c, http.StatusInternalServerError, "delete speaking item failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // createLevel 创建关卡。
-func (h *Handler) createLevel(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) createLevel(c *gin.Context) {
 	var req levelUpsert
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	req.Lang = strings.TrimSpace(req.Lang)
 	req.Difficulty = strings.ToUpper(strings.TrimSpace(req.Difficulty))
 	if req.Name == "" {
-		writeError(w, http.StatusBadRequest, "name is required")
+		writeError(c, http.StatusBadRequest, "name is required")
 		return
 	}
 	if req.Lang == "" {
 		req.Lang = "de"
 	}
 	if !langPattern.MatchString(req.Lang) {
-		writeError(w, http.StatusBadRequest, "invalid lang")
+		writeError(c, http.StatusBadRequest, "invalid lang")
 		return
 	}
 	if req.Difficulty == "" {
 		req.Difficulty = "A1"
 	}
 	if !validDifficulties[req.Difficulty] {
-		writeError(w, http.StatusBadRequest, "invalid difficulty (A1/A2/B1/B2)")
+		writeError(c, http.StatusBadRequest, "invalid difficulty (A1/A2/B1/B2)")
 		return
 	}
-	id, err := h.store.CreateLevel(r.Context(), req.Name, req.Lang, req.Difficulty, req.Description, req.SortOrder)
+	id, err := h.store.CreateLevel(c.Request.Context(), req.Name, req.Lang, req.Difficulty, req.Description, req.SortOrder)
 	if err != nil {
 		h.logger.Printf("create level: %v", err)
-		writeError(w, http.StatusInternalServerError, "create level failed")
+		writeError(c, http.StatusInternalServerError, "create level failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"id": id})
+	writeJSON(c, http.StatusOK, map[string]any{"id": id})
 }
 
 // getLevel 返回关卡详情（含关联的 exam 列表）。
-func (h *Handler) getLevel(w http.ResponseWriter, r *http.Request) {
-	id, err := parseLevelID(r)
+func (h *Handler) getLevel(c *gin.Context) {
+	id, err := parseLevelID(c)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid level id")
+		writeError(c, http.StatusBadRequest, "invalid level id")
 		return
 	}
-	lv, err := h.store.GetLevel(r.Context(), id)
+	lv, err := h.store.GetLevel(c.Request.Context(), id)
 	if err != nil {
 		h.logger.Printf("get level: %v", err)
-		writeError(w, http.StatusInternalServerError, "get level failed")
+		writeError(c, http.StatusInternalServerError, "get level failed")
 		return
 	}
 	if lv == nil {
-		writeError(w, http.StatusNotFound, "level not found")
+		writeError(c, http.StatusNotFound, "level not found")
 		return
 	}
-	exams, err := h.store.ListLevelExams(r.Context(), id)
+	exams, err := h.store.ListLevelExams(c.Request.Context(), id)
 	if err != nil {
 		h.logger.Printf("list level exams: %v", err)
-		writeError(w, http.StatusInternalServerError, "list level exams failed")
+		writeError(c, http.StatusInternalServerError, "list level exams failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"level": lv, "exams": exams})
+	writeJSON(c, http.StatusOK, map[string]any{"level": lv, "exams": exams})
 }
 
 // updateLevel 更新关卡。
-func (h *Handler) updateLevel(w http.ResponseWriter, r *http.Request) {
-	id, err := parseLevelID(r)
+func (h *Handler) updateLevel(c *gin.Context) {
+	id, err := parseLevelID(c)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid level id")
+		writeError(c, http.StatusBadRequest, "invalid level id")
 		return
 	}
 	var req levelUpsert
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	req.Difficulty = strings.ToUpper(strings.TrimSpace(req.Difficulty))
 	if req.Name == "" {
-		writeError(w, http.StatusBadRequest, "name is required")
+		writeError(c, http.StatusBadRequest, "name is required")
 		return
 	}
 	if req.Difficulty == "" {
 		req.Difficulty = "A1"
 	}
 	if !validDifficulties[req.Difficulty] {
-		writeError(w, http.StatusBadRequest, "invalid difficulty (A1/A2/B1/B2)")
+		writeError(c, http.StatusBadRequest, "invalid difficulty (A1/A2/B1/B2)")
 		return
 	}
-	if err := h.store.UpdateLevel(r.Context(), id, req.Name, req.Difficulty, req.Description, req.SortOrder, req.Active); err != nil {
+	if err := h.store.UpdateLevel(c.Request.Context(), id, req.Name, req.Difficulty, req.Description, req.SortOrder, req.Active); err != nil {
 		h.logger.Printf("update level: %v", err)
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(c, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // deleteLevel 删除关卡。
-func (h *Handler) deleteLevel(w http.ResponseWriter, r *http.Request) {
-	id, err := parseLevelID(r)
+func (h *Handler) deleteLevel(c *gin.Context) {
+	id, err := parseLevelID(c)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid level id")
+		writeError(c, http.StatusBadRequest, "invalid level id")
 		return
 	}
-	if err := h.store.DeleteLevel(r.Context(), id); err != nil {
+	if err := h.store.DeleteLevel(c.Request.Context(), id); err != nil {
 		h.logger.Printf("delete level: %v", err)
-		writeError(w, http.StatusInternalServerError, "delete level failed")
+		writeError(c, http.StatusInternalServerError, "delete level failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // listLevelExams 返回关卡关联的 exam 列表。
-func (h *Handler) listLevelExams(w http.ResponseWriter, r *http.Request) {
-	id, err := parseLevelID(r)
+func (h *Handler) listLevelExams(c *gin.Context) {
+	id, err := parseLevelID(c)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid level id")
+		writeError(c, http.StatusBadRequest, "invalid level id")
 		return
 	}
-	exams, err := h.store.ListLevelExams(r.Context(), id)
+	exams, err := h.store.ListLevelExams(c.Request.Context(), id)
 	if err != nil {
 		h.logger.Printf("list level exams: %v", err)
-		writeError(w, http.StatusInternalServerError, "list level exams failed")
+		writeError(c, http.StatusInternalServerError, "list level exams failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"exams": exams})
+	writeJSON(c, http.StatusOK, map[string]any{"exams": exams})
 }
 
 type addExamReq struct {
@@ -1366,78 +1398,78 @@ type addExamReq struct {
 var validItemTypes = map[string]bool{"listening": true, "speaking": true}
 
 // addLevelExam 给关卡添加一个题目（听力或口语）。
-func (h *Handler) addLevelExam(w http.ResponseWriter, r *http.Request) {
-	id, err := parseLevelID(r)
+func (h *Handler) addLevelExam(c *gin.Context) {
+	id, err := parseLevelID(c)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid level id")
+		writeError(c, http.StatusBadRequest, "invalid level id")
 		return
 	}
 	var req addExamReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
 	req.ExamID = strings.TrimSpace(req.ExamID)
 	req.ItemType = strings.ToLower(strings.TrimSpace(req.ItemType))
 	if req.ExamID == "" {
-		writeError(w, http.StatusBadRequest, "exam_id is required")
+		writeError(c, http.StatusBadRequest, "exam_id is required")
 		return
 	}
 	if req.ItemType == "" {
 		req.ItemType = "listening"
 	}
 	if !validItemTypes[req.ItemType] {
-		writeError(w, http.StatusBadRequest, "invalid item_type (listening/speaking)")
+		writeError(c, http.StatusBadRequest, "invalid item_type (listening/speaking)")
 		return
 	}
-	if err := h.store.AddLevelExam(r.Context(), id, req.ItemType, req.ExamID, req.SortOrder); err != nil {
+	if err := h.store.AddLevelExam(c.Request.Context(), id, req.ItemType, req.ExamID, req.SortOrder); err != nil {
 		h.logger.Printf("add level exam: %v", err)
-		writeError(w, http.StatusInternalServerError, "add level exam failed")
+		writeError(c, http.StatusInternalServerError, "add level exam failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // removeLevelExam 从关卡移除一个题目。?item_type=listening|speaking，默认 listening。
-func (h *Handler) removeLevelExam(w http.ResponseWriter, r *http.Request) {
-	id, err := parseLevelID(r)
+func (h *Handler) removeLevelExam(c *gin.Context) {
+	id, err := parseLevelID(c)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid level id")
+		writeError(c, http.StatusBadRequest, "invalid level id")
 		return
 	}
-	examID := r.PathValue("examId")
+	examID := c.Param("examId")
 	if examID == "" {
-		writeError(w, http.StatusBadRequest, "examId is required")
+		writeError(c, http.StatusBadRequest, "examId is required")
 		return
 	}
-	itemType := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("item_type")))
+	itemType := strings.ToLower(strings.TrimSpace(c.Query("item_type")))
 	if itemType == "" {
 		itemType = "listening"
 	}
 	if !validItemTypes[itemType] {
-		writeError(w, http.StatusBadRequest, "invalid item_type (listening/speaking)")
+		writeError(c, http.StatusBadRequest, "invalid item_type (listening/speaking)")
 		return
 	}
-	if err := h.store.RemoveLevelExam(r.Context(), id, itemType, examID); err != nil {
+	if err := h.store.RemoveLevelExam(c.Request.Context(), id, itemType, examID); err != nil {
 		h.logger.Printf("remove level exam: %v", err)
-		writeError(w, http.StatusInternalServerError, "remove level exam failed")
+		writeError(c, http.StatusInternalServerError, "remove level exam failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // listAvailableExams 返回可加入关卡的听力与口语题目。
-func (h *Handler) listAvailableExams(w http.ResponseWriter, r *http.Request) {
-	id, err := parseLevelID(r)
+func (h *Handler) listAvailableExams(c *gin.Context) {
+	id, err := parseLevelID(c)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid level id")
+		writeError(c, http.StatusBadRequest, "invalid level id")
 		return
 	}
-	exams, err := h.store.ListAvailableExams(r.Context(), id)
+	exams, err := h.store.ListAvailableExams(c.Request.Context(), id)
 	if err != nil {
 		h.logger.Printf("list available exams: %v", err)
-		writeError(w, http.StatusInternalServerError, "list available exams failed")
+		writeError(c, http.StatusInternalServerError, "list available exams failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"exams": exams})
+	writeJSON(c, http.StatusOK, map[string]any{"exams": exams})
 }

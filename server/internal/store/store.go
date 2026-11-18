@@ -143,6 +143,80 @@ func (s *Store) ListSpeakingItems(ctx context.Context, lang, level string, activ
 // ErrNotFound 表示目标记录不存在，供 handler 映射为 404。
 var ErrNotFound = errors.New("record not found")
 
+// SpeakingReplyTemplate 是口语追问/搭档回应的兜底话术。
+type SpeakingReplyTemplate struct {
+	ID        int64     `gorm:"primaryKey" json:"id"`
+	Lang      string    `json:"lang"`
+	ExamPart  string    `gorm:"column:exam_part" json:"exam_part"`
+	Role      string    `json:"role"`
+	Text      string    `json:"text"`
+	Active    bool      `json:"active"`
+	SortOrder int       `gorm:"column:sort_order" json:"sort_order"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (SpeakingReplyTemplate) TableName() string { return "speaking_reply_templates" }
+
+// ListSpeakingReplyTemplates 返回兜底话术，按部分与排序返回。
+func (s *Store) ListSpeakingReplyTemplates(ctx context.Context, activeOnly bool) ([]SpeakingReplyTemplate, error) {
+	items := make([]SpeakingReplyTemplate, 0)
+	q := s.db.WithContext(ctx)
+	if activeOnly {
+		q = q.Where("active = ?", true)
+	}
+	err := q.Order("exam_part ASC, role ASC, sort_order ASC, id ASC").Find(&items).Error
+	return items, err
+}
+
+func (s *Store) CreateSpeakingReplyTemplate(ctx context.Context, item *SpeakingReplyTemplate) error {
+	return s.db.WithContext(ctx).Create(item).Error
+}
+
+// GetSpeakingReplyTemplate 返回单条兜底话术。
+func (s *Store) GetSpeakingReplyTemplate(ctx context.Context, id int64) (*SpeakingReplyTemplate, error) {
+	var item SpeakingReplyTemplate
+	err := s.db.WithContext(ctx).First(&item, id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (s *Store) UpdateSpeakingReplyTemplate(ctx context.Context, item *SpeakingReplyTemplate) error {
+	res := s.db.WithContext(ctx).Model(&SpeakingReplyTemplate{}).
+		Where("id = ?", item.ID).
+		Updates(map[string]any{
+			"exam_part":  item.ExamPart,
+			"role":       item.Role,
+			"text":       item.Text,
+			"active":     item.Active,
+			"sort_order": item.SortOrder,
+			"updated_at": time.Now(),
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteSpeakingReplyTemplate(ctx context.Context, id int64) error {
+	res := s.db.WithContext(ctx).Delete(&SpeakingReplyTemplate{}, id)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SearchRagChunks 按关键词粗检索参考语料，用于口语追问的轻量 RAG 注入。
 // 不在交互路径上加载 embedding 模型，只做 content ILIKE 命中。
 func (s *Store) SearchRagChunks(ctx context.Context, lang, level string, keywords []string, limit int) ([]string, error) {
