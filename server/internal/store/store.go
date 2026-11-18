@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"gorm.io/driver/postgres"
@@ -141,6 +142,33 @@ func (s *Store) ListSpeakingItems(ctx context.Context, lang, level string, activ
 
 // ErrNotFound 表示目标记录不存在，供 handler 映射为 404。
 var ErrNotFound = errors.New("record not found")
+
+// SearchRagChunks 按关键词粗检索参考语料，用于口语追问的轻量 RAG 注入。
+// 不在交互路径上加载 embedding 模型，只做 content ILIKE 命中。
+func (s *Store) SearchRagChunks(ctx context.Context, lang, level string, keywords []string, limit int) ([]string, error) {
+	contents := make([]string, 0)
+	if len(keywords) == 0 {
+		return contents, nil
+	}
+	if limit <= 0 || limit > 5 {
+		limit = 3
+	}
+	tx := s.db.WithContext(ctx).Table("rag_chunks").Select("content").Where("lang = ?", lang)
+	if level != "" {
+		tx = tx.Where("(level = ? OR level IS NULL OR level = '')", level)
+	}
+	conds := make([]string, 0, len(keywords))
+	args := make([]any, 0, len(keywords))
+	for _, kw := range keywords {
+		conds = append(conds, "content ILIKE ?")
+		args = append(args, "%"+kw+"%")
+	}
+	tx = tx.Where("("+strings.Join(conds, " OR ")+")", args...)
+	if err := tx.Order("chunk_id DESC").Limit(limit).Scan(&contents).Error; err != nil {
+		return nil, err
+	}
+	return contents, nil
+}
 
 // GetSpeakingItem 返回单条口语题目。
 func (s *Store) GetSpeakingItem(ctx context.Context, key string) (*SpeakingItem, error) {

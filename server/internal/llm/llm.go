@@ -24,18 +24,30 @@ type Client struct {
 }
 
 // NewFromEnv 读取 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL 构造客户端。
+// 未显式配置 LLM_* 时回退到 DASHSCOPE_*（项目现有的大模型凭证）。
 func NewFromEnv() *Client {
 	base := strings.TrimRight(strings.TrimSpace(os.Getenv("LLM_BASE_URL")), "/")
+	apiKey := strings.TrimSpace(os.Getenv("LLM_API_KEY"))
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("DASHSCOPE_API_KEY"))
+		if base == "" {
+			base = strings.TrimRight(strings.TrimSpace(os.Getenv("DASHSCOPE_BASE_URL")), "/")
+		}
+	}
 	if base == "" {
 		base = "https://api.openai.com/v1"
 	}
 	model := strings.TrimSpace(os.Getenv("LLM_MODEL"))
 	if model == "" {
-		model = "gpt-4o-mini"
+		if strings.Contains(base, "dashscope") {
+			model = "qwen-plus"
+		} else {
+			model = "gpt-4o-mini"
+		}
 	}
 	return &Client{
 		baseURL: base,
-		apiKey:  strings.TrimSpace(os.Getenv("LLM_API_KEY")),
+		apiKey:  apiKey,
 		model:   model,
 		http:    &http.Client{Timeout: 20 * time.Second},
 	}

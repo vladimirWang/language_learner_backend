@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,6 +9,45 @@ import (
 	"strings"
 	"unicode/utf8"
 )
+
+var ragKeywordRe = regexp.MustCompile(`[A-Za-zÄÖÜäöüß]{5,}`)
+
+// speakingReferences 从题库问句与话题中抽取关键词，检索少量参考语料。
+// 命中失败或没有语料时返回空，不影响追问生成。
+func (h *Handler) speakingReferences(ctx context.Context, req speakingReplyReq) []string {
+	if h.store == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	keywords := make([]string, 0, 3)
+	for _, word := range ragKeywordRe.FindAllString(req.Topic+" "+req.PromptDE, -1) {
+		kw := strings.ToLower(word)
+		if seen[kw] {
+			continue
+		}
+		seen[kw] = true
+		keywords = append(keywords, kw)
+		if len(keywords) >= 3 {
+			break
+		}
+	}
+	refs, err := h.store.SearchRagChunks(ctx, "de", req.Level, keywords, 2)
+	if err != nil {
+		h.logger.Printf("speaking rag search: %v", err)
+		return nil
+	}
+	out := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		ref = strings.Join(strings.Fields(ref), " ")
+		if utf8.RuneCountInString(ref) > 220 {
+			ref = string([]rune(ref)[:220]) + "…"
+		}
+		if ref != "" {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
 
 // speakingReplyReq 是「受控追问 / 搭档回应」的请求体。
 type speakingReplyReq struct {
@@ -240,6 +280,14 @@ func (h *Handler) speakingReply(w http.ResponseWriter, r *http.Request) {
 		sb.WriteString("\n请生成搭档对考生最后一句话的回应（德语，一到两句）。")
 	} else {
 		sb.WriteString("\n请生成考官对考生最后一句话的追问（德语，一到两句）。")
+	}
+	if refs := h.speakingReferences(r.Context(), req); len(refs) > 0 {
+		sb.WriteString("\n\n参考资料（仅可借鉴表达，不要照抄）：\n")
+		for _, ref := range refs {
+			sb.WriteString("- ")
+			sb.WriteString(ref)
+			sb.WriteString("\n")
+		}
 	}
 
 	reply, err := h.llm.Chat(r.Context(), system, sb.String())
