@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -40,22 +41,62 @@ type pggQuestion struct {
 	Level         string   `json:"level"`
 }
 
+type pggDiktat struct {
+	PaperID   string `json:"paper_id"`
+	FullText  string `json:"full_text"`
+	WordCount int    `json:"word_count"`
+	AudioRef  string `json:"audio_ref,omitempty"`
+}
+
+type pggWriting struct {
+	PaperID     string `json:"paper_id"`
+	Prompt      string `json:"prompt"`
+	WordLimit   int    `json:"word_limit,omitempty"`
+	MaterialRef string `json:"material_ref,omitempty"`
+}
+
+// pggMaterialBlock 是原文素材块（阅读篇章 / 听力原文），供讲解定位。
+type pggMaterialBlock struct {
+	PageNo  int    `json:"page_no"`
+	PaperID string `json:"paper_id,omitempty"`
+	Section string `json:"section"`
+	RawText string `json:"raw_text"`
+}
+
 type pggExamFile struct {
 	Papers    []pggPaper    `json:"papers"`
 	Questions []pggQuestion `json:"questions"`
+	Diktat    []pggDiktat   `json:"diktat"`
+	Writing   []pggWriting  `json:"writing"`
 }
 
-// loadPGGExam 依次读取成功任务的 result.json，按套卷与题号去重。
-func (h *Handler) loadPGGExam(ctx context.Context) ([]pggPaper, []pggQuestion) {
+type pggExam struct {
+	Papers    []pggPaper
+	Questions []pggQuestion
+	Diktat    []pggDiktat
+	Writing   []pggWriting
+	Materials []pggMaterialBlock
+}
+
+// loadPGGExam 依次读取成功任务的 result.json，按套卷、题号与原文页去重。
+func (h *Handler) loadPGGExam(ctx context.Context) pggExam {
 	jobs, err := h.store.ListPDFImportJobs(ctx, 200, false)
 	if err != nil {
 		h.logger.Printf("list pdf jobs for exam: %v", err)
-		return nil, nil
+		return pggExam{}
 	}
-	papers := make([]pggPaper, 0)
-	questions := make([]pggQuestion, 0)
+	exam := pggExam{
+		Papers:    make([]pggPaper, 0),
+		Questions: make([]pggQuestion, 0),
+		Diktat:    make([]pggDiktat, 0),
+		Writing:   make([]pggWriting, 0),
+		Materials: make([]pggMaterialBlock, 0),
+	}
 	seenPaper := map[string]bool{}
 	seenQuestion := map[string]bool{}
+	seenDiktat := map[string]bool{}
+	seenWriting := map[string]bool{}
+	seenMaterial := map[string]bool{}
 
 	for _, job := range jobs {
 		if job.Status != "succeeded" {
@@ -77,73 +118,121 @@ func (h *Handler) loadPGGExam(ctx context.Context) ([]pggPaper, []pggQuestion) {
 			continue
 		}
 		var payload struct {
-			Exam *pggExamFile `json:"exam"`
+			Exam   *pggExamFile       `json:"exam"`
+			Blocks []pggMaterialBlock `json:"blocks"`
 		}
-		if err := json.Unmarshal(raw, &payload); err != nil || payload.Exam == nil {
+		if err := json.Unmarshal(raw, &payload); err != nil {
 			continue
 		}
-		for _, paper := range payload.Exam.Papers {
-			if seenPaper[paper.PaperID] {
-				continue
+
+		if payload.Exam != nil {
+			for _, paper := range payload.Exam.Papers {
+				if seenPaper[paper.PaperID] {
+					continue
+				}
+				seenPaper[paper.PaperID] = true
+				paper.ExamSystem = "pgg"
+				paper.SourceJobID = job.JobID
+				exam.Papers = append(exam.Papers, paper)
 			}
-			seenPaper[paper.PaperID] = true
-			paper.ExamSystem = "pgg"
-			paper.SourceJobID = job.JobID
-			papers = append(papers, paper)
+			for _, question := range payload.Exam.Questions {
+				key := question.PaperID + "|" + question.Section + "|" + question.QNo
+				if seenQuestion[key] {
+					continue
+				}
+				seenQuestion[key] = true
+				exam.Questions = append(exam.Questions, question)
+			}
+			for _, item := range payload.Exam.Diktat {
+				if item.PaperID == "" || seenDiktat[item.PaperID] {
+					continue
+				}
+				seenDiktat[item.PaperID] = true
+				exam.Diktat = append(exam.Diktat, item)
+			}
+			for _, item := range payload.Exam.Writing {
+				key := item.PaperID + "|" + item.Prompt
+				if item.PaperID == "" || seenWriting[key] {
+					continue
+				}
+				seenWriting[key] = true
+				exam.Writing = append(exam.Writing, item)
+			}
 		}
-		for _, question := range payload.Exam.Questions {
-			key := question.PaperID + "|" + question.Section + "|" + question.QNo
-			if seenQuestion[key] {
+
+		for _, block := range payload.Blocks {
+			if block.PaperID == "" || strings.TrimSpace(block.RawText) == "" {
 				continue
 			}
-			seenQuestion[key] = true
-			questions = append(questions, question)
+			key := block.PaperID + "|" + block.Section + "|" + strconv.Itoa(block.PageNo)
+			if seenMaterial[key] {
+				continue
+			}
+			seenMaterial[key] = true
+			exam.Materials = append(exam.Materials, block)
 		}
 	}
 
-	// 统计每套卷的题量与题型。
-	for index := range papers {
+	// 统计每套卷的题量与题型；听写 / 写作单独成题型。
+	for index := range exam.Papers {
 		sections := make([]string, 0)
 		count := 0
-		for _, question := range questions {
-			if question.PaperID != papers[index].PaperID {
+		for _, question := range exam.Questions {
+			if question.PaperID != exam.Papers[index].PaperID {
 				continue
 			}
 			count++
-			found := false
-			for _, section := range sections {
-				if section == question.Section {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if !containsString(sections, question.Section) {
 				sections = append(sections, question.Section)
 			}
 		}
-		papers[index].QuestionCnt = count
-		papers[index].Sections = sections
-	}
-	sort.Slice(papers, func(i, j int) bool {
-		if papers[i].Year == papers[j].Year {
-			return papers[i].PaperID < papers[j].PaperID
+		for _, item := range exam.Diktat {
+			if item.PaperID == exam.Papers[index].PaperID && !containsString(sections, "diktat") {
+				sections = append(sections, "diktat")
+			}
 		}
-		return papers[i].Year < papers[j].Year
+		for _, item := range exam.Writing {
+			if item.PaperID == exam.Papers[index].PaperID && !containsString(sections, "writing") {
+				sections = append(sections, "writing")
+			}
+		}
+		exam.Papers[index].QuestionCnt = count
+		exam.Papers[index].Sections = sections
+	}
+	sort.Slice(exam.Papers, func(i, j int) bool {
+		if exam.Papers[i].Year == exam.Papers[j].Year {
+			return exam.Papers[i].PaperID < exam.Papers[j].PaperID
+		}
+		return exam.Papers[i].Year < exam.Papers[j].Year
 	})
-	return papers, questions
+	return exam
+}
+
+func containsString(list []string, target string) bool {
+	for _, item := range list {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) listExamPapers(c *gin.Context) {
-	papers, _ := h.loadPGGExam(c.Request.Context())
-	writeJSON(c, http.StatusOK, map[string]any{"papers": papers})
+	exam := h.loadPGGExam(c.Request.Context())
+	system := strings.TrimSpace(c.Query("system"))
+	if system != "" && system != "pgg" {
+		writeJSON(c, http.StatusOK, map[string]any{"papers": []pggPaper{}})
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"papers": exam.Papers})
 }
 
 func (h *Handler) listExamQuestions(c *gin.Context) {
 	paperID := c.Param("paperId")
 	section := c.Query("section")
-	_, questions := h.loadPGGExam(c.Request.Context())
+	exam := h.loadPGGExam(c.Request.Context())
 	out := make([]pggQuestion, 0)
-	for _, question := range questions {
+	for _, question := range exam.Questions {
 		if question.PaperID != paperID {
 			continue
 		}
@@ -155,6 +244,74 @@ func (h *Handler) listExamQuestions(c *gin.Context) {
 		out = append(out, question)
 	}
 	writeJSON(c, http.StatusOK, map[string]any{"questions": out})
+}
+
+// getExamQuestion 返回单题（不含答案），qid 由 paper_id + section + q_no 定位。
+func (h *Handler) getExamQuestion(c *gin.Context) {
+	paperID := strings.TrimSpace(c.Query("paper_id"))
+	section := strings.TrimSpace(c.Query("section"))
+	qNo := strings.TrimSpace(c.Query("q_no"))
+	if paperID == "" || section == "" || qNo == "" {
+		writeError(c, http.StatusBadRequest, "paper_id, section and q_no are required")
+		return
+	}
+	exam := h.loadPGGExam(c.Request.Context())
+	for _, question := range exam.Questions {
+		if question.PaperID != paperID || question.Section != section || question.QNo != qNo {
+			continue
+		}
+		question.CorrectAnswer = nil
+		writeJSON(c, http.StatusOK, map[string]any{"question": question})
+		return
+	}
+	writeError(c, http.StatusNotFound, "question not found")
+}
+
+func (h *Handler) listExamDiktat(c *gin.Context) {
+	paperID := c.Param("paperId")
+	exam := h.loadPGGExam(c.Request.Context())
+	out := make([]pggDiktat, 0)
+	for _, item := range exam.Diktat {
+		if item.PaperID == paperID {
+			out = append(out, item)
+		}
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"diktat": out})
+}
+
+func (h *Handler) listExamWriting(c *gin.Context) {
+	paperID := c.Param("paperId")
+	exam := h.loadPGGExam(c.Request.Context())
+	out := make([]pggWriting, 0)
+	for _, item := range exam.Writing {
+		if item.PaperID == paperID {
+			out = append(out, item)
+		}
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"writing": out})
+}
+
+// examMaterial 返回某套卷某题型的原文素材，供讲解定位。
+func (h *Handler) examMaterial(c *gin.Context) {
+	paperID := strings.TrimSpace(c.Query("paper_id"))
+	section := strings.TrimSpace(c.Query("section"))
+	if paperID == "" || section == "" {
+		writeError(c, http.StatusBadRequest, "paper_id and section are required")
+		return
+	}
+	exam := h.loadPGGExam(c.Request.Context())
+	out := make([]pggMaterialBlock, 0)
+	for _, block := range exam.Materials {
+		if block.PaperID == paperID && block.Section == section {
+			out = append(out, block)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PageNo < out[j].PageNo })
+	writeJSON(c, http.StatusOK, map[string]any{
+		"paper_id":  paperID,
+		"section":   section,
+		"materials": out,
+	})
 }
 
 func normalizeExamAnswer(value string) string {
@@ -183,8 +340,8 @@ func (h *Handler) submitExamAnswer(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "paper_id, section and q_no are required")
 		return
 	}
-	_, questions := h.loadPGGExam(c.Request.Context())
-	for _, question := range questions {
+	exam := h.loadPGGExam(c.Request.Context())
+	for _, question := range exam.Questions {
 		if question.PaperID != req.PaperID || question.Section != req.Section || question.QNo != req.QNo {
 			continue
 		}

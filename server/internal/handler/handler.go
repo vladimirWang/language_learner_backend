@@ -93,7 +93,15 @@ func (h *Handler) Routes() http.Handler {
 	{
 		exam.GET("/papers", h.listExamPapers)
 		exam.GET("/paper/:paperId/questions", h.listExamQuestions)
+		exam.GET("/paper/:paperId/diktat", h.listExamDiktat)
+		exam.GET("/paper/:paperId/writing", h.listExamWriting)
+		exam.GET("/question", h.getExamQuestion)
+		exam.GET("/material", h.examMaterial)
 		exam.POST("/answer", h.submitExamAnswer)
+		// 管理台题库维护：浏览、绑定答案
+		exam.GET("/admin/papers", h.examAdminPapers)
+		exam.GET("/admin/questions", h.examAdminQuestions)
+		exam.PUT("/admin/answer", h.examAdminUpdateAnswer)
 	}
 
 	// 听力导入任务
