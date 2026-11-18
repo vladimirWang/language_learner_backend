@@ -327,11 +327,12 @@ func examinerSystemPrompt(level, topic string) string {
 必须做到：
 1. 只使用 %s 等级范围内的词汇与句式，禁止超纲；提问必须语法正确（冠词、格、介词支配、语序、动词变位）。
 2. 每轮只输出一到两句德语提问，围绕话题 %s，不要跳到其他话题。
-3. 不做语法讲解，只做自然的追问与引导。
-4. 不评价对错、不打分。
-5. 全程德语，不使用英语或中文。
-6. 不要重复对话记录里已经问过的问题，每次追问都要换一个角度。
-7. 只输出德语文本本身，不要加引号、翻译或解释。`, level, level, topic)
+3. 追问必须承接考生最后一句话：先抓取其中的具体信息（地点、时间、人物、原因、数量、感受等），再据此追问细节；禁止提出与这句话无关的通用问题。
+4. 不做语法讲解，只做自然的追问与引导。
+5. 不评价对错、不打分。
+6. 全程德语，不使用英语或中文。
+7. 不要重复对话记录里已经问过的问题；可以在考生的回答上继续深挖，但要换一个信息点。
+8. 只输出德语文本本身，不要加引号、翻译或解释。`, level, level, topic)
 }
 
 func partnerSystemPrompt(level, topic string) string {
@@ -339,10 +340,10 @@ func partnerSystemPrompt(level, topic string) string {
 
 必须做到：
 1. 以同级考生口吻表达观点，句子长度与词汇难度和 %s 一致。
-2. 有观点、有互动：可以附和、补充或温和反驳，但不主导讨论。
+2. 有观点、有互动：先针对考生最后一句话的具体内容附和、补充或温和反驳，再表达自己的相关看法，不自说自话。
 3. 不纠正对方语法，不做讲解，不给分数。
 4. 单轮输出不超过两句。
-5. 不要重复对话记录里已经说过的话，每次回应都要有新观点。
+5. 不要重复对话记录里已经说过的话；回应要围绕考生的最后一句话展开。
 6. 全程德语，只围绕 %s。只输出德语文本本身，不要加引号或解释。`, level, topic, level, topic)
 }
 
@@ -464,11 +465,6 @@ func (h *Handler) speakingReply(c *gin.Context) {
 		sb.WriteString(strings.TrimSpace(turn.Text))
 		sb.WriteString("\n")
 	}
-	if req.Role == "partner" {
-		sb.WriteString("\n请生成搭档对考生最后一句话的回应（德语，一到两句）。")
-	} else {
-		sb.WriteString("\n请生成考官对考生最后一句话的追问（德语，一到两句）。")
-	}
 	if refs := h.speakingReferences(c.Request.Context(), req); len(refs) > 0 {
 		sb.WriteString("\n\n参考资料（仅可借鉴表达，不要照抄）：\n")
 		for _, ref := range refs {
@@ -484,6 +480,26 @@ func (h *Handler) speakingReply(c *gin.Context) {
 			sb.WriteString(ref)
 			sb.WriteString("\n")
 		}
+	}
+	// 追问指令放在最后，避免被参考语料稀释。
+	lastUser := ""
+	for _, turn := range req.History {
+		if turn.Role == "user" && strings.TrimSpace(turn.Text) != "" {
+			lastUser = strings.TrimSpace(turn.Text)
+		}
+	}
+	if lastUser != "" {
+		sb.WriteString("\n\n考生最后一句话：")
+		sb.WriteString(lastUser)
+		if req.Role == "partner" {
+			sb.WriteString("\n请先回应这句话里的具体内容（观点、理由或细节），再补充或追问一个相关细节（德语，一到两句）。")
+		} else {
+			sb.WriteString("\n请针对这句话里的具体信息（地点、时间、人物、原因、数量、感受等）提出一个相关追问，不要问与这句话无关的通用问题（德语，一到两句）。")
+		}
+	} else if req.Role == "partner" {
+		sb.WriteString("\n\n请生成搭档对考生上一句话的回应（德语，一到两句）。")
+	} else {
+		sb.WriteString("\n\n请生成考官对考生的追问（德语，一到两句）。")
 	}
 
 	basePrompt := sb.String()
