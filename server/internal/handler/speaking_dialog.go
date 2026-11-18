@@ -88,14 +88,17 @@ func (h *Handler) grammarReferences(ctx context.Context, level string, texts ...
 
 // speakingReplyReq 是「受控追问 / 搭档回应」的请求体。
 type speakingReplyReq struct {
-	Lang          string            `json:"lang"`
-	Level         string            `json:"level"`
-	ExamPart      string            `json:"exam_part"`
-	Topic         string            `json:"topic"`
-	Role          string            `json:"role"` // examiner / partner
-	History       []speakingTurnReq `json:"history"`
-	FollowupCount int               `json:"followup_count"`
-	PromptDE      string            `json:"prompt_de"`
+	Lang           string            `json:"lang"`
+	Level          string            `json:"level"`
+	ExamPart       string            `json:"exam_part"`
+	Topic          string            `json:"topic"`
+	Role           string            `json:"role"` // examiner / partner
+	History        []speakingTurnReq `json:"history"`
+	FollowupCount  int               `json:"followup_count"`
+	PromptDE       string            `json:"prompt_de"`
+	ExpectedPoints string            `json:"expected_points"`
+	CoveredPoints  []string          `json:"covered_points"`
+	MissingPoints  []string          `json:"missing_points"`
 }
 
 type speakingTurnReq struct {
@@ -332,7 +335,8 @@ func examinerSystemPrompt(level, topic string) string {
 5. 不评价对错、不打分。
 6. 全程德语，不使用英语或中文。
 7. 不要重复对话记录里已经问过的问题；可以在考生的回答上继续深挖，但要换一个信息点。
-8. 只输出德语文本本身，不要加引号、翻译或解释。`, level, level, topic)
+8. 只在本题问句的范围内追问，不要另起一道新题，也不要直接问题库里的下一道题。
+9. 只输出德语文本本身，不要加引号、翻译或解释。`, level, level, topic)
 }
 
 func partnerSystemPrompt(level, topic string) string {
@@ -452,8 +456,20 @@ func (h *Handler) speakingReply(c *gin.Context) {
 	var sb strings.Builder
 	sb.WriteString("题库当前话题：")
 	sb.WriteString(req.Topic)
-	sb.WriteString("\n当前考官问句：")
+	sb.WriteString("\n本题问句（追问不得脱离本题）：")
 	sb.WriteString(req.PromptDE)
+	if req.ExpectedPoints != "" {
+		sb.WriteString("\n本题应覆盖的要点：")
+		sb.WriteString(req.ExpectedPoints)
+	}
+	if len(req.CoveredPoints) > 0 {
+		sb.WriteString("\n考生已覆盖：")
+		sb.WriteString(strings.Join(req.CoveredPoints, " / "))
+	}
+	if len(req.MissingPoints) > 0 {
+		sb.WriteString("\n考生尚未覆盖：")
+		sb.WriteString(strings.Join(req.MissingPoints, " / "))
+	}
 	sb.WriteString("\n对话记录：\n")
 	for _, turn := range req.History {
 		role := "考生"
@@ -495,6 +511,9 @@ func (h *Handler) speakingReply(c *gin.Context) {
 			sb.WriteString("\n请先回应这句话里的具体内容（观点、理由或细节），再补充或追问一个相关细节（德语，一到两句）。")
 		} else {
 			sb.WriteString("\n请针对这句话里的具体信息（地点、时间、人物、原因、数量、感受等）提出一个相关追问，不要问与这句话无关的通用问题（德语，一到两句）。")
+			if len(req.MissingPoints) > 0 {
+				sb.WriteString("\n如果考生还没覆盖上述缺失要点，追问应自然引导其补充，不要直接念出要点原文；仍然只围绕本题问句。")
+			}
 		}
 	} else if req.Role == "partner" {
 		sb.WriteString("\n\n请生成搭档对考生上一句话的回应（德语，一到两句）。")
@@ -543,12 +562,11 @@ func (h *Handler) speakingReply(c *gin.Context) {
 // ---------------------------------------------------------------------------
 
 type speakingCheckReq struct {
-	Lang           string `json:"lang"`
-	Level          string `json:"level"`
-	Topic          string `json:"topic"`
-	PromptDE       string `json:"prompt_de"`
-	Answer         string `json:"answer"`
-	ExpectedPoints string `json:"expected_points"`
+	Lang     string `json:"lang"`
+	Level    string `json:"level"`
+	Topic    string `json:"topic"`
+	PromptDE string `json:"prompt_de"`
+	Answer   string `json:"answer"`
 }
 
 type grammarIssue struct {
@@ -571,13 +589,14 @@ func grammarCheckSystemPrompt() string {
 
 必须做到：
 1. 只依据「语法规范参考」和标准德语语法判断，规范没有覆盖的条目不得臆造规则。
-2. 只检查语法与搭配，不评价内容好坏，不打分。
-3. 输出严格为 JSON，不要使用代码块，不要输出 JSON 以外的任何文字。
-4. JSON 结构：
+2. 只检查语法、用词与固定搭配，不评价内容好坏，不打分。
+3. 不要因为回答没有覆盖题目要点、信息不完整或与题目无关而判定为语法错误；这类情况只在 comment 里提示。
+4. 输出严格为 JSON，不要使用代码块，不要输出 JSON 以外的任何文字。
+5. JSON 结构：
 {"corrected":"语法正确的改写（尽量保留原意与原句结构）","errors":[{"type":"冠词/格/介词/语序/动词变位/搭配/其他","snippet":"原句中的错误片段","fix":"正确写法","explanation":"中文简短解释"}],"rules":["引用的规范标题"],"comment":"一句中文总评"}
-5. type、explanation 与 comment 必须使用简体中文；corrected、snippet、fix 使用德语。
-6. 没有语法错误时 errors 为空数组，corrected 可与原句相同，comment 说明表达正确。
-7. 最多列出 4 处错误；考生回答过短或与题目无关时只在 comment 里提示，不要编造错误。
+6. type、explanation 与 comment 必须使用简体中文；corrected、snippet、fix 使用德语。
+7. 没有语法错误时 errors 为空数组，corrected 可与原句相同，comment 说明表达正确。
+8. 最多列出 4 处错误；不要编造错误。
 
 示例（只示范格式与语言，不要照抄内容）：
 输入：Ich komme aus Thailand, bin nicht Spanien.
@@ -594,10 +613,6 @@ func grammarCheckUserPrompt(req speakingCheckReq, refs []string) string {
 	sb.WriteString(req.PromptDE)
 	sb.WriteString("\n考生回答：")
 	sb.WriteString(req.Answer)
-	if req.ExpectedPoints != "" {
-		sb.WriteString("\n本题应覆盖的要点：")
-		sb.WriteString(req.ExpectedPoints)
-	}
 	if len(refs) > 0 {
 		sb.WriteString("\n\n语法规范参考：\n")
 		for _, ref := range refs {
@@ -673,7 +688,6 @@ func (h *Handler) speakingCheck(c *gin.Context) {
 	req.Topic = strings.TrimSpace(req.Topic)
 	req.PromptDE = strings.TrimSpace(req.PromptDE)
 	req.Answer = strings.TrimSpace(req.Answer)
-	req.ExpectedPoints = strings.TrimSpace(req.ExpectedPoints)
 	if !validCefrLevels[req.Level] {
 		writeError(c, http.StatusBadRequest, "invalid level")
 		return
@@ -692,7 +706,7 @@ func (h *Handler) speakingCheck(c *gin.Context) {
 		writeJSON(c, http.StatusOK, empty)
 		return
 	}
-	refs := h.grammarReferences(c.Request.Context(), req.Level, req.Topic, req.PromptDE, req.Answer, req.ExpectedPoints)
+	refs := h.grammarReferences(c.Request.Context(), req.Level, req.Topic, req.PromptDE, req.Answer)
 	raw, err := h.llm.ChatJSON(c.Request.Context(), grammarCheckSystemPrompt(), grammarCheckUserPrompt(req, refs), 800)
 	if err != nil {
 		h.logger.Printf("speaking grammar check: %v", err)
