@@ -23,7 +23,6 @@ def run(settings: Settings, langs: list[str], version: str) -> None:
 
     store = Store(settings.pg_dsn)
     try:
-        store.ensure_schema()
         uploader = Uploader(settings)
         for lang in langs:
             lang_version = version if len(langs) == 1 else f"{version}-{lang}"

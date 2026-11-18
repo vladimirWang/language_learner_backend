@@ -13,53 +13,6 @@ from .chunking import Chunk
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA = [
-    "CREATE EXTENSION IF NOT EXISTS vector",
-    """
-    CREATE TABLE IF NOT EXISTS rag_chunks (
-        chunk_id    BIGSERIAL PRIMARY KEY,
-        lang        TEXT NOT NULL,
-        level       TEXT,
-        chunk_type  TEXT NOT NULL,
-        lemma       TEXT,
-        title       TEXT NOT NULL,
-        content     TEXT NOT NULL,
-        source_path TEXT NOT NULL,
-        source_hash TEXT NOT NULL,
-        embedding   vector(1024),
-        create_version TEXT,
-        updated_at  TIMESTAMPTZ DEFAULT now()
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_rag_chunks_filter
-        ON rag_chunks (lang, chunk_type, level)
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS build_versions (
-        version   TEXT PRIMARY KEY,
-        lang      TEXT,
-        db_url    TEXT,
-        vector_snapshot_url TEXT,
-        db_md5    TEXT,
-        vector_md5 TEXT,
-        status    TEXT,
-        source_commit TEXT,
-        created_at TIMESTAMPTZ DEFAULT now()
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS build_logs (
-        log_id    BIGSERIAL PRIMARY KEY,
-        version   TEXT,
-        stage     TEXT,
-        message   TEXT,
-        level     TEXT,
-        created_at TIMESTAMPTZ DEFAULT now()
-    )
-    """,
-]
-
 
 @dataclass(frozen=True)
 class StoredChunk:
@@ -78,34 +31,11 @@ class StoredChunk:
 class Store:
     def __init__(self, dsn: str) -> None:
         self._conn = psycopg.connect(dsn, connect_timeout=10)
-        # pgvector 适配器要求库里已存在 vector 类型
-        with self._conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        self._conn.commit()
+        # vector 扩展与表结构由 golang-migrate 在 builder 启动前创建。
         register_vector(self._conn)
 
     def close(self) -> None:
         self._conn.close()
-
-    def ensure_schema(self) -> None:
-        with self._conn.cursor() as cur:
-            for statement in _SCHEMA:
-                cur.execute(statement)
-            # 兼容旧库：build_versions 增加 source_commit 列（增量迁移）
-            cur.execute(
-                """
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM information_schema.columns
-                        WHERE table_name = 'build_versions' AND column_name = 'source_commit'
-                    ) THEN
-                        ALTER TABLE build_versions ADD COLUMN source_commit TEXT;
-                    END IF;
-                END $$;
-                """
-            )
-        self._conn.commit()
 
     def create_vector_index(self) -> None:
         """数据写入后建 HNSW，避免批量写入期 maintenance_work_mem 尖峰。"""

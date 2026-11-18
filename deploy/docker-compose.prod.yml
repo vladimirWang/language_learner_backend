@@ -9,7 +9,6 @@ services:
       POSTGRES_DB: ${PG_DATABASE}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     ports:
       - "127.0.0.1:5432:5432"
     mem_limit: 512m
@@ -24,6 +23,30 @@ services:
       - -c max_connections=16
       - -c effective_cache_size=256MB
       - -c wal_buffers=1MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${PG_USER} -d $${PG_DATABASE}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  migrate:
+    image: migrate/migrate:v4.18.3
+    container_name: lang-migrate-prod
+    env_file: .env.prod
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        migrate -path /migrations
+        -database "postgres://$$PG_USER:$$PG_PASSWORD@$$PG_HOST:$$PG_PORT/$$PG_DATABASE?sslmode=$${PG_SSLMODE:-disable}"
+        -verbose up
+    volumes:
+      - ./migrations:/migrations:ro
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   version-service:
     build:
@@ -38,7 +61,8 @@ services:
     cpus: 1.0
     restart: always
     depends_on:
-      - postgres
+      migrate:
+        condition: service_completed_successfully
 
   # 管理后台前端：静态站点 + /api 反向代理
   # 部署前先在宿主机构建前端（language_learner_frontend：pnpm build），
@@ -73,7 +97,8 @@ services:
     volumes:
       - ../content:/builder/content:ro
     depends_on:
-      - postgres
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:
