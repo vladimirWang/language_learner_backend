@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -121,19 +122,13 @@ class Store:
                     embedding=_vector_values(row[9]),
                 )
 
+    # 构建生命周期表（build_versions / build_logs）由 Go 独占写入；
+    # builder 只把状态与结果打印成约定格式，由 scheduler 解析后入库。
     def record_build(self, version: str, lang: str, status: str, source_commit: str = "") -> None:
-        with self._conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO build_versions (version, lang, status, source_commit)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (version) DO UPDATE
-                SET lang = EXCLUDED.lang, status = EXCLUDED.status,
-                    source_commit = COALESCE(NULLIF(%s, ''), build_versions.source_commit)
-                """,
-                (version, lang, status, source_commit, source_commit),
-            )
-        self._conn.commit()
+        print(
+            f"[build] {version} status={status} lang={lang} source_commit={source_commit or '-'}",
+            flush=True,
+        )
 
     def finish_build(
         self,
@@ -144,49 +139,22 @@ class Store:
         db_md5: str,
         vector_md5: str,
     ) -> None:
-        with self._conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE build_versions
-                SET status = 'built', db_url = %s, vector_snapshot_url = %s,
-                    db_md5 = %s, vector_md5 = %s
-                WHERE version = %s
-                """,
-                (db_key, vector_key, db_md5, vector_md5, version),
-            )
-            if cur.rowcount == 0:
-                cur.execute(
-                    """
-                    INSERT INTO build_versions
-                        (version, lang, status, db_url, vector_snapshot_url, db_md5, vector_md5)
-                    VALUES (%s, %s, 'built', %s, %s, %s, %s)
-                    """,
-                    (version, lang, db_key, vector_key, db_md5, vector_md5),
-                )
-        self._conn.commit()
+        payload = {
+            "version": version,
+            "lang": lang,
+            "db_url": db_key,
+            "vector_snapshot_url": vector_key,
+            "db_md5": db_md5,
+            "vector_md5": vector_md5,
+        }
+        print("BUILD_RESULT " + json.dumps(payload, ensure_ascii=False), flush=True)
 
     def fail_build(self, version: str, message: str) -> None:
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE build_versions SET status = 'failed' WHERE version = %s",
-                    (version,),
-                )
-            self._conn.commit()
-        except Exception:  # pragma: no cover - 失败路径尽力而为
-            logger.exception("failed to mark build %s as failed", version)
+        print(f"[build] {version} failed: {message}", flush=True)
         self.log(version, "pipeline", message, "error")
 
     def log(self, version: str, stage: str, message: str, level: str = "info") -> None:
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO build_logs (version, stage, message, level) VALUES (%s, %s, %s, %s)",
-                    (version, stage, message, level),
-                )
-            self._conn.commit()
-        except Exception:  # pragma: no cover - 日志失败不阻断构建
-            logger.exception("failed to write build log")
+        print(f"[{stage}] [{level}] {message}", flush=True)
 
 
 def _vector_values(value) -> list[float]:

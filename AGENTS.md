@@ -110,6 +110,16 @@ language_learn/
    - Builder 由 Go 触发拉起，执行完毕进程退出；
    - 同一时刻只允许一个构建任务；Go 侧做内存水位拦截（阈值 120MB）。
 
+4. **数据库迁移与写入归属**
+   - DDL 只由 `deploy/migrations` 下的 golang-migrate 执行；Go / Python 运行期都不建表、不改表。
+   - 每张表只有一个写入方：
+     | 表 | 写入方 |
+     |---|---|
+     | `listening_jobs`、`listening_job_logs`、`levels`、`level_exams`、`speaking_items` | Go |
+     | `build_versions`、`build_logs` | Go（唯一写入） |
+     | `rag_chunks`（含向量） | Python builder |
+   - Builder 不直接写 `build_versions` / `build_logs`：结束时输出 `BUILD_RESULT {json}`，日志走 stdout，由 Go scheduler 解析入库；进程异常时 Go 用 `MarkFailed` 兜底。
+
 4. **库分离**
    - `ground_truth.db`（只读预置）与 `user_data.db`（私有读写）物理分库；版本更新不覆盖用户进度。
 

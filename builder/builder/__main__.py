@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     except BuildError as exc:
         logging.error("build failed: %s", exc)
         return 1
-    except Exception:  # 未预期错误；失败状态由 pipeline 写入 build_versions
+    except Exception:  # 未预期错误；失败状态由 Go scheduler 依据退出码落库
         logging.exception("build crashed")
         return 1
     return 0

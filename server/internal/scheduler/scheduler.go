@@ -3,6 +3,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"regexp"
@@ -172,8 +173,14 @@ func (s *Scheduler) run(ctx context.Context, version, lang string) {
 		s.logLine(ctx, version, "trigger", "source_commit="+sourceCommit)
 	}
 
+	var result *buildResult
 	err := s.runner.Run(ctx, lang, version, extraEnv, func(line string) {
 		s.logger.Printf("[builder %s] %s", version, line)
+		if payload, ok := parseBuildResult(line); ok {
+			result = &payload
+			s.logLine(ctx, version, "builder", "build result received")
+			return
+		}
 		s.logLine(ctx, version, "builder", line)
 	})
 	if err != nil {
@@ -186,8 +193,44 @@ func (s *Scheduler) run(ctx context.Context, version, lang string) {
 		}
 		return
 	}
-	// 构建结果（built/failed、产物地址与 md5）由 Python 任务写入 build_versions。
+	// 构建结果由 builder 以 BUILD_RESULT 行输出，Go 负责落库。
+	if s.store != nil {
+		if result == nil {
+			s.logLine(ctx, version, "runner", "error: builder produced no BUILD_RESULT")
+			if e := s.store.MarkFailed(ctx, version); e != nil {
+				s.logger.Printf("mark failed %s: %v", version, e)
+			}
+			return
+		}
+		if e := s.store.FinishBuild(ctx, version,
+			result.DBURL, result.VectorSnapshotURL, result.DBMd5, result.VectorMd5); e != nil {
+			s.logger.Printf("finish build %s: %v", version, e)
+		}
+	}
 	s.logLine(ctx, version, "runner", "builder finished")
+}
+
+// buildResult 是 builder 输出的构建产物信息。
+type buildResult struct {
+	Version           string `json:"version"`
+	Lang              string `json:"lang"`
+	DBURL             string `json:"db_url"`
+	VectorSnapshotURL string `json:"vector_snapshot_url"`
+	DBMd5             string `json:"db_md5"`
+	VectorMd5         string `json:"vector_md5"`
+}
+
+const buildResultPrefix = "BUILD_RESULT "
+
+func parseBuildResult(line string) (buildResult, bool) {
+	if !strings.HasPrefix(line, buildResultPrefix) {
+		return buildResult{}, false
+	}
+	var r buildResult
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(line, buildResultPrefix)), &r); err != nil {
+		return buildResult{}, false
+	}
+	return r, true
 }
 
 func (s *Scheduler) setIdle() {

@@ -606,7 +606,20 @@ func (s *Store) StartBuild(ctx context.Context, version, lang string) error {
 	}).Create(&v).Error
 }
 
-// MarkFailed 只把未成功的记录置为 failed，避免覆盖 Python 已写入的成功结果。
+// FinishBuild 记录构建成功及产物信息（build_versions 由 Go 独占写入）。
+func (s *Store) FinishBuild(ctx context.Context, version, dbURL, vectorURL, dbMD5, vectorMD5 string) error {
+	return s.db.WithContext(ctx).Model(&Version{}).
+		Where("version = ?", version).
+		Updates(map[string]any{
+			"status":              "built",
+			"db_url":              dbURL,
+			"vector_snapshot_url": vectorURL,
+			"db_md5":              dbMD5,
+			"vector_md5":          vectorMD5,
+		}).Error
+}
+
+// MarkFailed 只把未成功的记录置为 failed，避免覆盖已写入的成功结果。
 func (s *Store) MarkFailed(ctx context.Context, version string) error {
 	return s.db.WithContext(ctx).Model(&Version{}).
 		Where("version = ? AND status <> ?", version, "built").
