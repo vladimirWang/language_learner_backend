@@ -86,6 +86,11 @@ var examinerTemplates = map[string][]string{
 		"Wie oft machen Sie das?",
 		"Haben Sie ein Beispiel dafür?",
 		"Und wie war das früher bei Ihnen?",
+		"Wer macht das bei Ihnen zu Hause?",
+		"Was gefällt Ihnen daran am besten?",
+		"Gibt es dabei auch etwas Schwieriges?",
+		"Wie lange machen Sie das schon?",
+		"Mit wem machen Sie das meistens?",
 	},
 	"part2_presentation": {
 		"Was ist dabei der wichtigste Punkt für Sie?",
@@ -93,6 +98,9 @@ var examinerTemplates = map[string][]string{
 		"Welche Erfahrung haben Sie damit gemacht?",
 		"Was würden Sie anderen in dieser Situation empfehlen?",
 		"Gibt es dabei auch Nachteile?",
+		"Wie hat sich das in den letzten Jahren verändert?",
+		"Welche Rolle spielt das für Ihre Familie?",
+		"Was könnte man in Zukunft besser machen?",
 	},
 	"part3_discussion": {
 		"Das ist ein guter Punkt. Wie sehen Sie das?",
@@ -100,6 +108,9 @@ var examinerTemplates = map[string][]string{
 		"Was würden Sie in dieser Situation machen?",
 		"Ich sehe das etwas anders. Was meinen Sie dazu?",
 		"Und wie wichtig ist Ihnen das persönlich?",
+		"Was spricht aus Ihrer Sicht dagegen?",
+		"Haben Sie das selbst schon erlebt?",
+		"Wie würden Ihre Freunde darüber denken?",
 	},
 }
 
@@ -110,6 +121,47 @@ var partnerTemplates = []string{
 	"Ich stimme Ihnen teilweise zu. Wie wichtig ist das für Sie?",
 	"Das kann ich gut verstehen. Haben Sie ein Beispiel dafür?",
 	"Da bin ich anderer Meinung. Wie würden Sie das begründen?",
+	"Das überrascht mich. Wie kam es dazu?",
+	"Bei uns ist das ähnlich. Was gefällt Ihnen daran am besten?",
+	"Das finde ich spannend. Wie oft machen Sie das?",
+	"Ehrlich gesagt sehe ich das anders. Warum ist das für Sie so wichtig?",
+}
+
+var wordSplitRe = regexp.MustCompile(`[a-zA-ZÄÖÜäöüß]{4,}`)
+
+// contentWordSet 提取用于判重的实词集合（长度 ≥4 的词）。
+func contentWordSet(text string) map[string]bool {
+	set := make(map[string]bool)
+	for _, word := range wordSplitRe.FindAllString(normalizeText(text), -1) {
+		set[word] = true
+	}
+	return set
+}
+
+// similarToAny 判断候选句是否与既有句子高度相似（词集合 Jaccard ≥ 0.6）。
+// 只做字面近似，用于拦住换汤不换药的重复提问。
+func similarToAny(candidate string, existing []string) bool {
+	candWords := contentWordSet(candidate)
+	if len(candWords) < 3 {
+		return false
+	}
+	for _, sentence := range existing {
+		words := contentWordSet(sentence)
+		if len(words) < 3 {
+			continue
+		}
+		inter := 0
+		for word := range candWords {
+			if words[word] {
+				inter++
+			}
+		}
+		union := len(candWords) + len(words) - inter
+		if union > 0 && float64(inter)/float64(union) >= 0.6 {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeText 去掉标点与多余空白并转小写，用于判重。
@@ -290,23 +342,49 @@ func (h *Handler) speakingReply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	reply, err := h.llm.Chat(r.Context(), system, sb.String())
-	if err != nil {
+	// 已出现过的问句（含题库当前问句），用于拦截重复提问。
+	past := make([]string, 0, len(req.History)+1)
+	if strings.TrimSpace(req.PromptDE) != "" {
+		past = append(past, req.PromptDE)
+	}
+	for _, turn := range req.History {
+		if turn.Role != "user" && strings.TrimSpace(turn.Text) != "" {
+			past = append(past, turn.Text)
+		}
+	}
+
+	basePrompt := sb.String()
+	reply, err := h.llm.Chat(r.Context(), system, basePrompt)
+	if err == nil {
+		reply = sanitizeReply(reply)
+		if validGermanReply(reply, req.Level) && !similarToAny(reply, past) {
+			writeJSON(w, http.StatusOK, speakingReplyResp{Reply: reply, Source: "llm"})
+			return
+		}
+		if err == nil && validGermanReply(reply, req.Level) {
+			h.logger.Printf("speaking llm repeated a question, retrying: %q", reply)
+			// 带「禁止重复」清单再请求一次，仍重复则回退模板。
+			var ban strings.Builder
+			for i := len(past) - 1; i >= 0 && ban.Len() < 600; i-- {
+				ban.WriteString("- ")
+				ban.WriteString(past[i])
+				ban.WriteString("\n")
+			}
+			retry, retryErr := h.llm.Chat(r.Context(), system,
+				basePrompt+"\n\n以下句子已经问过，严禁重复或改写：\n"+ban.String()+
+					"\n请换一个完全不同的角度提问。")
+			if retryErr == nil {
+				retry = sanitizeReply(retry)
+				if validGermanReply(retry, req.Level) && !similarToAny(retry, past) {
+					writeJSON(w, http.StatusOK, speakingReplyResp{Reply: retry, Source: "llm"})
+					return
+				}
+			}
+		} else {
+			h.logger.Printf("speaking llm output rejected: %q", reply)
+		}
+	} else {
 		h.logger.Printf("speaking llm: %v", err)
-		writeJSON(w, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
-		return
 	}
-	reply = sanitizeReply(reply)
-	if !validGermanReply(reply, req.Level) {
-		h.logger.Printf("speaking llm output rejected: %q", reply)
-		writeJSON(w, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
-		return
-	}
-	// 与本轮已出现过的问句重复时，改用模板中未被使用的句子。
-	if used[normalizeText(reply)] {
-		h.logger.Printf("speaking llm output duplicated, fallback to template")
-		writeJSON(w, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
-		return
-	}
-	writeJSON(w, http.StatusOK, speakingReplyResp{Reply: reply, Source: "llm"})
+	writeJSON(w, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
 }
