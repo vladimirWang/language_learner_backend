@@ -108,6 +108,11 @@ func (w *Worker) handle(ctx context.Context, msg amqp.Delivery) {
 		_ = msg.Ack(false)
 		return
 	}
+	if job.DeletedAt != nil {
+		w.logger.Printf("pdf worker: job %s deleted, skip", payload.JobID)
+		_ = msg.Ack(false)
+		return
+	}
 	if job.Status == "running" || job.Status == "succeeded" {
 		_ = msg.Ack(false)
 		return

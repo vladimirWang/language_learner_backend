@@ -48,6 +48,21 @@ func main() {
 	}
 	publisher := mq.NewPublisher(cfg.RabbitMQURL, cfg.PDFQueue, logger)
 	defer publisher.Close()
+	// 恢复上次进程退出时未完成的解析任务，避免任务停在 queued/running。
+	if ids, err := st.RequeueStalePDFJobs(ctx); err != nil {
+		logger.Printf("requeue stale pdf jobs: %v", err)
+	} else {
+		for _, jobID := range ids {
+			pubCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := publisher.Publish(pubCtx, map[string]string{"job_id": jobID})
+			cancel()
+			if err != nil {
+				logger.Printf("requeue pdf job %s: %v", jobID, err)
+			} else {
+				logger.Printf("requeued pdf job %s", jobID)
+			}
+		}
+	}
 	pdfWorker := pdfworker.New(st, rn, cfg.RabbitMQURL, cfg.PDFQueue, cfg.WorkDir, logger)
 	pdfWorker.Start(ctx)
 
@@ -57,8 +72,9 @@ func main() {
 		Addr:              cfg.Addr,
 		Handler:           h.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		// PDF 试卷可能很大，上传耗时可能超过 15 秒；过短的读超时会把请求体截断。
+		ReadTimeout:  10 * time.Minute,
+		WriteTimeout: 2 * time.Minute,
 	}
 
 	go func() {

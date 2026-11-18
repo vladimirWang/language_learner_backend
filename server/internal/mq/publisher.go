@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -44,13 +45,25 @@ func (p *Publisher) Publish(ctx context.Context, payload any) error {
 			publishErr = err
 			continue
 		}
+		confirms := p.ch.NotifyPublish(make(chan amqp.Confirmation, 1))
 		publishErr = p.ch.PublishWithContext(ctx, "", p.queue, false, false, amqp.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,
 			Body:         body,
 		})
 		if publishErr == nil {
-			return nil
+			// 等待 broker 确认落盘，避免消息未持久化就标记任务已入队。
+			select {
+			case confirm, ok := <-confirms:
+				if ok && confirm.Ack {
+					return nil
+				}
+				publishErr = fmt.Errorf("broker rejected message")
+			case <-time.After(5 * time.Second):
+				publishErr = fmt.Errorf("publish confirm timeout")
+			case <-ctx.Done():
+				publishErr = ctx.Err()
+			}
 		}
 		p.closeLocked()
 	}
@@ -81,6 +94,12 @@ func (p *Publisher) ensureLocked() error {
 		ch.Close()
 		conn.Close()
 		return fmt.Errorf("declare queue %s: %w", p.queue, err)
+	}
+	// 开启 publisher confirm，配合 durable 队列与持久化消息保证任务不丢。
+	if err := ch.Confirm(false); err != nil {
+		ch.Close()
+		conn.Close()
+		return fmt.Errorf("enable publisher confirm: %w", err)
 	}
 	p.conn = conn
 	p.ch = ch

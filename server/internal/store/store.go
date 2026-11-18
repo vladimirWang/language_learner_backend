@@ -990,6 +990,7 @@ type PDFImportJob struct {
 	UpdatedAt    time.Time       `gorm:"column:updated_at" json:"updated_at"`
 	StartedAt    *time.Time      `gorm:"column:started_at" json:"started_at"`
 	FinishedAt   *time.Time      `gorm:"column:finished_at" json:"finished_at"`
+	DeletedAt    *time.Time      `gorm:"column:deleted_at" json:"deleted_at"`
 }
 
 func (PDFImportJob) TableName() string { return "pdf_import_jobs" }
@@ -1004,6 +1005,110 @@ type PDFImportLog struct {
 }
 
 func (PDFImportLog) TableName() string { return "pdf_import_logs" }
+
+// PDFUploadSession 记录一次分片上传，fingerprint 用于断点续传。
+type PDFUploadSession struct {
+	UploadID     string    `gorm:"column:upload_id;primaryKey" json:"upload_id"`
+	Fingerprint  string    `gorm:"column:fingerprint" json:"fingerprint"`
+	OriginalName string    `gorm:"column:original_name" json:"original_name"`
+	SizeBytes    int64     `gorm:"column:size_bytes" json:"size_bytes"`
+	Lang         string    `gorm:"column:lang" json:"lang"`
+	ChunkSize    int       `gorm:"column:chunk_size" json:"chunk_size"`
+	TotalChunks  int       `gorm:"column:total_chunks" json:"total_chunks"`
+	Status       string    `gorm:"column:status" json:"status"`
+	JobID        *string   `gorm:"column:job_id" json:"job_id"`
+	CreatedAt    time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt    time.Time `gorm:"column:updated_at" json:"updated_at"`
+}
+
+func (PDFUploadSession) TableName() string { return "pdf_upload_sessions" }
+
+// CreatePDFUploadSession 登记分片上传会话。
+func (s *Store) CreatePDFUploadSession(ctx context.Context, session PDFUploadSession) error {
+	return s.db.WithContext(ctx).Model(&PDFUploadSession{}).Create(map[string]any{
+		"upload_id":     session.UploadID,
+		"fingerprint":   session.Fingerprint,
+		"original_name": session.OriginalName,
+		"size_bytes":    session.SizeBytes,
+		"lang":          session.Lang,
+		"chunk_size":    session.ChunkSize,
+		"total_chunks":  session.TotalChunks,
+		"status":        "uploading",
+	}).Error
+}
+
+// GetPDFUploadSession 按 upload_id 查询；不存在返回 nil。
+func (s *Store) GetPDFUploadSession(ctx context.Context, uploadID string) (*PDFUploadSession, error) {
+	var session PDFUploadSession
+	err := s.db.WithContext(ctx).Where("upload_id = ?", uploadID).Take(&session).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &session, nil
+}
+
+// GetPDFUploadSessionByFingerprint 按文件指纹查询会话，用于断点续传。
+func (s *Store) GetPDFUploadSessionByFingerprint(ctx context.Context, fingerprint string) (*PDFUploadSession, error) {
+	var session PDFUploadSession
+	err := s.db.WithContext(ctx).Where("fingerprint = ?", fingerprint).Take(&session).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &session, nil
+}
+
+// ListPDFUploadChunks 返回已收到的分片序号。
+func (s *Store) ListPDFUploadChunks(ctx context.Context, uploadID string) ([]int, error) {
+	indexes := make([]int, 0)
+	err := s.db.WithContext(ctx).
+		Table("pdf_upload_chunks").
+		Where("upload_id = ?", uploadID).
+		Order("chunk_index ASC").
+		Pluck("chunk_index", &indexes).Error
+	return indexes, err
+}
+
+// UpsertPDFUploadChunk 记录一个已上传分片（重复上传按覆盖处理）。
+func (s *Store) UpsertPDFUploadChunk(ctx context.Context, uploadID string, index int, size int64) error {
+	return s.db.WithContext(ctx).Exec(
+		`INSERT INTO pdf_upload_chunks (upload_id, chunk_index, size_bytes)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT (upload_id, chunk_index) DO UPDATE SET size_bytes = EXCLUDED.size_bytes`,
+		uploadID, index, size,
+	).Error
+}
+
+// CompletePDFUploadSession 标记会话完成并关联导入任务。
+func (s *Store) CompletePDFUploadSession(ctx context.Context, uploadID, jobID string) error {
+	return s.db.WithContext(ctx).Model(&PDFUploadSession{}).Where("upload_id = ?", uploadID).
+		Updates(map[string]any{
+			"status":     "completed",
+			"job_id":     jobID,
+			"updated_at": gorm.Expr("now()"),
+		}).Error
+}
+
+// FindPDFImportJobByMD5 按文件 MD5 查找已有导入任务，用于去重。
+func (s *Store) FindPDFImportJobByMD5(ctx context.Context, md5sum, lang string) (*PDFImportJob, error) {
+	var job PDFImportJob
+	err := s.db.WithContext(ctx).
+		Where("file_md5 = ? AND lang = ? AND file_md5 <> '' AND deleted_at IS NULL", md5sum, lang).
+		Order("created_at DESC").
+		Take(&job).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &job, nil
+}
 
 // CreatePDFImportJob 登记一个待解析任务。
 func (s *Store) CreatePDFImportJob(ctx context.Context, job PDFImportJob) error {
@@ -1032,11 +1137,34 @@ func (s *Store) GetPDFImportJob(ctx context.Context, jobID string) (*PDFImportJo
 	return &job, nil
 }
 
-// ListPDFImportJobs 返回最近的导入任务。
-func (s *Store) ListPDFImportJobs(ctx context.Context, limit int) ([]PDFImportJob, error) {
+// ListPDFImportJobs 返回最近的导入任务；默认不包含已软删除的任务。
+func (s *Store) ListPDFImportJobs(ctx context.Context, limit int, includeDeleted bool) ([]PDFImportJob, error) {
 	jobs := make([]PDFImportJob, 0)
-	err := s.db.WithContext(ctx).Order("created_at DESC").Limit(limit).Find(&jobs).Error
+	q := s.db.WithContext(ctx).Order("created_at DESC").Limit(limit)
+	if !includeDeleted {
+		q = q.Where("deleted_at IS NULL")
+	}
+	err := q.Find(&jobs).Error
 	return jobs, err
+}
+
+// SoftDeletePDFImportJob 软删除任务；文件与解析结果保留，可恢复。
+func (s *Store) SoftDeletePDFImportJob(ctx context.Context, jobID string) error {
+	return s.db.WithContext(ctx).Model(&PDFImportJob{}).
+		Where("job_id = ? AND deleted_at IS NULL", jobID).
+		Updates(map[string]any{
+			"deleted_at": gorm.Expr("now()"),
+			"updated_at": gorm.Expr("now()"),
+		}).Error
+}
+
+// RestorePDFImportJob 恢复已软删除的任务。
+func (s *Store) RestorePDFImportJob(ctx context.Context, jobID string) error {
+	return s.db.WithContext(ctx).Model(&PDFImportJob{}).Where("job_id = ?", jobID).
+		Updates(map[string]any{
+			"deleted_at": nil,
+			"updated_at": gorm.Expr("now()"),
+		}).Error
 }
 
 // ListPDFImportLogs 返回任务日志；afterLogID > 0 时只返回更新的部分。
@@ -1061,11 +1189,32 @@ func (s *Store) AppendPDFImportLog(ctx context.Context, jobID, level, message st
 
 // MarkPDFImportQueued 标记消息已成功投递。
 func (s *Store) MarkPDFImportQueued(ctx context.Context, jobID string) error {
-	return s.db.WithContext(ctx).Model(&PDFImportJob{}).Where("job_id = ?", jobID).
+	// 只在仍为 pending 时置为 queued，避免覆盖消费者已经写入的 running 状态。
+	return s.db.WithContext(ctx).Model(&PDFImportJob{}).
+		Where("job_id = ? AND status = ?", jobID, "pending").
 		Updates(map[string]any{
 			"status":     "queued",
 			"updated_at": gorm.Expr("now()"),
 		}).Error
+}
+
+// RequeueStalePDFJobs 在服务启动时恢复未完成任务：
+// 上次进程中断留下的 running 重置为 pending，并返回需要重新投递的任务。
+func (s *Store) RequeueStalePDFJobs(ctx context.Context) ([]string, error) {
+	if err := s.db.WithContext(ctx).Model(&PDFImportJob{}).
+		Where("status = ? AND deleted_at IS NULL", "running").
+		Updates(map[string]any{
+			"status":     "pending",
+			"updated_at": gorm.Expr("now()"),
+		}).Error; err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0)
+	err := s.db.WithContext(ctx).Model(&PDFImportJob{}).
+		Where("status IN ? AND deleted_at IS NULL", []string{"pending", "queued"}).
+		Order("created_at ASC").
+		Pluck("job_id", &ids).Error
+	return ids, err
 }
 
 // StartPDFImportJob 标记任务开始执行。
