@@ -245,8 +245,8 @@ type speakingPlanUpsert struct {
 	ItemKeys    []string `json:"item_keys"`
 }
 
-// speakingPlanFromRequest 校验并规范化方案请求体。
-func speakingPlanFromRequest(req speakingPlanUpsert) (store.SpeakingPlan, []string, string) {
+// speakingPlanMetadataFromRequest 校验并规范化方案基础信息。
+func speakingPlanMetadataFromRequest(req speakingPlanUpsert) (store.SpeakingPlan, string) {
 	req.Lang = strings.TrimSpace(req.Lang)
 	req.Level = strings.ToUpper(strings.TrimSpace(req.Level))
 	req.Name = strings.TrimSpace(req.Name)
@@ -254,16 +254,37 @@ func speakingPlanFromRequest(req speakingPlanUpsert) (store.SpeakingPlan, []stri
 		req.Lang = "de"
 	}
 	if !langPattern.MatchString(req.Lang) {
-		return store.SpeakingPlan{}, nil, "invalid lang"
+		return store.SpeakingPlan{}, "invalid lang"
 	}
 	if !validCefrLevels[req.Level] {
-		return store.SpeakingPlan{}, nil, "invalid level (A1/A2/B1/B2/C1/C2)"
+		return store.SpeakingPlan{}, "invalid level (A1/A2/B1/B2/C1/C2)"
 	}
 	if req.Name == "" {
-		return store.SpeakingPlan{}, nil, "name is required"
+		return store.SpeakingPlan{}, "name is required"
 	}
 	if len([]rune(req.Name)) > 100 {
-		return store.SpeakingPlan{}, nil, "name is too long (max 100)"
+		return store.SpeakingPlan{}, "name is too long (max 100)"
+	}
+
+	active := true
+	if req.Active != nil {
+		active = *req.Active
+	}
+	return store.SpeakingPlan{
+		Lang:        req.Lang,
+		Level:       req.Level,
+		Name:        req.Name,
+		Description: strings.TrimSpace(req.Description),
+		Active:      active,
+		SortOrder:   req.SortOrder,
+	}, ""
+}
+
+// speakingPlanFromRequest 校验并规范化方案请求体。
+func speakingPlanFromRequest(req speakingPlanUpsert) (store.SpeakingPlan, []string, string) {
+	plan, msg := speakingPlanMetadataFromRequest(req)
+	if msg != "" {
+		return store.SpeakingPlan{}, nil, msg
 	}
 
 	keys := make([]string, 0, len(req.ItemKeys))
@@ -279,29 +300,20 @@ func speakingPlanFromRequest(req speakingPlanUpsert) (store.SpeakingPlan, []stri
 	if len(keys) == 0 {
 		return store.SpeakingPlan{}, nil, "item_keys is required"
 	}
-
-	active := true
-	if req.Active != nil {
-		active = *req.Active
-	}
-	return store.SpeakingPlan{
-		Lang:        req.Lang,
-		Level:       req.Level,
-		Name:        req.Name,
-		Description: strings.TrimSpace(req.Description),
-		Active:      active,
-		SortOrder:   req.SortOrder,
-	}, keys, ""
+	return plan, keys, ""
 }
 
-// validatePlanItems 确认方案题目都属于该难度且存在。
-func (h *Handler) validatePlanItems(c *gin.Context, level string, keys []string) string {
-	count, err := h.store.CountSoloSpeakingItems(c.Request.Context(), level, keys)
+// validatePlanItems 保留停用保存的难度校验；启用方案时追加语种与题目状态校验。
+func (h *Handler) validatePlanItems(c *gin.Context, lang, level string, keys []string, activeOnly bool) string {
+	count, err := h.store.CountSoloSpeakingItems(c.Request.Context(), lang, level, keys, activeOnly)
 	if err != nil {
 		h.logger.Printf("count speaking items: %v", err)
 		return "validate speaking items failed"
 	}
 	if count != int64(len(keys)) {
+		if activeOnly {
+			return "启用方案前，请确保所有题目均属同语种、同等级且已启用"
+		}
 		return "存在不属于该难度或已删除的题目"
 	}
 	return ""
@@ -353,7 +365,7 @@ func (h *Handler) createSpeakingPlan(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, msg)
 		return
 	}
-	if msg := h.validatePlanItems(c, plan.Level, keys); msg != "" {
+	if msg := h.validatePlanItems(c, plan.Lang, plan.Level, keys, plan.Active); msg != "" {
 		writeError(c, http.StatusBadRequest, msg)
 		return
 	}
@@ -395,7 +407,7 @@ func (h *Handler) updateSpeakingPlan(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, msg)
 		return
 	}
-	if msg := h.validatePlanItems(c, plan.Level, keys); msg != "" {
+	if msg := h.validatePlanItems(c, plan.Lang, plan.Level, keys, plan.Active); msg != "" {
 		writeError(c, http.StatusBadRequest, msg)
 		return
 	}

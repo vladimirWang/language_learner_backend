@@ -144,6 +144,7 @@ func (h *Handler) Routes() http.Handler {
 		speaking.GET("/plans", h.listSpeakingPlans)
 		speaking.GET("/plans/:id", h.getSpeakingPlan)
 		speaking.POST("/plans", h.createSpeakingPlan)
+		speaking.POST("/plans/generate", h.generateSpeakingPlan)
 		speaking.PUT("/plans/:id", h.updateSpeakingPlan)
 		speaking.DELETE("/plans/:id", h.deleteSpeakingPlan)
 		speaking.GET("/items/:key", h.getSpeakingItem)

@@ -785,15 +785,18 @@ func (s *Store) GetSpeakingPlan(ctx context.Context, id int64) (*SpeakingPlan, [
 	return &plan, items, err
 }
 
-// CountSoloSpeakingItems 统计 keys 中属于指定难度的题目数量，用于保存前校验。
-func (s *Store) CountSoloSpeakingItems(ctx context.Context, level string, keys []string) (int64, error) {
+// CountSoloSpeakingItems 统计 keys 中符合难度要求的题目；启用方案时同时校验语种和题目状态。
+func (s *Store) CountSoloSpeakingItems(ctx context.Context, lang, level string, keys []string, activeOnly bool) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
 	var count int64
-	err := s.db.WithContext(ctx).Model(&SpeakingItem{}).
-		Where("level = ? AND item_key IN ?", level, keys).
-		Count(&count).Error
+	q := s.db.WithContext(ctx).Model(&SpeakingItem{}).
+		Where("level = ? AND item_key IN ?", level, keys)
+	if activeOnly {
+		q = q.Where("lang = ? AND active = ?", lang, true)
+	}
+	err := q.Count(&count).Error
 	return count, err
 }
 
@@ -814,27 +817,54 @@ func replacePlanItems(tx *gorm.DB, planID int64, keys []string) error {
 	return nil
 }
 
+// createSpeakingPlan 在事务内创建方案及有序题目映射。
+func createSpeakingPlan(tx *gorm.DB, plan SpeakingPlan, itemKeys []string) (int64, error) {
+	if err := tx.Model(&SpeakingPlan{}).Create(map[string]any{
+		"lang":        plan.Lang,
+		"level":       plan.Level,
+		"name":        plan.Name,
+		"description": plan.Description,
+		"active":      plan.Active,
+		"sort_order":  plan.SortOrder,
+	}).Error; err != nil {
+		return 0, err
+	}
+	var created SpeakingPlan
+	if err := tx.Where("lang = ? AND level = ? AND name = ?", plan.Lang, plan.Level, plan.Name).
+		Take(&created).Error; err != nil {
+		return 0, err
+	}
+	if err := replacePlanItems(tx, created.ID, itemKeys); err != nil {
+		return 0, err
+	}
+	return created.ID, nil
+}
+
 // CreateSpeakingPlan 新建方案及其题目，返回方案 ID。
 func (s *Store) CreateSpeakingPlan(ctx context.Context, plan SpeakingPlan, itemKeys []string) (int64, error) {
 	var id int64
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&SpeakingPlan{}).Create(map[string]any{
-			"lang":        plan.Lang,
-			"level":       plan.Level,
-			"name":        plan.Name,
-			"description": plan.Description,
-			"active":      plan.Active,
-			"sort_order":  plan.SortOrder,
-		}).Error; err != nil {
-			return err
+		var err error
+		id, err = createSpeakingPlan(tx, plan, itemKeys)
+		return err
+	})
+	return id, err
+}
+
+// CreateGeneratedSpeakingPlan 原子写入智能生成的新题、停用方案及有序题目映射。
+func (s *Store) CreateGeneratedSpeakingPlan(ctx context.Context, plan SpeakingPlan, itemKeys []string, newItems []SpeakingItem) (int64, error) {
+	var id int64
+	plan.Active = false
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for i := range newItems {
+			newItems[i].Active = false
+			if err := tx.Create(&newItems[i]).Error; err != nil {
+				return err
+			}
 		}
-		var created SpeakingPlan
-		if err := tx.Where("lang = ? AND level = ? AND name = ?", plan.Lang, plan.Level, plan.Name).
-			Take(&created).Error; err != nil {
-			return err
-		}
-		id = created.ID
-		return replacePlanItems(tx, id, itemKeys)
+		var err error
+		id, err = createSpeakingPlan(tx, plan, itemKeys)
+		return err
 	})
 	return id, err
 }
