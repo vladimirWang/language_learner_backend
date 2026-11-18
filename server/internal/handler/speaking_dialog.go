@@ -44,16 +44,22 @@ var examinerTemplates = map[string][]string{
 		"Können Sie das bitte noch etwas genauer sagen?",
 		"Und warum ist das für Sie wichtig?",
 		"Wie oft machen Sie das?",
+		"Haben Sie ein Beispiel dafür?",
+		"Und wie war das früher bei Ihnen?",
 	},
 	"part2_presentation": {
 		"Was ist dabei der wichtigste Punkt für Sie?",
 		"Können Sie dazu ein Beispiel geben?",
 		"Welche Erfahrung haben Sie damit gemacht?",
+		"Was würden Sie anderen in dieser Situation empfehlen?",
+		"Gibt es dabei auch Nachteile?",
 	},
 	"part3_discussion": {
 		"Das ist ein guter Punkt. Wie sehen Sie das?",
 		"Können Sie das noch etwas erklären?",
 		"Was würden Sie in dieser Situation machen?",
+		"Ich sehe das etwas anders. Was meinen Sie dazu?",
+		"Und wie wichtig ist Ihnen das persönlich?",
 	},
 }
 
@@ -62,17 +68,41 @@ var partnerTemplates = []string{
 	"Interessant. Bei mir ist das ein bisschen anders.",
 	"Guter Punkt. Was würden Sie in dieser Situation machen?",
 	"Ich stimme Ihnen teilweise zu. Wie wichtig ist das für Sie?",
+	"Das kann ich gut verstehen. Haben Sie ein Beispiel dafür?",
+	"Da bin ich anderer Meinung. Wie würden Sie das begründen?",
 }
 
-func pickTemplate(part, role string, followupCount int) string {
-	if role == "partner" {
-		return partnerTemplates[followupCount%len(partnerTemplates)]
+// normalizeText 去掉标点与多余空白并转小写，用于判重。
+func normalizeText(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	replacer := strings.NewReplacer(
+		".", "", "?", "", "!", "", ",", "", ";", "", ":", "",
+		"\"", "", "'", "", "„", "", "“", "", "”", "",
+	)
+	return strings.Join(strings.Fields(replacer.Replace(text)), " ")
+}
+
+// pickTemplate 在模板池中轮转，优先选择本轮对话里没出现过的句子。
+func pickTemplate(part, role string, followupCount int, used map[string]bool) string {
+	pool := partnerTemplates
+	if role != "partner" {
+		if p, ok := examinerTemplates[part]; ok && len(p) > 0 {
+			pool = p
+		} else {
+			pool = examinerTemplates["part1_intro"]
+		}
 	}
-	pool, ok := examinerTemplates[part]
-	if !ok || len(pool) == 0 {
-		pool = examinerTemplates["part1_intro"]
+	if len(pool) == 0 {
+		return "Können Sie das noch etwas genauer erklären?"
 	}
-	return pool[followupCount%len(pool)]
+	start := followupCount % len(pool)
+	for i := 0; i < len(pool); i++ {
+		candidate := pool[(start+i)%len(pool)]
+		if !used[normalizeText(candidate)] {
+			return candidate
+		}
+	}
+	return pool[start]
 }
 
 func examinerSystemPrompt(level, topic string) string {
@@ -84,7 +114,8 @@ func examinerSystemPrompt(level, topic string) string {
 3. 不做语法讲解，只做自然的追问与引导。
 4. 不评价对错、不打分。
 5. 全程德语，不使用英语或中文。
-6. 只输出德语文本本身，不要加引号、翻译或解释。`, level, level, topic)
+6. 不要重复对话记录里已经问过的问题，每次追问都要换一个角度。
+7. 只输出德语文本本身，不要加引号、翻译或解释。`, level, level, topic)
 }
 
 func partnerSystemPrompt(level, topic string) string {
@@ -95,7 +126,8 @@ func partnerSystemPrompt(level, topic string) string {
 2. 有观点、有互动：可以附和、补充或温和反驳，但不主导讨论。
 3. 不纠正对方语法，不做讲解，不给分数。
 4. 单轮输出不超过两句。
-5. 全程德语，只围绕 %s。只输出德语文本本身，不要加引号或解释。`, level, topic, level, topic)
+5. 不要重复对话记录里已经说过的话，每次回应都要有新观点。
+6. 全程德语，只围绕 %s。只输出德语文本本身，不要加引号或解释。`, level, topic, level, topic)
 }
 
 // sanitizeReply 去掉引号、换行与多余空白的干扰。
@@ -166,7 +198,18 @@ func (h *Handler) speakingReply(w http.ResponseWriter, r *http.Request) {
 		req.FollowupCount = 0
 	}
 
-	fallback := pickTemplate(req.ExamPart, req.Role, req.FollowupCount)
+	// 已出现过的句子：用于避免重复提问（含当前题库问句）。
+	used := map[string]bool{}
+	if p := normalizeText(req.PromptDE); p != "" {
+		used[p] = true
+	}
+	for _, turn := range req.History {
+		if text := normalizeText(turn.Text); text != "" {
+			used[text] = true
+		}
+	}
+
+	fallback := pickTemplate(req.ExamPart, req.Role, req.FollowupCount, used)
 
 	if !h.llm.Enabled() {
 		writeJSON(w, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
@@ -208,6 +251,12 @@ func (h *Handler) speakingReply(w http.ResponseWriter, r *http.Request) {
 	reply = sanitizeReply(reply)
 	if !validGermanReply(reply, req.Level) {
 		h.logger.Printf("speaking llm output rejected: %q", reply)
+		writeJSON(w, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
+		return
+	}
+	// 与本轮已出现过的问句重复时，改用模板中未被使用的句子。
+	if used[normalizeText(reply)] {
+		h.logger.Printf("speaking llm output duplicated, fallback to template")
 		writeJSON(w, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
 		return
 	}
