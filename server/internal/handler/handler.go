@@ -133,6 +133,11 @@ func (h *Handler) Routes() http.Handler {
 		speaking.POST("/templates", h.createSpeakingTemplate)
 		speaking.PUT("/templates/:id", h.updateSpeakingTemplate)
 		speaking.DELETE("/templates/:id", h.deleteSpeakingTemplate)
+		speaking.GET("/plans", h.listSpeakingPlans)
+		speaking.GET("/plans/:id", h.getSpeakingPlan)
+		speaking.POST("/plans", h.createSpeakingPlan)
+		speaking.PUT("/plans/:id", h.updateSpeakingPlan)
+		speaking.DELETE("/plans/:id", h.deleteSpeakingPlan)
 	}
 	return r
 }
@@ -1576,6 +1581,214 @@ func (h *Handler) createLevel(c *gin.Context) {
 
 // getLevel 返回关卡详情（含关联的 exam 列表）。
 func (h *Handler) getLevel(c *gin.Context) {
+// speakingPlanUpsert 是口语方案的创建/更新请求体。
+type speakingPlanUpsert struct {
+	Lang        string   `json:"lang"`
+	Level       string   `json:"level"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Active      *bool    `json:"active"`
+	SortOrder   int      `json:"sort_order"`
+	ItemKeys    []string `json:"item_keys"`
+}
+
+// speakingPlanFromRequest 校验并规范化方案请求体。
+func speakingPlanFromRequest(req speakingPlanUpsert) (store.SpeakingPlan, []string, string) {
+	req.Lang = strings.TrimSpace(req.Lang)
+	req.Level = strings.ToUpper(strings.TrimSpace(req.Level))
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Lang == "" {
+		req.Lang = "de"
+	}
+	if !langPattern.MatchString(req.Lang) {
+		return store.SpeakingPlan{}, nil, "invalid lang"
+	}
+	if !validCefrLevels[req.Level] {
+		return store.SpeakingPlan{}, nil, "invalid level (A1/A2/B1/B2/C1/C2)"
+	}
+	if req.Name == "" {
+		return store.SpeakingPlan{}, nil, "name is required"
+	}
+	if len([]rune(req.Name)) > 100 {
+		return store.SpeakingPlan{}, nil, "name is too long (max 100)"
+	}
+
+	keys := make([]string, 0, len(req.ItemKeys))
+	seen := make(map[string]bool, len(req.ItemKeys))
+	for _, raw := range req.ItemKeys {
+		key := strings.TrimSpace(raw)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return store.SpeakingPlan{}, nil, "item_keys is required"
+	}
+
+	active := true
+	if req.Active != nil {
+		active = *req.Active
+	}
+	return store.SpeakingPlan{
+		Lang:        req.Lang,
+		Level:       req.Level,
+		Name:        req.Name,
+		Description: strings.TrimSpace(req.Description),
+		Active:      active,
+		SortOrder:   req.SortOrder,
+	}, keys, ""
+}
+
+// validatePlanItems 确认方案题目都属于该难度且存在。
+func (h *Handler) validatePlanItems(c *gin.Context, level string, keys []string) string {
+	count, err := h.store.CountSoloSpeakingItems(c.Request.Context(), level, keys)
+	if err != nil {
+		h.logger.Printf("count speaking items: %v", err)
+		return "validate speaking items failed"
+	}
+	if count != int64(len(keys)) {
+		return "存在不属于该难度或已删除的题目"
+	}
+	return ""
+}
+
+// listSpeakingPlans 返回口语方案列表。
+func (h *Handler) listSpeakingPlans(c *gin.Context) {
+	lang := strings.TrimSpace(c.Query("lang"))
+	level := strings.ToUpper(strings.TrimSpace(c.Query("level")))
+	activeOnly := c.Query("active_only") != "false"
+	plans, err := h.store.ListSpeakingPlans(c.Request.Context(), lang, level, activeOnly)
+	if err != nil {
+		h.logger.Printf("list speaking plans: %v", err)
+		writeError(c, http.StatusInternalServerError, "list speaking plans failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"plans": plans})
+}
+
+// getSpeakingPlan 返回方案及其题目。
+func (h *Handler) getSpeakingPlan(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	plan, items, err := h.store.GetSpeakingPlan(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "speaking plan not found")
+			return
+		}
+		h.logger.Printf("get speaking plan: %v", err)
+		writeError(c, http.StatusInternalServerError, "get speaking plan failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"plan": plan, "items": items})
+}
+
+// createSpeakingPlan 新建口语方案。
+func (h *Handler) createSpeakingPlan(c *gin.Context) {
+	var req speakingPlanUpsert
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	plan, keys, msg := speakingPlanFromRequest(req)
+	if msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
+		return
+	}
+	if msg := h.validatePlanItems(c, plan.Level, keys); msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
+		return
+	}
+	existing, err := h.store.ListSpeakingPlans(c.Request.Context(), plan.Lang, plan.Level, false)
+	if err != nil {
+		h.logger.Printf("list speaking plans: %v", err)
+		writeError(c, http.StatusInternalServerError, "create speaking plan failed")
+		return
+	}
+	for _, item := range existing {
+		if item.Name == plan.Name {
+			writeError(c, http.StatusConflict, "该难度下已存在同名方案")
+			return
+		}
+	}
+	id, err := h.store.CreateSpeakingPlan(c.Request.Context(), plan, keys)
+	if err != nil {
+		h.logger.Printf("create speaking plan: %v", err)
+		writeError(c, http.StatusInternalServerError, "create speaking plan failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"id": id})
+}
+
+// updateSpeakingPlan 更新口语方案。
+func (h *Handler) updateSpeakingPlan(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var req speakingPlanUpsert
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	plan, keys, msg := speakingPlanFromRequest(req)
+	if msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
+		return
+	}
+	if msg := h.validatePlanItems(c, plan.Level, keys); msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
+		return
+	}
+	existing, err := h.store.ListSpeakingPlans(c.Request.Context(), plan.Lang, plan.Level, false)
+	if err != nil {
+		h.logger.Printf("list speaking plans: %v", err)
+		writeError(c, http.StatusInternalServerError, "update speaking plan failed")
+		return
+	}
+	for _, item := range existing {
+		if item.Name == plan.Name && item.ID != id {
+			writeError(c, http.StatusConflict, "该难度下已存在同名方案")
+			return
+		}
+	}
+	if err := h.store.UpdateSpeakingPlan(c.Request.Context(), id, plan, keys); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "speaking plan not found")
+			return
+		}
+		h.logger.Printf("update speaking plan: %v", err)
+		writeError(c, http.StatusInternalServerError, "update speaking plan failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
+}
+
+// deleteSpeakingPlan 删除口语方案。
+func (h *Handler) deleteSpeakingPlan(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if err := h.store.DeleteSpeakingPlan(c.Request.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "speaking plan not found")
+			return
+		}
+		h.logger.Printf("delete speaking plan: %v", err)
+		writeError(c, http.StatusInternalServerError, "delete speaking plan failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
+}
+
 	id, err := parseLevelID(c)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "invalid level id")
@@ -1670,7 +1883,9 @@ type addExamReq struct {
 	SortOrder int    `json:"sort_order"`
 }
 
-var validItemTypes = map[string]bool{"listening": true, "speaking": true, "speaking_topic": true}
+var validItemTypes = map[string]bool{
+	"listening": true, "speaking": true, "speaking_topic": true, "speaking_plan": true,
+}
 
 // addLevelExam 给关卡添加一个题目（听力或口语）。
 func (h *Handler) addLevelExam(c *gin.Context) {
@@ -1694,7 +1909,7 @@ func (h *Handler) addLevelExam(c *gin.Context) {
 		req.ItemType = "listening"
 	}
 	if !validItemTypes[req.ItemType] {
-		writeError(c, http.StatusBadRequest, "invalid item_type (listening/speaking_topic)")
+		writeError(c, http.StatusBadRequest, "invalid item_type (listening/speaking_plan)")
 		return
 	}
 	if err := h.store.AddLevelExam(c.Request.Context(), id, req.ItemType, req.ExamID, req.SortOrder); err != nil {
@@ -1722,7 +1937,7 @@ func (h *Handler) removeLevelExam(c *gin.Context) {
 		itemType = "listening"
 	}
 	if !validItemTypes[itemType] {
-		writeError(c, http.StatusBadRequest, "invalid item_type (listening/speaking_topic)")
+		writeError(c, http.StatusBadRequest, "invalid item_type (listening/speaking_plan)")
 		return
 	}
 	if err := h.store.RemoveLevelExam(c.Request.Context(), id, itemType, examID); err != nil {

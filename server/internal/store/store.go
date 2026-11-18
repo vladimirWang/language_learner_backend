@@ -721,8 +721,160 @@ func (s *Store) ListSpeakingItemsByTopic(ctx context.Context, lang, level, topic
 	return items, err
 }
 
+// SpeakingPlan 是同一难度下由若干口语题目组成的方案，可被多个关卡引用。
+type SpeakingPlan struct {
+	ID          int64     `gorm:"column:id;primaryKey" json:"id"`
+	Lang        string    `gorm:"column:lang" json:"lang"`
+	Level       string    `gorm:"column:level" json:"level"`
+	Name        string    `gorm:"column:name" json:"name"`
+	Description string    `gorm:"column:description" json:"description"`
+	Active      bool      `gorm:"column:active" json:"active"`
+	SortOrder   int       `gorm:"column:sort_order" json:"sort_order"`
+	ItemCount   int64     `gorm:"column:item_count" json:"item_count"`
+	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
+}
+
+func (SpeakingPlan) TableName() string { return "speaking_exam_plans" }
+
+// ListSpeakingPlans 返回口语方案列表，activeOnly 为 false 时含停用项。
+func (s *Store) ListSpeakingPlans(ctx context.Context, lang, level string, activeOnly bool) ([]SpeakingPlan, error) {
+	plans := make([]SpeakingPlan, 0)
+	q := s.db.WithContext(ctx).
+		Table("speaking_exam_plans p").
+		Select(`p.id, p.lang, p.level, p.name, p.description, p.active, p.sort_order,
+			p.created_at, p.updated_at,
+			(SELECT COUNT(*) FROM speaking_exam_plan_items i WHERE i.plan_id = p.id) AS item_count`)
+	if activeOnly {
+		q = q.Where("p.active = ?", true)
+	}
+	if lang != "" {
+		q = q.Where("p.lang = ?", lang)
+	}
+	if level != "" {
+		q = q.Where("p.level = ?", level)
+	}
+	err := q.Order("p.level ASC, p.sort_order ASC, p.id ASC").Scan(&plans).Error
+	return plans, err
+}
+
+// GetSpeakingPlan 返回方案及其题目，题目按方案内顺序排列。
+func (s *Store) GetSpeakingPlan(ctx context.Context, id int64) (*SpeakingPlan, []SpeakingItem, error) {
+	var plan SpeakingPlan
+	err := s.db.WithContext(ctx).
+		Table("speaking_exam_plans p").
+		Select(`p.id, p.lang, p.level, p.name, p.description, p.active, p.sort_order,
+			p.created_at, p.updated_at,
+			(SELECT COUNT(*) FROM speaking_exam_plan_items i WHERE i.plan_id = p.id) AS item_count`).
+		Where("p.id = ?", id).
+		Take(&plan).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, ErrNotFound
+		}
+		return nil, nil, err
+	}
+	items := make([]SpeakingItem, 0)
+	err = s.db.WithContext(ctx).
+		Table("speaking_items si").
+		Select("si.*").
+		Joins("JOIN speaking_exam_plan_items i ON i.item_key = si.item_key").
+		Where("i.plan_id = ?", id).
+		Order("i.sort_order ASC, si.item_key ASC").
+		Scan(&items).Error
+	return &plan, items, err
+}
+
+// CountSoloSpeakingItems 统计 keys 中属于指定难度的题目数量，用于保存前校验。
+func (s *Store) CountSoloSpeakingItems(ctx context.Context, level string, keys []string) (int64, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	var count int64
+	err := s.db.WithContext(ctx).Model(&SpeakingItem{}).
+		Where("level = ? AND item_key IN ?", level, keys).
+		Count(&count).Error
+	return count, err
+}
+
+// replacePlanItems 覆盖方案题目映射。
+func replacePlanItems(tx *gorm.DB, planID int64, keys []string) error {
+	if err := tx.Exec("DELETE FROM speaking_exam_plan_items WHERE plan_id = ?", planID).Error; err != nil {
+		return err
+	}
+	for index, key := range keys {
+		if err := tx.Exec(
+			`INSERT INTO speaking_exam_plan_items (plan_id, item_key, sort_order)
+			 VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
+			planID, key, index,
+		).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CreateSpeakingPlan 新建方案及其题目，返回方案 ID。
+func (s *Store) CreateSpeakingPlan(ctx context.Context, plan SpeakingPlan, itemKeys []string) (int64, error) {
+	var id int64
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&SpeakingPlan{}).Create(map[string]any{
+			"lang":        plan.Lang,
+			"level":       plan.Level,
+			"name":        plan.Name,
+			"description": plan.Description,
+			"active":      plan.Active,
+			"sort_order":  plan.SortOrder,
+		}).Error; err != nil {
+			return err
+		}
+		var created SpeakingPlan
+		if err := tx.Where("lang = ? AND level = ? AND name = ?", plan.Lang, plan.Level, plan.Name).
+			Take(&created).Error; err != nil {
+			return err
+		}
+		id = created.ID
+		return replacePlanItems(tx, id, itemKeys)
+	})
+	return id, err
+}
+
+// UpdateSpeakingPlan 全量更新方案与题目。
+func (s *Store) UpdateSpeakingPlan(ctx context.Context, id int64, plan SpeakingPlan, itemKeys []string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&SpeakingPlan{}).Where("id = ?", id).Updates(map[string]any{
+			"lang":        plan.Lang,
+			"level":       plan.Level,
+			"name":        plan.Name,
+			"description": plan.Description,
+			"active":      plan.Active,
+			"sort_order":  plan.SortOrder,
+			"updated_at":  gorm.Expr("now()"),
+		})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		return replacePlanItems(tx, id, itemKeys)
+	})
+}
+
+// DeleteSpeakingPlan 删除方案；题目映射随外键级联删除。
+func (s *Store) DeleteSpeakingPlan(ctx context.Context, id int64) error {
+	res := s.db.WithContext(ctx).Where("id = ?", id).Delete(&SpeakingPlan{})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ListLevelExams 返回关卡关联的内容，按 sort_order 排序。
-// 口语以话题为单位返回（exam_id 即话题名），由客户端进入主题对话页。
+// 口语以方案为单位返回（exam_id 即方案 ID），由客户端进入口语考试页。
 // 已软删除的听力 exam 不返回。
 func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamInfo, error) {
 	rows := make([]LevelExamInfo, 0)
@@ -742,19 +894,22 @@ func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamI
 		return nil, err
 	}
 
-	topics := make([]LevelExamInfo, 0)
+	plans := make([]LevelExamInfo, 0)
 	err := s.db.WithContext(ctx).
 		Table("level_exams le").
 		Select(`le.exam_id, le.item_type, le.sort_order, le.created_at,
-			COALESCE(l.lang, '') AS lang, '' AS source_url, le.exam_id AS name`).
+			COALESCE(p.lang, l.lang, '') AS lang, '' AS source_url,
+			COALESCE(NULLIF(p.name, ''), le.exam_id) AS name`).
 		Joins("LEFT JOIN levels l ON l.id = le.level_id").
-		Where("le.level_id = ? AND le.item_type = 'speaking_topic'", levelID).
+		Joins("LEFT JOIN speaking_exam_plans p ON le.item_type = 'speaking_plan' AND p.id::text = le.exam_id").
+		Where(`le.level_id = ? AND (le.item_type = 'speaking_topic'
+			OR (le.item_type = 'speaking_plan' AND p.id IS NOT NULL))`, levelID).
 		Order("le.sort_order ASC, le.id ASC").
-		Scan(&topics).Error
+		Scan(&plans).Error
 	if err != nil {
 		return nil, err
 	}
-	rows = append(rows, topics...)
+	rows = append(rows, plans...)
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].SortOrder < rows[j].SortOrder })
 	return rows, nil
 }
@@ -786,8 +941,8 @@ type AvailableExam struct {
 	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
 }
 
-// ListAvailableExams 返回可加入指定关卡且尚未关联的听力 exam 与口语话题。
-// 口语以话题为单位：只返回该关卡语种与难度下、已填写要点的话题。
+// ListAvailableExams 返回可加入指定关卡且尚未关联的听力 exam 与口语方案。
+// 口语以方案为单位：只返回该关卡语种与难度下、启用且含题目的方案。
 func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]AvailableExam, error) {
 	var lv Level
 	if err := s.db.WithContext(ctx).Where("id = ?", levelID).Take(&lv).Error; err != nil {
@@ -805,16 +960,15 @@ func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]Availa
 		      SELECT exam_id FROM level_exams WHERE level_id = ? AND item_type = 'listening'
 		  )
 		UNION ALL
-		SELECT 'speaking_topic' AS item_type, si.topic AS exam_id,
-		       si.topic || '（' || COUNT(*)::text || ' 题）' AS name,
-		       si.lang, '' AS source_url, MIN(si.created_at) AS created_at
-		FROM speaking_items si
-		WHERE si.active = true AND COALESCE(si.expected_points, '') <> ''
-		  AND si.lang = ? AND si.level = ?
-		  AND si.topic NOT IN (
-		      SELECT exam_id FROM level_exams WHERE level_id = ? AND item_type = 'speaking_topic'
+		SELECT 'speaking_plan' AS item_type, p.id::text AS exam_id,
+		       p.name || '（' || (SELECT COUNT(*) FROM speaking_exam_plan_items i WHERE i.plan_id = p.id)::text || ' 题）' AS name,
+		       p.lang, '' AS source_url, p.created_at
+		FROM speaking_exam_plans p
+		WHERE p.active = true AND p.lang = ? AND p.level = ?
+		  AND EXISTS (SELECT 1 FROM speaking_exam_plan_items i WHERE i.plan_id = p.id)
+		  AND p.id::text NOT IN (
+		      SELECT exam_id FROM level_exams WHERE level_id = ? AND item_type = 'speaking_plan'
 		  )
-		GROUP BY si.topic, si.lang
 		ORDER BY item_type ASC, created_at DESC
 	`, levelID, lv.Lang, lv.Difficulty, levelID).Scan(&rows).Error
 	return rows, err
