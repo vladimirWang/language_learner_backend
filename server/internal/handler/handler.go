@@ -1317,7 +1317,7 @@ func (h *Handler) getLevel(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "level not found")
 		return
 	}
-	exams, err := h.store.ListLevelExams(c.Request.Context(), id)
+	exams, err := h.store.ListLevelExams(c.Request.Context(), id, c.Query("expand_speaking") == "1")
 	if err != nil {
 		h.logger.Printf("list level exams: %v", err)
 		writeError(c, http.StatusInternalServerError, "list level exams failed")
@@ -1381,7 +1381,7 @@ func (h *Handler) listLevelExams(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid level id")
 		return
 	}
-	exams, err := h.store.ListLevelExams(c.Request.Context(), id)
+	exams, err := h.store.ListLevelExams(c.Request.Context(), id, c.Query("expand_speaking") == "1")
 	if err != nil {
 		h.logger.Printf("list level exams: %v", err)
 		writeError(c, http.StatusInternalServerError, "list level exams failed")
@@ -1396,7 +1396,7 @@ type addExamReq struct {
 	SortOrder int    `json:"sort_order"`
 }
 
-var validItemTypes = map[string]bool{"listening": true, "speaking": true}
+var validItemTypes = map[string]bool{"listening": true, "speaking": true, "speaking_topic": true}
 
 // addLevelExam 给关卡添加一个题目（听力或口语）。
 func (h *Handler) addLevelExam(c *gin.Context) {
@@ -1420,7 +1420,7 @@ func (h *Handler) addLevelExam(c *gin.Context) {
 		req.ItemType = "listening"
 	}
 	if !validItemTypes[req.ItemType] {
-		writeError(c, http.StatusBadRequest, "invalid item_type (listening/speaking)")
+		writeError(c, http.StatusBadRequest, "invalid item_type (listening/speaking_topic)")
 		return
 	}
 	if err := h.store.AddLevelExam(c.Request.Context(), id, req.ItemType, req.ExamID, req.SortOrder); err != nil {
@@ -1448,7 +1448,7 @@ func (h *Handler) removeLevelExam(c *gin.Context) {
 		itemType = "listening"
 	}
 	if !validItemTypes[itemType] {
-		writeError(c, http.StatusBadRequest, "invalid item_type (listening/speaking)")
+		writeError(c, http.StatusBadRequest, "invalid item_type (listening/speaking_topic)")
 		return
 	}
 	if err := h.store.RemoveLevelExam(c.Request.Context(), id, itemType, examID); err != nil {

@@ -506,11 +506,13 @@ func (s *Store) ListLevels(ctx context.Context, activeOnly bool) ([]Level, error
 	return levels, err
 }
 
-// ListLevelExams 返回关卡关联的题目列表（听力 exam / 口语题目），按 sort_order 排序。
-// 已软删除的听力 exam 不返回。
-func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamInfo, error) {
+// ListLevelExams 返回关卡关联的内容，按 sort_order 排序。
+// expandSpeaking=true 时把「口语话题」展开为该话题下当前等级的全部口语题（供 client 逐题练习）；
+// false 时返回话题本身（供管理台展示与移除）。已软删除的听力 exam 不返回。
+func (s *Store) ListLevelExams(ctx context.Context, levelID int64, expandSpeaking bool) ([]LevelExamInfo, error) {
 	rows := make([]LevelExamInfo, 0)
-	err := s.db.WithContext(ctx).
+	// 听力 exam 与历史遗留的单题口语关联。
+	if err := s.db.WithContext(ctx).
 		Table("level_exams le").
 		Select(`le.exam_id, le.item_type, le.sort_order, le.created_at,
 			COALESCE(j.lang, si.lang, '') AS lang,
@@ -521,8 +523,42 @@ func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamI
 		Where("le.level_id = ?", levelID).
 		Where("(le.item_type = 'listening' AND j.exam_id IS NOT NULL) OR (le.item_type = 'speaking' AND si.item_key IS NOT NULL)").
 		Order("le.sort_order ASC, le.id ASC").
-		Scan(&rows).Error
-	return rows, err
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	topics := make([]LevelExamInfo, 0)
+	if expandSpeaking {
+		// 话题 → 当前等级下该话题的全部口语题，按考试部分顺序展开。
+		err := s.db.WithContext(ctx).
+			Table("level_exams le").
+			Select(`si.item_key AS exam_id, 'speaking' AS item_type, le.sort_order, le.created_at,
+				si.lang AS lang, '' AS source_url, si.prompt_de AS name`).
+			Joins("JOIN levels l ON l.id = le.level_id").
+			Joins("JOIN speaking_items si ON si.topic = le.exam_id AND si.lang = l.lang AND si.level::text = l.difficulty AND si.active").
+			Where("COALESCE(si.expected_points, '') <> ''").
+			Where("le.level_id = ? AND le.item_type = 'speaking_topic'", levelID).
+			Order("le.sort_order ASC, le.id ASC, si.exam_part ASC, si.sort_order ASC, si.item_key ASC").
+			Scan(&topics).Error
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		err := s.db.WithContext(ctx).
+			Table("level_exams le").
+			Select(`le.exam_id, le.item_type, le.sort_order, le.created_at,
+				COALESCE(l.lang, '') AS lang, '' AS source_url, le.exam_id AS name`).
+			Joins("LEFT JOIN levels l ON l.id = le.level_id").
+			Where("le.level_id = ? AND le.item_type = 'speaking_topic'", levelID).
+			Order("le.sort_order ASC, le.id ASC").
+			Scan(&topics).Error
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows = append(rows, topics...)
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].SortOrder < rows[j].SortOrder })
+	return rows, nil
 }
 
 // AddLevelExam 给关卡添加一个题目（听力或口语）；已存在则更新 sort_order。
@@ -552,8 +588,16 @@ type AvailableExam struct {
 	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
 }
 
-// ListAvailableExams 返回可加入指定关卡且尚未关联的听力与口语题目。
+// ListAvailableExams 返回可加入指定关卡且尚未关联的听力 exam 与口语话题。
+// 口语以话题为单位：只返回该关卡语种与难度下、已填写要点的话题。
 func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]AvailableExam, error) {
+	var lv Level
+	if err := s.db.WithContext(ctx).Where("id = ?", levelID).Take(&lv).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return []AvailableExam{}, nil
+		}
+		return nil, err
+	}
 	rows := make([]AvailableExam, 0)
 	err := s.db.WithContext(ctx).Raw(`
 		SELECT 'listening' AS item_type, exam_id, name, lang, source_url, created_at
@@ -563,15 +607,18 @@ func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]Availa
 		      SELECT exam_id FROM level_exams WHERE level_id = ? AND item_type = 'listening'
 		  )
 		UNION ALL
-		SELECT 'speaking' AS item_type, item_key AS exam_id, prompt_de AS name,
-		       lang, prompt_de AS source_url, created_at
-		FROM speaking_items
-		WHERE active = true AND COALESCE(expected_points, '') <> ''
-		  AND item_key NOT IN (
-		      SELECT exam_id FROM level_exams WHERE level_id = ? AND item_type = 'speaking'
+		SELECT 'speaking_topic' AS item_type, si.topic AS exam_id,
+		       si.topic || '（' || COUNT(*)::text || ' 题）' AS name,
+		       si.lang, '' AS source_url, MIN(si.created_at) AS created_at
+		FROM speaking_items si
+		WHERE si.active = true AND COALESCE(si.expected_points, '') <> ''
+		  AND si.lang = ? AND si.level = ?
+		  AND si.topic NOT IN (
+		      SELECT exam_id FROM level_exams WHERE level_id = ? AND item_type = 'speaking_topic'
 		  )
+		GROUP BY si.topic, si.lang
 		ORDER BY item_type ASC, created_at DESC
-	`, levelID, levelID).Scan(&rows).Error
+	`, levelID, lv.Lang, lv.Difficulty, levelID).Scan(&rows).Error
 	return rows, err
 }
 
