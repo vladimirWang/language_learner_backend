@@ -3,6 +3,8 @@ package store
 
 import (
 	"context"
+	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"path"
 	"sort"
@@ -146,17 +148,69 @@ func (s *Store) ListSpeakingItems(ctx context.Context, lang, level string, activ
 // ErrNotFound 表示目标记录不存在，供 handler 映射为 404。
 var ErrNotFound = errors.New("record not found")
 
+// StringList 是存为 JSON 文本的字符串数组，便于在 TEXT 列里保存多值标签。
+type StringList []string
+
+func (s *StringList) Scan(value any) error {
+	var raw []byte
+	switch v := value.(type) {
+	case nil:
+		*s = StringList{}
+		return nil
+	case []byte:
+		raw = v
+	case string:
+		raw = []byte(v)
+	default:
+		*s = StringList{}
+		return nil
+	}
+	if len(raw) == 0 {
+		*s = StringList{}
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal(raw, &out); err != nil {
+		*s = StringList{}
+		return nil
+	}
+	*s = StringList(out)
+	return nil
+}
+
+func (s StringList) Value() (driver.Value, error) {
+	if s == nil {
+		return "[]", nil
+	}
+	raw, err := json.Marshal([]string(s))
+	if err != nil {
+		return nil, err
+	}
+	return string(raw), nil
+}
+
+// HasTopic 判断该话术是否绑定了指定话题。
+func (s StringList) HasTopic(topic string) bool {
+	for _, item := range s {
+		if item == topic {
+			return true
+		}
+	}
+	return false
+}
+
 // SpeakingReplyTemplate 是口语追问/搭档回应的兜底话术。
 type SpeakingReplyTemplate struct {
-	ID        int64     `gorm:"primaryKey" json:"id"`
-	Lang      string    `json:"lang"`
-	ExamPart  string    `gorm:"column:exam_part" json:"exam_part"`
-	Role      string    `json:"role"`
-	Text      string    `json:"text"`
-	Active    bool      `json:"active"`
-	SortOrder int       `gorm:"column:sort_order" json:"sort_order"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        int64      `gorm:"primaryKey" json:"id"`
+	Lang      string     `json:"lang"`
+	ExamPart  string     `gorm:"column:exam_part" json:"exam_part"`
+	Role      string     `json:"role"`
+	Text      string     `json:"text"`
+	Topics    StringList `gorm:"column:topics" json:"topics"`
+	Active    bool       `json:"active"`
+	SortOrder int        `gorm:"column:sort_order" json:"sort_order"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
 }
 
 func (SpeakingReplyTemplate) TableName() string { return "speaking_reply_templates" }
@@ -196,6 +250,7 @@ func (s *Store) UpdateSpeakingReplyTemplate(ctx context.Context, item *SpeakingR
 			"exam_part":  item.ExamPart,
 			"role":       item.Role,
 			"text":       item.Text,
+			"topics":     item.Topics,
 			"active":     item.Active,
 			"sort_order": item.SortOrder,
 			"updated_at": time.Now(),
@@ -218,6 +273,45 @@ func (s *Store) DeleteSpeakingReplyTemplate(ctx context.Context, id int64) error
 		return ErrNotFound
 	}
 	return nil
+}
+
+// ListSpeakingTopics 返回题库中出现过的话题名，供管理台做话术标签选择。
+func (s *Store) ListSpeakingTopics(ctx context.Context, lang string) ([]string, error) {
+	topics := make([]string, 0)
+	q := s.db.WithContext(ctx).Table("speaking_items").
+		Where("topic <> ''").
+		Distinct("topic").
+		Order("topic ASC")
+	if lang != "" {
+		q = q.Where("lang = ?", lang)
+	}
+	err := q.Pluck("topic", &topics).Error
+	return topics, err
+}
+
+// MissingSpeakingTopics 返回在题库中不存在的话题名。
+func (s *Store) MissingSpeakingTopics(ctx context.Context, topics []string) ([]string, error) {
+	if len(topics) == 0 {
+		return nil, nil
+	}
+	found := make([]string, 0, len(topics))
+	if err := s.db.WithContext(ctx).Table("speaking_items").
+		Where("topic IN ?", topics).
+		Distinct("topic").
+		Pluck("topic", &found).Error; err != nil {
+		return nil, err
+	}
+	exists := make(map[string]bool, len(found))
+	for _, topic := range found {
+		exists[topic] = true
+	}
+	missing := make([]string, 0)
+	for _, topic := range topics {
+		if !exists[topic] {
+			missing = append(missing, topic)
+		}
+	}
+	return missing, nil
 }
 
 // SearchRagChunks 按关键词粗检索参考语料，用于口语追问的轻量 RAG 注入。

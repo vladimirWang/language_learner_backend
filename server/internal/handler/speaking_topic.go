@@ -167,7 +167,7 @@ func (h *Handler) speakingTopicPlan(c *gin.Context) {
 		}
 	}
 	if len(plan.Rounds) == 0 {
-		plan.Rounds = fallbackTopicRounds(c.Request.Context(), h, anchors, target)
+		plan.Rounds = fallbackTopicRounds(c.Request.Context(), h, req.Topic, anchors, target)
 	}
 	for i := range plan.Rounds {
 		plan.Rounds[i].Order = i + 1
@@ -257,7 +257,7 @@ func parseTopicPlanReply(raw, level string, anchors []topicPlanRound, target int
 }
 
 // fallbackTopicRounds 按素材顺序铺开，再用兜底追问补足轮次。
-func fallbackTopicRounds(ctx context.Context, h *Handler, anchors []topicPlanRound, target int) []topicPlanRound {
+func fallbackTopicRounds(ctx context.Context, h *Handler, topic string, anchors []topicPlanRound, target int) []topicPlanRound {
 	rounds := make([]topicPlanRound, 0, target)
 	asked := make([]string, 0, target)
 	for _, anchor := range anchors {
@@ -267,7 +267,7 @@ func fallbackTopicRounds(ctx context.Context, h *Handler, anchors []topicPlanRou
 		rounds = append(rounds, anchor)
 		asked = append(asked, anchor.QuestionDE)
 	}
-	pool := h.templatePool(ctx, "part1_intro", "examiner")
+	pool := h.templatePool(ctx, "part1_intro", "examiner", topic)
 	for i := 0; len(rounds) < target && len(pool) > 0; i++ {
 		q := pool[i%len(pool)]
 		if similarToAny(q, asked) {

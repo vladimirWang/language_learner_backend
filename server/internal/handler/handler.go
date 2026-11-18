@@ -44,7 +44,7 @@ type Handler struct {
 
 	// 口语兜底话术缓存：启动/读写后按 TTL 重新加载，避免每次追问都查库。
 	tplMu      sync.RWMutex
-	tplCache   map[string][]string
+	tplCache   map[string][]store.SpeakingReplyTemplate
 	tplCacheAt time.Time
 
 	// 主题对话编排缓存：同一主题在 TTL 内复用同一份 ≥5 轮脚本。
@@ -123,6 +123,7 @@ func (h *Handler) Routes() http.Handler {
 		speaking.POST("/topic-plan", h.speakingTopicPlan)
 		speaking.POST("/validate-item", h.validateSpeakingItem)
 		speaking.GET("/templates", h.listSpeakingTemplates)
+		speaking.GET("/topics", h.listSpeakingTopics)
 		speaking.POST("/templates", h.createSpeakingTemplate)
 		speaking.PUT("/templates/:id", h.updateSpeakingTemplate)
 		speaking.DELETE("/templates/:id", h.deleteSpeakingTemplate)

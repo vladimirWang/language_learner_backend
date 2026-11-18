@@ -266,43 +266,61 @@ func pickTemplate(pool []string, followupCount int, used map[string]bool, past [
 
 const templateCacheTTL = 60 * time.Second
 
-// templatePool 从数据库读取兜底话术（60 秒缓存）；表为空或查询失败时回退代码内默认值。
-func (h *Handler) templatePool(ctx context.Context, part, role string) []string {
-	key := part
-	if role == "partner" {
-		key = "partner"
-	}
+// loadReplyTemplates 读取启用中的兜底话术（60 秒缓存）。
+func (h *Handler) loadReplyTemplates(ctx context.Context) []store.SpeakingReplyTemplate {
 	h.tplMu.RLock()
-	pool := h.tplCache[key]
+	items := h.tplCache["all"]
 	loadedAt := h.tplCacheAt
 	h.tplMu.RUnlock()
-	if len(pool) > 0 && time.Since(loadedAt) < templateCacheTTL {
-		return pool
+	if items != nil && time.Since(loadedAt) < templateCacheTTL {
+		return items
 	}
-	if h.store != nil {
-		items, err := h.store.ListSpeakingReplyTemplates(ctx, true)
-		if err == nil {
-			next := make(map[string][]string)
-			for _, item := range items {
-				if item.Lang != "" && item.Lang != "de" {
-					continue
-				}
-				k := item.ExamPart
-				if item.Role == "partner" {
-					k = "partner"
-				}
-				next[k] = append(next[k], item.Text)
-			}
-			h.tplMu.Lock()
-			h.tplCache = next
-			h.tplCacheAt = time.Now()
-			h.tplMu.Unlock()
-			if len(next[key]) > 0 {
-				return next[key]
-			}
-		} else {
-			h.logger.Printf("load speaking templates: %v", err)
+	if h.store == nil {
+		return nil
+	}
+	items, err := h.store.ListSpeakingReplyTemplates(ctx, true)
+	if err != nil {
+		h.logger.Printf("load speaking templates: %v", err)
+		return nil
+	}
+	h.tplMu.Lock()
+	h.tplCache = map[string][]store.SpeakingReplyTemplate{"all": items}
+	h.tplCacheAt = time.Now()
+	h.tplMu.Unlock()
+	return items
+}
+
+// templatePool 返回某部分/角色可用的话术。
+// 指定话题时：绑定了其他话题的话术被排除，未绑定话题的话术作为通用兜底；
+// 同一主题下优先使用显式绑定该话题的话术。
+func (h *Handler) templatePool(ctx context.Context, part, role, topic string) []string {
+	items := h.loadReplyTemplates(ctx)
+	tagged := make([]string, 0)
+	generic := make([]string, 0)
+	for _, item := range items {
+		if item.Lang != "" && item.Lang != "de" {
+			continue
 		}
+		if role == "partner" {
+			if item.Role != "partner" {
+				continue
+			}
+		} else if item.Role == "partner" || item.ExamPart != part {
+			continue
+		}
+		if topic != "" && len(item.Topics) > 0 && !item.Topics.HasTopic(topic) {
+			// 绑定了其他话题的话术不能用于当前话题。
+			continue
+		}
+		if len(item.Topics) == 0 {
+			generic = append(generic, item.Text)
+		} else {
+			tagged = append(tagged, item.Text)
+		}
+	}
+	pool := append(tagged, generic...)
+	if len(pool) > 0 {
+		return pool
 	}
 	return defaultTemplatePool(part, role)
 }
@@ -325,6 +343,13 @@ func (h *Handler) invalidateTemplateCache() {
 }
 
 func examinerSystemPrompt(level, topic string) string {
+	levelRule := ""
+	switch level {
+	case "A1":
+		levelRule = "\n10. A1 每轮只问一个不超过 8 个词的短问题，只涉及个人信息、日常事物与简单请求；不做追问链，不讨论观点。"
+	case "A2":
+		levelRule = "\n10. A2 每轮不超过 12 个词，围绕日常生活；不进行观点辩论，不要求长篇陈述。"
+	}
 	return fmt.Sprintf(`你是歌德学院 %s 级别口语考试的考官，与考生进行德语对话。
 
 必须做到：
@@ -336,10 +361,14 @@ func examinerSystemPrompt(level, topic string) string {
 6. 全程德语，不使用英语或中文。
 7. 不要重复对话记录里已经问过的问题；可以在考生的回答上继续深挖，但要换一个信息点。
 8. 只在本题问句的范围内追问，不要另起一道新题，也不要直接问题库里的下一道题。
-9. 只输出德语文本本身，不要加引号、翻译或解释。`, level, level, topic)
+9. 只输出德语文本本身，不要加引号、翻译或解释。%s`, level, level, topic, levelRule)
 }
 
 func partnerSystemPrompt(level, topic string) string {
+	levelRule := ""
+	if level == "A2" {
+		levelRule = "\n7. A2 搭档只做简短邀请、确认或委婉拒绝，不展开辩论。"
+	}
 	return fmt.Sprintf(`你是与考生同等级的 %s 德语考生，正在参加歌德口语第三部分的双人讨论，话题为 %s。
 
 必须做到：
@@ -348,7 +377,7 @@ func partnerSystemPrompt(level, topic string) string {
 3. 不纠正对方语法，不做讲解，不给分数。
 4. 单轮输出不超过两句。
 5. 不要重复对话记录里已经说过的话；回应要围绕考生的最后一句话展开。
-6. 全程德语，只围绕 %s。只输出德语文本本身，不要加引号或解释。`, level, topic, level, topic)
+6. 全程德语，只围绕 %s。只输出德语文本本身，不要加引号或解释。%s`, level, topic, level, topic, levelRule)
 }
 
 // sanitizeReply 去掉引号、换行与多余空白的干扰。
@@ -442,7 +471,7 @@ func (h *Handler) speakingReply(c *gin.Context) {
 		}
 	}
 
-	fallback := pickTemplate(h.templatePool(c.Request.Context(), req.ExamPart, req.Role), req.FollowupCount, used, past)
+	fallback := pickTemplate(h.templatePool(c.Request.Context(), req.ExamPart, req.Role, req.Topic), req.FollowupCount, used, past)
 
 	if !h.llm.Enabled() {
 		writeJSON(c, http.StatusOK, speakingReplyResp{Reply: fallback, Source: "template"})
@@ -735,11 +764,30 @@ func (h *Handler) speakingCheck(c *gin.Context) {
 // ---------------------------------------------------------------------------
 
 type speakingTemplateReq struct {
-	ExamPart  string `json:"exam_part"`
-	Role      string `json:"role"`
-	Text      string `json:"text"`
-	Active    *bool  `json:"active"`
-	SortOrder int    `json:"sort_order"`
+	ExamPart  string   `json:"exam_part"`
+	Role      string   `json:"role"`
+	Text      string   `json:"text"`
+	Topics    []string `json:"topics"`
+	Active    *bool    `json:"active"`
+	SortOrder int      `json:"sort_order"`
+}
+
+// normalizeTopics 去重并清理话题标签。
+func normalizeTopics(topics []string) []string {
+	out := make([]string, 0, len(topics))
+	seen := make(map[string]bool)
+	for _, topic := range topics {
+		topic = strings.TrimSpace(topic)
+		if topic == "" || len([]rune(topic)) > 80 || seen[topic] {
+			continue
+		}
+		seen[topic] = true
+		out = append(out, topic)
+		if len(out) >= 8 {
+			break
+		}
+	}
+	return out
 }
 
 func (req speakingTemplateReq) validate() (store.SpeakingReplyTemplate, error) {
@@ -767,9 +815,100 @@ func (req speakingTemplateReq) validate() (store.SpeakingReplyTemplate, error) {
 		ExamPart:  strings.TrimSpace(req.ExamPart),
 		Role:      role,
 		Text:      text,
+		Topics:    store.StringList(normalizeTopics(req.Topics)),
 		Active:    active,
 		SortOrder: req.SortOrder,
 	}, nil
+}
+
+// checkTemplateTopics 校验话题标签：话题必须存在，且话术需与话题相关。
+// LLM 不可用或调用失败时放行，避免临时故障阻塞管理台。
+func (h *Handler) checkTemplateTopics(ctx context.Context, text string, topics store.StringList) string {
+	if len(topics) == 0 {
+		return ""
+	}
+	batch := []string(topics)
+	missing, err := h.store.MissingSpeakingTopics(ctx, batch)
+	if err != nil {
+		h.logger.Printf("check template topics: %v", err)
+		return "校验话题失败，请稍后重试"
+	}
+	if len(missing) > 0 {
+		return "话题不存在：" + strings.Join(missing, "、")
+	}
+	if !h.llm.Enabled() {
+		return ""
+	}
+	raw, err := h.llm.ChatJSON(ctx, templateTopicSystemPrompt(), templateTopicUserPrompt(text, batch), 600)
+	if err != nil {
+		h.logger.Printf("template topic check llm: %v", err)
+		return ""
+	}
+	bad := parseTemplateTopicReply(raw, batch)
+	if len(bad) > 0 {
+		return "话术与这些话题不相关，不能加入：" + strings.Join(bad, "、")
+	}
+	return ""
+}
+
+func templateTopicSystemPrompt() string {
+	return `你是歌德学院德语口语教材编辑，负责审核对话话术与话题的匹配度。只判断是否相关，不修改话术。只输出 JSON。`
+}
+
+func templateTopicUserPrompt(text string, topics []string) string {
+	return fmt.Sprintf(`德语话术：%s
+
+请逐一判断该话术是否适合以下口语话题（能否自然用于该话题下的提问或回应）：
+%s
+
+输出 JSON：{"results":[{"topic":"话题名","fit":true,"reason":"中文一句话说明"}]}
+只对明显无关的话题给出 fit=false。只输出 JSON。`, text, strings.Join(topics, "、"))
+}
+
+// parseTemplateTopicReply 返回不相关的话题名；解析失败时返回空（放行）。
+func parseTemplateTopicReply(raw string, topics []string) []string {
+	start := strings.Index(raw, "{")
+	end := strings.LastIndex(raw, "}")
+	if start < 0 || end <= start {
+		return nil
+	}
+	var reply struct {
+		Results []struct {
+			Topic string `json:"topic"`
+			Fit   bool   `json:"fit"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(raw[start:end+1]), &reply); err != nil {
+		return nil
+	}
+	bad := make([]string, 0)
+	for _, item := range reply.Results {
+		if item.Fit {
+			continue
+		}
+		for _, topic := range topics {
+			if item.Topic == topic {
+				bad = append(bad, topic)
+				break
+			}
+		}
+	}
+	return bad
+}
+
+// listSpeakingTopics 返回题库中的话题名，供管理台给话术打话题标签。
+func (h *Handler) listSpeakingTopics(c *gin.Context) {
+	lang := strings.TrimSpace(c.Query("lang"))
+	if lang == "" {
+		lang = "de"
+	}
+	topics, err := h.store.ListSpeakingTopics(c.Request.Context(), lang)
+	if err != nil {
+		h.logger.Printf("list speaking topics: %v", err)
+		writeError(c, http.StatusInternalServerError, "list speaking topics failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"topics": topics})
 }
 
 func (h *Handler) listSpeakingTemplates(c *gin.Context) {
@@ -791,6 +930,10 @@ func (h *Handler) createSpeakingTemplate(c *gin.Context) {
 	item, err := req.validate()
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if msg := h.checkTemplateTopics(c.Request.Context(), item.Text, item.Topics); msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
 		return
 	}
 	if err := h.store.CreateSpeakingReplyTemplate(c.Request.Context(), &item); err != nil {
@@ -830,6 +973,10 @@ func (h *Handler) updateSpeakingTemplate(c *gin.Context) {
 			return
 		}
 		item.Active = existing.Active
+	}
+	if msg := h.checkTemplateTopics(c.Request.Context(), item.Text, item.Topics); msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
+		return
 	}
 	if err := h.store.UpdateSpeakingReplyTemplate(c.Request.Context(), &item); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
