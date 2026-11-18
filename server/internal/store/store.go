@@ -145,6 +145,117 @@ func (s *Store) ListSpeakingItems(ctx context.Context, lang, level string, activ
 	return items, err
 }
 
+// SpeakingExamPart 对应 speaking_exam_parts 一行：口语考试的固定部分配置。
+// A1/A2 的考试结构（时长、追问上限、辅助材料）由该表驱动。
+type SpeakingExamPart struct {
+	ID           int64           `gorm:"primaryKey;column:id" json:"id"`
+	Lang         string          `gorm:"column:lang" json:"lang"`
+	Level        string          `gorm:"column:level" json:"level"`
+	PartKey      string          `gorm:"column:part_key" json:"part_key"`
+	Title        string          `gorm:"column:title" json:"title"`
+	Mode         string          `gorm:"column:mode" json:"mode"`
+	DurationSec  int             `gorm:"column:duration_sec" json:"duration_sec"`
+	MaxFollowups int             `gorm:"column:max_followups" json:"max_followups"`
+	Role         string          `gorm:"column:role" json:"role"`
+	Aid          json.RawMessage `gorm:"column:aid" json:"aid"`
+	SortOrder    int             `gorm:"column:sort_order" json:"sort_order"`
+	Active       bool            `gorm:"column:active" json:"active"`
+}
+
+func (SpeakingExamPart) TableName() string { return "speaking_exam_parts" }
+
+// ListSpeakingExamParts 返回口语考试部分配置，可按语种与等级过滤；activeOnly 为 false 时含停用项。
+func (s *Store) ListSpeakingExamParts(ctx context.Context, lang, level string, activeOnly bool) ([]SpeakingExamPart, error) {
+	parts := make([]SpeakingExamPart, 0)
+	q := s.db.WithContext(ctx)
+	if activeOnly {
+		q = q.Where("active = ?", true)
+	}
+	if lang != "" {
+		q = q.Where("lang = ?", lang)
+	}
+	if level != "" {
+		q = q.Where("level = ?", level)
+	}
+	err := q.Order("level ASC, sort_order ASC, part_key ASC").Find(&parts).Error
+	return parts, err
+}
+
+// aidExpr 把辅助材料 JSON 按 jsonb 写入；空值与 null 都写成 NULL。
+func aidExpr(raw json.RawMessage) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return gorm.Expr("NULL::jsonb")
+	}
+	return gorm.Expr("?::jsonb", string(raw))
+}
+
+// CreateSpeakingExamPart 新增考试部分配置，返回新 ID。
+func (s *Store) CreateSpeakingExamPart(ctx context.Context, part SpeakingExamPart) (int64, error) {
+	err := s.db.WithContext(ctx).Model(&SpeakingExamPart{}).Create(map[string]any{
+		"lang":          part.Lang,
+		"level":         part.Level,
+		"part_key":      part.PartKey,
+		"title":         part.Title,
+		"mode":          part.Mode,
+		"duration_sec":  part.DurationSec,
+		"max_followups": part.MaxFollowups,
+		"role":          part.Role,
+		"aid":           aidExpr(part.Aid),
+		"sort_order":    part.SortOrder,
+		"active":        part.Active,
+	}).Error
+	if err != nil {
+		return 0, err
+	}
+	var created SpeakingExamPart
+	err = s.db.WithContext(ctx).
+		Where("lang = ? AND level = ? AND part_key = ?", part.Lang, part.Level, part.PartKey).
+		Take(&created).Error
+	if err != nil {
+		return 0, err
+	}
+	return created.ID, nil
+}
+
+// UpdateSpeakingExamPart 按 ID 全量更新考试部分配置。
+func (s *Store) UpdateSpeakingExamPart(ctx context.Context, part SpeakingExamPart) error {
+	res := s.db.WithContext(ctx).Model(&SpeakingExamPart{}).
+		Where("id = ?", part.ID).
+		Updates(map[string]any{
+			"lang":          part.Lang,
+			"level":         part.Level,
+			"part_key":      part.PartKey,
+			"title":         part.Title,
+			"mode":          part.Mode,
+			"duration_sec":  part.DurationSec,
+			"max_followups": part.MaxFollowups,
+			"role":          part.Role,
+			"aid":           aidExpr(part.Aid),
+			"sort_order":    part.SortOrder,
+			"active":        part.Active,
+			"updated_at":    gorm.Expr("now()"),
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteSpeakingExamPart 按 ID 删除考试部分配置。
+func (s *Store) DeleteSpeakingExamPart(ctx context.Context, id int64) error {
+	res := s.db.WithContext(ctx).Where("id = ?", id).Delete(&SpeakingExamPart{})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ErrNotFound 表示目标记录不存在，供 handler 映射为 404。
 var ErrNotFound = errors.New("record not found")
 

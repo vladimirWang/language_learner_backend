@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,6 +92,7 @@ func (h *Handler) Routes() http.Handler {
 		listening.GET("/job/:jobId/files", h.listeningFiles)
 		listening.GET("/job/:jobId/download", h.listeningDownload)
 		listening.GET("/job/:jobId/archive", h.listeningArchive)
+		listening.GET("/job/:jobId/answers", h.listeningJobAnswers)
 		listening.POST("/job/:jobId/answers", h.listeningUpdateAnswers)
 		listening.PATCH("/job/:jobId", h.updateListeningJobMeta)
 		listening.DELETE("/job/:jobId", h.deleteListeningJob)
@@ -114,6 +116,10 @@ func (h *Handler) Routes() http.Handler {
 	speaking := api.Group("/speaking")
 	{
 		speaking.GET("/items", h.listSpeakingItems)
+		speaking.GET("/exam-parts", h.listSpeakingExamParts)
+		speaking.POST("/exam-parts", h.createSpeakingExamPart)
+		speaking.PUT("/exam-parts/:id", h.updateSpeakingExamPart)
+		speaking.DELETE("/exam-parts/:id", h.deleteSpeakingExamPart)
 		speaking.GET("/items/:key", h.getSpeakingItem)
 		speaking.POST("/items", h.createSpeakingItem)
 		speaking.PUT("/items/:key", h.updateSpeakingItem)
@@ -851,8 +857,55 @@ func saveUploadedFile(src io.ReadCloser, dst string) error {
 	return nil
 }
 
+// listeningJobAnswers 返回任务 manifest 中已绑定的答案，供管理台回显。
+func (h *Handler) listeningJobAnswers(c *gin.Context) {
+	jobID := c.Param("jobId")
+	if jobID == "" {
+		writeError(c, http.StatusBadRequest, "missing jobId")
+		return
+	}
+	dir, _, err := h.listeningExamDir(c.Request.Context(), jobID)
+	switch {
+	case err == errListeningJobNotFound:
+		writeError(c, http.StatusNotFound, "job not found")
+		return
+	case err != nil:
+		h.logger.Printf("listening exam dir: %v", err)
+		writeError(c, http.StatusInternalServerError, "locate exam dir failed")
+		return
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		writeError(c, http.StatusNotFound, "manifest not found")
+		return
+	}
+	var manifest struct {
+		Questions []struct {
+			Number int `json:"number"`
+			Answer any `json:"answer"`
+		} `json:"questions"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		writeError(c, http.StatusInternalServerError, "manifest parse failed")
+		return
+	}
+	type qBrief struct {
+		Number int    `json:"number"`
+		Answer string `json:"answer"`
+	}
+	out := make([]qBrief, 0, len(manifest.Questions))
+	for _, q := range manifest.Questions {
+		if answer, ok := q.Answer.(string); ok && strings.TrimSpace(answer) != "" {
+			out = append(out, qBrief{Number: q.Number, Answer: answer})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Number < out[j].Number })
+	writeJSON(c, http.StatusOK, map[string]any{"answers": out})
+}
+
 // listeningUpdateAnswers 允许管理员在任务完成后补充答案 CSV。
 // CSV 格式：题号,答案（选择 A/B/C/D；判断 richtig/falsch）。更新 manifest.json 中对应题目的 answer 字段。
+// 重新上传视为覆盖：文件中的答案是唯一答案，未出现在文件里的旧答案会被清空。
 func (h *Handler) listeningUpdateAnswers(c *gin.Context) {
 	jobID := c.Param("jobId")
 	if jobID == "" {
@@ -914,6 +967,8 @@ func (h *Handler) listeningUpdateAnswers(c *gin.Context) {
 		if !ok {
 			continue
 		}
+		// 重新上传视为覆盖：先清空旧答案，再写入本次文件里的答案。
+		qMap["answer"] = nil
 		num, ok := qMap["number"].(float64)
 		if !ok {
 			continue
@@ -943,6 +998,7 @@ func (h *Handler) listeningUpdateAnswers(c *gin.Context) {
 	for n := range answerMap {
 		updatedList = append(updatedList, qBrief{Number: n, Answer: answerMap[n]})
 	}
+	sort.Slice(updatedList, func(i, j int) bool { return updatedList[i].Number < updatedList[j].Number })
 
 	// 上传答案后标记该素材已绑定答案
 	if err := h.store.SetListeningJobHasAnswers(c.Request.Context(), jobID); err != nil {
@@ -1109,6 +1165,213 @@ func (h *Handler) listSpeakingItems(c *gin.Context) {
 		return
 	}
 	writeJSON(c, http.StatusOK, map[string]any{"items": items})
+}
+
+// listSpeakingExamParts 返回口语考试的固定部分配置（A1/A2 官方流程的结构来源）。
+func (h *Handler) listSpeakingExamParts(c *gin.Context) {
+	lang := strings.TrimSpace(c.Query("lang"))
+	level := strings.ToUpper(strings.TrimSpace(c.Query("level")))
+	activeOnly := c.Query("active_only") != "false"
+	parts, err := h.store.ListSpeakingExamParts(c.Request.Context(), lang, level, activeOnly)
+	if err != nil {
+		h.logger.Printf("list speaking exam parts: %v", err)
+		writeError(c, http.StatusInternalServerError, "list speaking exam parts failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"parts": parts})
+}
+
+// speakingExamPartUpsert 是口语考试部分配置的创建/更新请求体。
+type speakingExamPartUpsert struct {
+	Lang         string          `json:"lang"`
+	Level        string          `json:"level"`
+	PartKey      string          `json:"part_key"`
+	Title        string          `json:"title"`
+	Mode         string          `json:"mode"`
+	DurationSec  int             `json:"duration_sec"`
+	MaxFollowups int             `json:"max_followups"`
+	Role         string          `json:"role"`
+	Aid          json.RawMessage `json:"aid"`
+	SortOrder    int             `json:"sort_order"`
+	Active       bool            `json:"active"`
+}
+
+var validExamPartModes = map[string]bool{
+	"intro": true, "qa": true, "request": true, "monologue": true,
+	"planning": true, "presentation": true, "discussion": true,
+}
+
+var validExamAidKinds = map[string]bool{
+	"chips": true, "cards": true, "mindmap": true, "schedule": true,
+}
+
+// speakingExamPartFromRequest 校验并规范化请求体。
+func speakingExamPartFromRequest(req speakingExamPartUpsert) (store.SpeakingExamPart, string) {
+	req.Lang = strings.TrimSpace(req.Lang)
+	req.Level = strings.ToUpper(strings.TrimSpace(req.Level))
+	req.PartKey = strings.TrimSpace(req.PartKey)
+	req.Title = strings.TrimSpace(req.Title)
+	req.Mode = strings.TrimSpace(req.Mode)
+	req.Role = strings.TrimSpace(req.Role)
+
+	if req.Lang == "" {
+		req.Lang = "de"
+	}
+	if !langPattern.MatchString(req.Lang) {
+		return store.SpeakingExamPart{}, "invalid lang"
+	}
+	if !validCefrLevels[req.Level] {
+		return store.SpeakingExamPart{}, "invalid level (A1/A2/B1/B2/C1/C2)"
+	}
+	if !validExamParts[req.PartKey] {
+		return store.SpeakingExamPart{}, "invalid part_key"
+	}
+	if req.Title == "" {
+		return store.SpeakingExamPart{}, "title is required"
+	}
+	if !validExamPartModes[req.Mode] {
+		return store.SpeakingExamPart{}, "invalid mode"
+	}
+	if req.DurationSec < 30 || req.DurationSec > 3600 {
+		return store.SpeakingExamPart{}, "duration_sec 需在 30–3600 秒之间"
+	}
+	if req.MaxFollowups < 0 || req.MaxFollowups > 10 {
+		return store.SpeakingExamPart{}, "max_followups 需在 0–10 之间"
+	}
+	if req.Role == "" {
+		req.Role = "examiner"
+	}
+	if req.Role != "examiner" && req.Role != "partner" {
+		return store.SpeakingExamPart{}, "role 只能是 examiner 或 partner"
+	}
+
+	var aid json.RawMessage
+	if len(req.Aid) > 0 && string(req.Aid) != "null" {
+		var probe struct {
+			Kind  string `json:"kind"`
+			Label string `json:"label"`
+		}
+		if err := json.Unmarshal(req.Aid, &probe); err != nil {
+			return store.SpeakingExamPart{}, "aid 必须是 JSON 对象"
+		}
+		if !validExamAidKinds[probe.Kind] {
+			return store.SpeakingExamPart{}, "aid.kind 只能是 chips/cards/mindmap/schedule"
+		}
+		if strings.TrimSpace(probe.Label) == "" {
+			return store.SpeakingExamPart{}, "aid.label is required"
+		}
+		aid = req.Aid
+	}
+
+	return store.SpeakingExamPart{
+		Lang:         req.Lang,
+		Level:        req.Level,
+		PartKey:      req.PartKey,
+		Title:        req.Title,
+		Mode:         req.Mode,
+		DurationSec:  req.DurationSec,
+		MaxFollowups: req.MaxFollowups,
+		Role:         req.Role,
+		Aid:          aid,
+		SortOrder:    req.SortOrder,
+		Active:       req.Active,
+	}, ""
+}
+
+// createSpeakingExamPart 新增口语考试部分配置。
+func (h *Handler) createSpeakingExamPart(c *gin.Context) {
+	var req speakingExamPartUpsert
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	part, msg := speakingExamPartFromRequest(req)
+	if msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
+		return
+	}
+	existing, err := h.store.ListSpeakingExamParts(c.Request.Context(), part.Lang, part.Level, false)
+	if err != nil {
+		h.logger.Printf("list speaking exam parts: %v", err)
+		writeError(c, http.StatusInternalServerError, "create speaking exam part failed")
+		return
+	}
+	for _, item := range existing {
+		if item.PartKey == part.PartKey {
+			writeError(c, http.StatusConflict, "该等级下已存在同一部分配置")
+			return
+		}
+	}
+	id, err := h.store.CreateSpeakingExamPart(c.Request.Context(), part)
+	if err != nil {
+		h.logger.Printf("create speaking exam part: %v", err)
+		writeError(c, http.StatusInternalServerError, "create speaking exam part failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"id": id})
+}
+
+// updateSpeakingExamPart 更新口语考试部分配置。
+func (h *Handler) updateSpeakingExamPart(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var req speakingExamPartUpsert
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	part, msg := speakingExamPartFromRequest(req)
+	if msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
+		return
+	}
+	part.ID = id
+
+	existing, err := h.store.ListSpeakingExamParts(c.Request.Context(), part.Lang, part.Level, false)
+	if err != nil {
+		h.logger.Printf("list speaking exam parts: %v", err)
+		writeError(c, http.StatusInternalServerError, "update speaking exam part failed")
+		return
+	}
+	for _, item := range existing {
+		if item.PartKey == part.PartKey && item.ID != id {
+			writeError(c, http.StatusConflict, "该等级下已存在同一部分配置")
+			return
+		}
+	}
+
+	if err := h.store.UpdateSpeakingExamPart(c.Request.Context(), part); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "speaking exam part not found")
+			return
+		}
+		h.logger.Printf("update speaking exam part: %v", err)
+		writeError(c, http.StatusInternalServerError, "update speaking exam part failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
+}
+
+// deleteSpeakingExamPart 删除口语考试部分配置。
+func (h *Handler) deleteSpeakingExamPart(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if err := h.store.DeleteSpeakingExamPart(c.Request.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "speaking exam part not found")
+			return
+		}
+		h.logger.Printf("delete speaking exam part: %v", err)
+		writeError(c, http.StatusInternalServerError, "delete speaking exam part failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // speakingItemUpsert 是口语题目的创建/更新请求体。
