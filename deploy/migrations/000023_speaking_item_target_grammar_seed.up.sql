@@ -1,0 +1,51 @@
+-- 为现有口语题目补充“可自然引出的语法点”，供方案语法要求承载校验。
+-- 只填充空值，不覆盖管理台后续的人工标注。
+UPDATE speaking_items AS s
+SET target_grammar = v.tags
+FROM (VALUES
+    ('de-a1-intro-name', '["人称代词","物主代词"]'::jsonb),
+    ('de-a1-intro-alter', '["人称代词","高频固定搭配"]'::jsonb),
+    ('de-a1-intro-herkunft', '["人称代词","只跟第三格的介词","高频固定搭配"]'::jsonb),
+    ('de-a1-intro-wohnen', '["人称代词","只跟第三格的介词","物主代词","定冠词"]'::jsonb),
+    ('de-a1-intro-sprachen', '["人称代词","高频固定搭配"]'::jsonb),
+    ('de-a1-intro-arbeit', '["人称代词","不定冠词","高频固定搭配"]'::jsonb),
+    ('de-a1-intro-freizeit', '["人称代词","真反身动词","只跟第四格的介词","高频固定搭配"]'::jsonb),
+    ('de-a1-qa-essen', '["人称代词","定冠词","高频固定搭配"]'::jsonb),
+    ('de-a1-qa-einkaufen', '["定冠词","只跟第三格的介词","高频固定搭配"]'::jsonb),
+    ('de-a1-qa-wochenende', '["人称代词","只跟第四格的介词","高频固定搭配"]'::jsonb),
+    ('de-a1-gen-1795031402508630003-4', '["定冠词","只跟第三格的介词","只跟第四格的介词","高频固定搭配"]'::jsonb),
+    ('de-a1-qa-geschwister', '["物主代词","人称代词","名词复数第三格词尾"]'::jsonb),
+    ('de-a1-request-buch', '["物主代词","高频固定搭配"]'::jsonb),
+    ('de-a1-request-kino', '["只跟第四格的介词","高频固定搭配"]'::jsonb),
+    ('de-a1-request-wort', '["定冠词","高频固定搭配"]'::jsonb),
+    ('de-a1-gen-1795031402508630003-5', '["定冠词","只跟第三格的介词","高频固定搭配"]'::jsonb),
+    ('de-a1-discussion-wochenende', '["人称代词","只跟第四格的介词","高频固定搭配"]'::jsonb),
+    ('de-a2-intro-geburtstag', '["物主代词","人称代词"]'::jsonb),
+    ('de-a2-intro-wohnort', '["定冠词","物主代词","形容词词尾变化","只跟第三格的介词"]'::jsonb),
+    ('de-a2-intro-hobby', '["物主代词","真反身动词","高频固定搭配"]'::jsonb),
+    ('de-a2-intro-beruf', '["人称代词","不定冠词","高频固定搭配"]'::jsonb),
+    ('de-a2-plan-weekend', '["人称代词","只跟第四格的介词","高频固定搭配"]'::jsonb),
+    ('de-a2-mono-geld', '["定冠词","只跟第四格的介词","高频固定搭配"]'::jsonb),
+    ('de-a2-reise', '["第二分词构成规则","过去时变位规则","只跟第三格的介词","名词复数第三格词尾"]'::jsonb),
+    ('de-a2-essen', '["定冠词","高频固定搭配"]'::jsonb),
+    ('de-a2-termin', '["人称代词","只跟第三格的介词","高频固定搭配"]'::jsonb),
+    ('de-a2-presentation-wohnung', '["物主代词","形容词词尾变化","定冠词","只跟第三格的介词","名词复数第三格词尾"]'::jsonb),
+    ('de-a2-presentation-reise', '["第二分词构成规则","过去时变位规则","形容词词尾变化"]'::jsonb),
+    ('de-a2-plan-ausflug', '["人称代词","只跟第四格的介词","高频固定搭配"]'::jsonb),
+    ('de-a2-discussion-geschenk', '["不定冠词","只跟第四格的介词","高频固定搭配"]'::jsonb),
+    ('de-a2-discussion-verkehr', '["只跟第三格的介词","形容词词尾变化","高频固定搭配"]'::jsonb),
+    ('de-b1-intro-vorstellung', '["人称代词","只跟第三格的介词","高频固定搭配"]'::jsonb),
+    ('de-b1-intro-freizeit', '["占位连词与从句语序","真反身动词","高频固定搭配"]'::jsonb),
+    ('de-b1-presentation-umwelt', '["定冠词","形容词词尾变化","占位连词与从句语序","不占位连词","高频固定搭配"]'::jsonb),
+    ('de-b1-presentation-medien', '["形容词词尾变化","占位连词与从句语序","不占位连词"]'::jsonb),
+    ('de-b1-discussion-reisen', '["第二虚拟式","不占位连词","占位连词与从句语序","只跟第二格的介词","名词复数第三格词尾"]'::jsonb),
+    ('de-b1-discussion-arbeit', '["第二虚拟式","不占位连词","占位连词与从句语序"]'::jsonb),
+    ('de-b2-intro-beruf', '["第二分词构成规则","过去时变位规则","占位连词与从句语序","高频固定搭配"]'::jsonb),
+    ('de-b2-intro-lernen', '["第二分词构成规则","过去时变位规则","占位连词与从句语序"]'::jsonb),
+    ('de-b2-presentation-digitalisierung', '["形容词词尾变化","占位连词与从句语序","不占位连词","第二虚拟式","高频固定搭配"]'::jsonb),
+    ('de-b2-presentation-mobilitaet', '["形容词词尾变化","第二分词构成规则","占位连词与从句语序"]'::jsonb),
+    ('de-b2-discussion-homeoffice', '["第二虚拟式","不占位连词","占位连词与从句语序","只跟第二格的介词","名词复数第三格词尾"]'::jsonb),
+    ('de-b2-discussion-ernaehrung', '["第二虚拟式","不占位连词","占位连词与从句语序","只跟第二格的介词","名词复数第三格词尾"]'::jsonb)
+) AS v(item_key, tags)
+WHERE s.item_key = v.item_key
+  AND s.target_grammar = '[]'::jsonb;

@@ -69,6 +69,7 @@ type GrammarPoint struct {
 	Level      string   `json:"level"`
 	SourcePath string   `json:"source_path"`
 	Patterns   []string `json:"patterns"`
+	Prompts    []string `json:"prompts"`
 }
 
 // GrammarRequirement 是方案级语法要求；整场任意回答达成即可。
@@ -242,10 +243,11 @@ func (s *Store) ListGrammarPoints(ctx context.Context, lang, level string) ([]Gr
 		SourcePath string
 		Level      string
 		Patterns   string
+		Prompts    string
 	}
 	rows := make([]row, 0, 64)
 	tx := s.db.WithContext(ctx).Table("rag_chunks").
-		Select("source_path, COALESCE(level, '') AS level, COALESCE(patterns, '') AS patterns").
+		Select("source_path, COALESCE(level, '') AS level, COALESCE(patterns, '') AS patterns, COALESCE(prompts, '') AS prompts").
 		Where("lang = ? AND chunk_type = 'grammar'", lang)
 	if level != "" {
 		tx = tx.Where("(level LIKE ? OR level IS NULL OR level = '')", "%"+level+"%")
@@ -257,6 +259,7 @@ func (s *Store) ListGrammarPoints(ctx context.Context, lang, level string) ([]Gr
 	points := make([]GrammarPoint, 0, len(rows))
 	index := make(map[string]int, len(rows))
 	seenPatterns := make(map[string]map[string]bool, len(rows))
+	seenPrompts := make(map[string]map[string]bool, len(rows))
 	for _, r := range rows {
 		key := grammarPointKey(r.SourcePath)
 		pos, ok := index[key]
@@ -264,12 +267,14 @@ func (s *Store) ListGrammarPoints(ctx context.Context, lang, level string) ([]Gr
 			pos = len(points)
 			index[key] = pos
 			seenPatterns[key] = make(map[string]bool)
+			seenPrompts[key] = make(map[string]bool)
 			points = append(points, GrammarPoint{
 				Key:        key,
 				Label:      strings.TrimSuffix(path.Base(r.SourcePath), ".md"),
 				Level:      r.Level,
 				SourcePath: r.SourcePath,
 				Patterns:   []string{},
+				Prompts:    []string{},
 			})
 		}
 		if points[pos].Level == "" && r.Level != "" {
@@ -282,8 +287,26 @@ func (s *Store) ListGrammarPoints(ctx context.Context, lang, level string) ([]Gr
 			seenPatterns[key][pattern] = true
 			points[pos].Patterns = append(points[pos].Patterns, pattern)
 		}
+		for _, prompt := range splitPrompts(r.Prompts) {
+			if seenPrompts[key][prompt] {
+				continue
+			}
+			seenPrompts[key][prompt] = true
+			points[pos].Prompts = append(points[pos].Prompts, prompt)
+		}
 	}
 	return points, nil
+}
+
+func splitPrompts(raw string) []string {
+	parts := strings.Split(raw, "|")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if prompt := strings.TrimSpace(part); prompt != "" {
+			out = append(out, prompt)
+		}
+	}
+	return out
 }
 
 // GrammarSourcePathsMissing 返回 sourcePaths 中不存在于当前语种 grammar 切片的文档路径。

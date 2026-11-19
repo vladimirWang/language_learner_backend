@@ -74,8 +74,8 @@ class Store:
                     """
                     INSERT INTO rag_chunks
                         (lang, level, chunk_type, lemma, title, content, source_path, source_hash,
-                         patterns, embedding, create_version)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         patterns, prompts, embedding, create_version)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     [
                         (
@@ -88,6 +88,7 @@ class Store:
                             c.source_path,
                             c.source_hash,
                             c.patterns,
+                            c.prompts,
                             vector,
                             version,
                         )

@@ -19,6 +19,7 @@ class SourceEntry:
     level: str | None
     tags: tuple[str, ...]
     patterns: str  # 逗号分隔的正则，供口语语法要求判定
+    prompts: str  # 竖线分隔的引导问句，供语法要求定向补答
     source_hash: str
     chunk_type: str
 
@@ -65,10 +66,13 @@ def load_index(settings: Settings) -> list[SourceEntry]:
             logger.warning("index hash mismatch for %s, using actual content hash", rel_path)
 
         patterns = fields.get("patterns", "").strip()
-        # patterns 写在索引元数据里，参与增量 hash，否则修改规则不会触发重建。
+        prompts = fields.get("prompts", "").strip()
+        # patterns/prompts 写在索引元数据里，参与增量 hash，否则修改规则不会触发重建。
         source_hash = actual_hash
-        if patterns:
-            digest = hashlib.sha256(f"{actual_hash}\n{patterns}".encode("utf-8")).hexdigest()
+        if patterns or prompts:
+            digest = hashlib.sha256(
+                f"{actual_hash}\n{patterns}\n{prompts}".encode("utf-8")
+            ).hexdigest()
             source_hash = "sha256:" + digest
 
         entries.append(
@@ -78,6 +82,7 @@ def load_index(settings: Settings) -> list[SourceEntry]:
                 level=fields.get("level") or None,
                 tags=tuple(t for t in fields.get("tags", "").split(",") if t),
                 patterns=patterns,
+                prompts=prompts,
                 source_hash=source_hash,
                 chunk_type=_chunk_type(rel_path),
             )
@@ -100,6 +105,7 @@ def load_pdfs(settings: Settings, lang: str) -> list[SourceEntry]:
                 level=None,
                 tags=("exam",),
                 patterns="",
+                prompts="",
                 source_hash=hash_file(pdf),
                 chunk_type="exam_paper",
             )
