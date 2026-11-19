@@ -86,7 +86,19 @@ func main() {
 		RateLimit: cfg.DailyWordsRateLimit,
 		Location:  loc,
 	}
-	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, dailyCfg, logger)
+	ssoCfg := handler.SSOConfig{
+		BaseURL:       cfg.SSOBaseURL,
+		PublicBaseURL: cfg.SSOPublicBaseURL,
+		ClientID:      cfg.SSOClientID,
+		ClientSecret:  cfg.SSOClientSecret,
+		RedirectURI:   cfg.SSORedirectURI,
+	}
+	if ssoCfg.Enabled() {
+		logger.Printf("admin sso: enabled (client=%s)", ssoCfg.ClientID)
+	} else {
+		logger.Printf("admin sso: not configured, /api/auth/sso/* returns 503")
+	}
+	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, dailyCfg, ssoCfg, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

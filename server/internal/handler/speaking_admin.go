@@ -326,6 +326,41 @@ func (h *Handler) validatePlanItems(c *gin.Context, lang, level string, keys []s
 	return ""
 }
 
+// validatePlanGrammarSources 启用方案时校验语法要求引用的文档存在于当前语种 grammar 切片。
+func (h *Handler) validatePlanGrammarSources(c *gin.Context, plan store.SpeakingPlan) string {
+	if !plan.Active {
+		return ""
+	}
+	requirements := make([]store.GrammarRequirement, 0)
+	if len(plan.GrammarRequirements) > 0 {
+		if err := json.Unmarshal(plan.GrammarRequirements, &requirements); err != nil {
+			return "语法要求格式不正确"
+		}
+	}
+	paths := make([]string, 0, len(requirements))
+	seen := make(map[string]bool, len(requirements))
+	for _, requirement := range requirements {
+		sourcePath := strings.TrimSpace(requirement.SourcePath)
+		if sourcePath == "" || seen[sourcePath] {
+			continue
+		}
+		seen[sourcePath] = true
+		paths = append(paths, sourcePath)
+	}
+	if len(paths) == 0 {
+		return ""
+	}
+	missing, err := h.store.GrammarSourcePathsMissing(c.Request.Context(), plan.Lang, paths)
+	if err != nil {
+		h.logger.Printf("check grammar sources plan=%d: %v", plan.ID, err)
+		return "校验语法要求失败，请稍后重试"
+	}
+	if len(missing) > 0 {
+		return fmt.Sprintf("语法要求引用的语法文档不存在：%s", strings.Join(missing, "、"))
+	}
+	return ""
+}
+
 // listSpeakingPlans 返回口语方案列表。
 func (h *Handler) listSpeakingPlans(c *gin.Context) {
 	lang := strings.TrimSpace(c.Query("lang"))
@@ -388,6 +423,10 @@ func (h *Handler) createSpeakingPlan(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, msg)
 		return
 	}
+	if msg := h.validatePlanGrammarSources(c, plan); msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
+		return
+	}
 	existing, err := h.store.ListSpeakingPlans(c.Request.Context(), plan.Lang, plan.Level, false)
 	if err != nil {
 		h.logger.Printf("list speaking plans: %v", err)
@@ -427,6 +466,10 @@ func (h *Handler) updateSpeakingPlan(c *gin.Context) {
 		return
 	}
 	if msg := h.validatePlanItems(c, plan.Lang, plan.Level, keys, plan.Active); msg != "" {
+		writeError(c, http.StatusBadRequest, msg)
+		return
+	}
+	if msg := h.validatePlanGrammarSources(c, plan); msg != "" {
 		writeError(c, http.StatusBadRequest, msg)
 		return
 	}

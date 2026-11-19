@@ -40,6 +40,13 @@ type Config struct {
 	DailyWordsAPIKey    string
 	DailyWordsRateLimit int
 	AppTZ               string
+
+	// 管理台 SSO 登录：BaseURL 供服务端换 token / 校验会话，PublicBaseURL 供浏览器跳转授权页。
+	SSOBaseURL       string
+	SSOPublicBaseURL string
+	SSOClientID      string
+	SSOClientSecret  string
+	SSORedirectURI   string
 }
 
 // Load 读取环境变量并做缺省处理；不因缺少可选项而失败。
@@ -60,7 +67,13 @@ func Load() Config {
 		DailyWordsAPIKey:    os.Getenv("DAILY_WORDS_API_KEY"),
 		DailyWordsRateLimit: envInt("DAILY_WORDS_RATE_LIMIT", 60),
 		AppTZ:               envOr("APP_TZ", "Asia/Shanghai"),
+
+		SSOBaseURL:      os.Getenv("SSO_BASE_URL"),
+		SSOClientID:     os.Getenv("SSO_CLIENT_ID"),
+		SSOClientSecret: os.Getenv("SSO_CLIENT_SECRET"),
+		SSORedirectURI:  os.Getenv("SSO_REDIRECT_URI"),
 	}
+	cfg.SSOPublicBaseURL = envOr("SSO_PUBLIC_BASE_URL", cfg.SSOBaseURL)
 	cfg.S3AccessKey = os.Getenv("S3_ACCESS_KEY")
 	cfg.S3SecretKey = os.Getenv("S3_SECRET_KEY")
 	cfg.PGDSN = buildDSN()

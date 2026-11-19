@@ -49,11 +49,16 @@ type Handler struct {
 	daily    DailyWordsConfig
 	rateMu   sync.Mutex
 	rateHits map[string]rateWindow
+
+	// 管理台 SSO：userinfo 校验缓存，避免每个请求都打 SSO。
+	sso      SSOConfig
+	ssoMu    sync.Mutex
+	ssoCache map[string]ssoCacheEntry
 }
 
 // New 创建 HTTP 处理器。
-func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, daily DailyWordsConfig, logger *log.Logger) *Handler {
-	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, logger: logger}
+func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, daily DailyWordsConfig, sso SSOConfig, logger *log.Logger) *Handler {
+	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, sso: sso, logger: logger}
 }
 
 // Routes 注册全部 API 路由。gin.Engine 实现了 http.Handler，签名保持不变。
@@ -85,6 +90,14 @@ func (h *Handler) Routes() http.Handler {
 		// 每日新词：供客户端与豆包插件调用，统一走 X-API-Key。
 		api.GET("/daily-words", h.dailyWords)
 		api.POST("/daily-words/learned", h.markWordsLearned)
+
+		// 管理台 SSO 登录：配置、授权码换 token、会话校验
+		auth := api.Group("/auth")
+		{
+			auth.GET("/sso/config", h.ssoConfigHandler)
+			auth.POST("/sso/exchange", h.ssoExchange)
+			auth.GET("/sso/me", h.ssoMe)
+		}
 
 		// PDF 试卷导入：分片上传支持断点续传，合并后再投递解析队列
 		api.POST("/pdf/upload/init", h.pdfUploadInit)

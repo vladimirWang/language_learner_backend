@@ -285,6 +285,32 @@ func (s *Store) ListGrammarPoints(ctx context.Context, lang, level string) ([]Gr
 	return points, nil
 }
 
+// GrammarSourcePathsMissing 返回 sourcePaths 中不存在于当前语种 grammar 切片的文档路径。
+func (s *Store) GrammarSourcePathsMissing(ctx context.Context, lang string, sourcePaths []string) ([]string, error) {
+	if len(sourcePaths) == 0 {
+		return nil, nil
+	}
+	found := make([]string, 0, len(sourcePaths))
+	if err := s.db.WithContext(ctx).Raw(
+		`SELECT DISTINCT source_path FROM rag_chunks
+		 WHERE lang = ? AND chunk_type = 'grammar' AND source_path IN ?`,
+		lang, sourcePaths,
+	).Scan(&found).Error; err != nil {
+		return nil, err
+	}
+	exists := make(map[string]bool, len(found))
+	for _, item := range found {
+		exists[item] = true
+	}
+	missing := make([]string, 0, len(sourcePaths))
+	for _, item := range sourcePaths {
+		if !exists[item] {
+			missing = append(missing, item)
+		}
+	}
+	return missing, nil
+}
+
 // GetGrammarRequirements 读取方案级语法要求；方案不存在时返回 ErrNotFound。
 func (s *Store) GetGrammarRequirements(ctx context.Context, planID int64) ([]GrammarRequirement, error) {
 	var row struct {
