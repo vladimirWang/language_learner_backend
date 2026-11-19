@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -404,7 +405,53 @@ func (h *Handler) getSpeakingPlan(c *gin.Context) {
 			recent = words
 		}
 	}
+	h.attachRequirementPrompts(c.Request.Context(), plan)
 	writeJSON(c, http.StatusOK, map[string]any{"plan": plan, "items": items, "recent_words": recent})
+}
+
+// attachRequirementPrompts 为方案详情附加语法点引导问句，仅在响应中生效。
+func (h *Handler) attachRequirementPrompts(ctx context.Context, plan *store.SpeakingPlan) {
+	if len(plan.GrammarRequirements) == 0 {
+		return
+	}
+	requirements := make([]store.GrammarRequirement, 0)
+	if err := json.Unmarshal(plan.GrammarRequirements, &requirements); err != nil || len(requirements) == 0 {
+		return
+	}
+	points, err := h.store.ListGrammarPoints(ctx, plan.Lang, "")
+	if err != nil {
+		h.logger.Printf("load grammar prompts plan=%d: %v", plan.ID, err)
+		return
+	}
+	prompts := make(map[string][]string, len(points)*2)
+	for _, point := range points {
+		prompts[point.Key] = point.Prompts
+		if point.SourcePath != "" {
+			prompts[point.SourcePath] = point.Prompts
+		}
+	}
+	changed := false
+	for i := range requirements {
+		if len(requirements[i].Prompts) > 0 {
+			continue
+		}
+		list, ok := prompts[requirements[i].Key]
+		if !ok && requirements[i].SourcePath != "" {
+			list, ok = prompts[requirements[i].SourcePath]
+		}
+		if ok && len(list) > 0 {
+			requirements[i].Prompts = list
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	raw, err := json.Marshal(requirements)
+	if err != nil {
+		return
+	}
+	plan.GrammarRequirements = store.JSONRaw(raw)
 }
 
 // createSpeakingPlan 新建口语方案。

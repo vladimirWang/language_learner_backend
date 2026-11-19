@@ -81,6 +81,8 @@ type GrammarRequirement struct {
 	MinUses    int      `json:"min_uses"`
 	Enforce    string   `json:"enforce"`
 	HintParts  []string `json:"hint_parts"`
+	// Prompts 仅在方案详情响应中附加，用于未达成时的定向引导，不写回数据库。
+	Prompts []string `json:"prompts,omitempty"`
 }
 
 const (

@@ -313,6 +313,8 @@ func normalizeGrammarRequirements(raw json.RawMessage) (json.RawMessage, string)
 		item.Label = strings.TrimSpace(item.Label)
 		item.SourcePath = strings.TrimSpace(item.SourcePath)
 		item.Enforce = strings.TrimSpace(item.Enforce)
+		// 引导问句由语法点清单实时提供，不固化进方案。
+		item.Prompts = nil
 		if item.Key == "" {
 			return nil, fmt.Sprintf("grammar_requirements[%d].key is required", i)
 		}
