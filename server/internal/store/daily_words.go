@@ -111,7 +111,7 @@ func (s *Store) DailyWords(ctx context.Context, lang, level string, count int, d
 		}
 	}
 
-	ids, err = s.pickDailyWordIDs(ctx, lang, level, dayStr, count)
+	ids, err = s.pickDailyWordIDs(ctx, lang, level, dayStr, deviceID, count)
 	if err != nil {
 		return nil, err
 	}
@@ -143,15 +143,16 @@ func (s *Store) loadDailyAssignment(ctx context.Context, lang, level, dayStr, de
 	return parseInt64Array(row.WordIDs), nil
 }
 
-func (s *Store) pickDailyWordIDs(ctx context.Context, lang, level, dayStr string, count int) ([]int64, error) {
+func (s *Store) pickDailyWordIDs(ctx context.Context, lang, level, dayStr, deviceID string, count int) ([]int64, error) {
 	sql := "SELECT id FROM vocab_words WHERE lang = ?"
 	args := []any{lang}
 	if level != "" {
 		sql += " AND level = ?"
 		args = append(args, level)
 	}
-	sql += " ORDER BY md5(lemma || ?) ASC, id ASC LIMIT ?"
-	args = append(args, dayStr, count)
+	// 把 device_id 计入哈希：不同设备同一天拿到不同词表，公共分配（空串）仍稳定可复现。
+	sql += " ORDER BY md5(lemma || ? || ?) ASC, id ASC LIMIT ?"
+	args = append(args, dayStr, deviceID, count)
 
 	ids := make([]int64, 0, count)
 	err := s.db.WithContext(ctx).Raw(sql, args...).Scan(&ids).Error

@@ -109,12 +109,10 @@ func (h *Handler) dailyWords(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid level")
 		return
 	}
-	count, err := strconv.Atoi(strings.TrimSpace(c.Query("count")))
-	if err != nil || count <= 0 {
-		count = 5
-	}
-	if count > 20 {
-		count = 20
+	count, countErr := parseDailyWordsCount(c.Query("count"))
+	if countErr != "" {
+		writeError(c, http.StatusBadRequest, countErr)
+		return
 	}
 	deviceID := strings.TrimSpace(c.Query("device_id"))
 
@@ -268,6 +266,21 @@ func (h *Handler) checkGrammarRequirements(c *gin.Context) {
 	})
 }
 
+// parseDailyWordsCount 解析 count 参数：缺省 5，越界或非数字返回错误信息。
+func parseDailyWordsCount(raw string) (int, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 5, ""
+	}
+	count, err := strconv.Atoi(raw)
+	if err != nil || count < 1 || count > maxDailyWordsCount {
+		return 0, "count must be an integer between 1 and 20"
+	}
+	return count, ""
+}
+
+const maxDailyWordsCount = 20
+
 func dedupeInt64(values []int64) []int64 {
 	out := make([]int64, 0, len(values))
 	seen := make(map[int64]bool, len(values))
@@ -316,6 +329,12 @@ func normalizeGrammarRequirements(raw json.RawMessage) (json.RawMessage, string)
 		if len([]rune(item.Label)) > 80 {
 			return nil, fmt.Sprintf("grammar_requirements[%d].label is too long (max 80)", i)
 		}
+		if item.Enforce == "" {
+			item.Enforce = "block"
+		}
+		if item.Enforce != "block" && item.Enforce != "warn" {
+			return nil, fmt.Sprintf("grammar_requirements[%d].enforce must be block or warn", i)
+		}
 		patterns := make([]string, 0, len(item.Patterns))
 		for _, pattern := range item.Patterns {
 			pattern = strings.TrimSpace(pattern)
@@ -330,8 +349,9 @@ func normalizeGrammarRequirements(raw json.RawMessage) (json.RawMessage, string)
 			}
 			patterns = append(patterns, pattern)
 		}
-		if len(patterns) == 0 {
-			return nil, fmt.Sprintf("grammar_requirements[%d].patterns is required", i)
+		// 无判定规则的语法点只能作为提示，不能阻断。
+		if len(patterns) == 0 && item.Enforce == "block" {
+			return nil, fmt.Sprintf("grammar_requirements[%d].patterns is required when enforce is block", i)
 		}
 		item.Patterns = patterns
 		if item.MinUses == 0 {
@@ -339,12 +359,6 @@ func normalizeGrammarRequirements(raw json.RawMessage) (json.RawMessage, string)
 		}
 		if item.MinUses < 1 || item.MinUses > 10 {
 			return nil, fmt.Sprintf("grammar_requirements[%d].min_uses must be 1-10", i)
-		}
-		if item.Enforce == "" {
-			item.Enforce = "block"
-		}
-		if item.Enforce != "block" && item.Enforce != "warn" {
-			return nil, fmt.Sprintf("grammar_requirements[%d].enforce must be block or warn", i)
 		}
 		hints := make([]string, 0, len(item.HintParts))
 		seenHints := make(map[string]bool, len(item.HintParts))
