@@ -50,6 +50,12 @@ type Config struct {
 	// 仅本地开发：跳过真实 SSO，固定返回开发账号。
 	SSODevMock      bool
 	SSODevMockEmail string
+
+	// 微信小程序登录：AppID/AppSecret 用于 code2session，TokenSecret 用于签发登录态。
+	WXAppID       string
+	WXAppSecret   string
+	WXTokenSecret string
+	WXBaseURL     string
 }
 
 // Load 读取环境变量并做缺省处理；不因缺少可选项而失败。
@@ -77,6 +83,11 @@ func Load() Config {
 		SSORedirectURI:  os.Getenv("SSO_REDIRECT_URI"),
 		SSODevMock:      envBool("SSO_DEV_MOCK", false),
 		SSODevMockEmail: envOr("SSO_DEV_MOCK_EMAIL", "413114463@qq.com"),
+
+		WXAppID:       os.Getenv("WX_APPID"),
+		WXAppSecret:   os.Getenv("WX_APPSECRET"),
+		WXTokenSecret: os.Getenv("WX_TOKEN_SECRET"),
+		WXBaseURL:     os.Getenv("WX_BASE_URL"),
 	}
 	cfg.SSOPublicBaseURL = envOr("SSO_PUBLIC_BASE_URL", cfg.SSOBaseURL)
 	cfg.S3AccessKey = os.Getenv("S3_ACCESS_KEY")

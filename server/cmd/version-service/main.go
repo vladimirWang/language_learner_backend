@@ -21,6 +21,7 @@ import (
 	"github.com/wangfernando/language-learner/server/internal/storage"
 	"github.com/wangfernando/language-learner/server/internal/store"
 	"github.com/wangfernando/language-learner/server/internal/tts"
+	"github.com/wangfernando/language-learner/server/internal/wxauth"
 )
 
 func main() {
@@ -102,7 +103,18 @@ func main() {
 	} else {
 		logger.Printf("admin sso: not configured, /api/auth/sso/* returns 503")
 	}
-	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, dailyCfg, ssoCfg, logger)
+	wxCfg := wxauth.Config{
+		AppID:       cfg.WXAppID,
+		AppSecret:   cfg.WXAppSecret,
+		TokenSecret: cfg.WXTokenSecret,
+		BaseURL:     cfg.WXBaseURL,
+	}
+	if wxCfg.Enabled() {
+		logger.Printf("wechat miniapp login: enabled (appid=%s)", wxCfg.AppID)
+	} else {
+		logger.Printf("wechat miniapp login: not configured, /api/auth/wx-* returns 503")
+	}
+	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, dailyCfg, ssoCfg, wxCfg, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
