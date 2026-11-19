@@ -427,6 +427,12 @@ func (h *Handler) createSpeakingPlan(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, msg)
 		return
 	}
+	warnings, err := h.downgradeUnsupportedGrammarRequirements(c.Request.Context(), &plan, keys)
+	if err != nil {
+		h.logger.Printf("downgrade grammar requirements: %v", err)
+		writeError(c, http.StatusInternalServerError, "校验语法要求使用场景失败，请稍后重试")
+		return
+	}
 	existing, err := h.store.ListSpeakingPlans(c.Request.Context(), plan.Lang, plan.Level, false)
 	if err != nil {
 		h.logger.Printf("list speaking plans: %v", err)
@@ -445,7 +451,7 @@ func (h *Handler) createSpeakingPlan(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "create speaking plan failed")
 		return
 	}
-	writeJSON(c, http.StatusOK, map[string]any{"id": id})
+	writeJSON(c, http.StatusOK, map[string]any{"id": id, "warnings": warnings})
 }
 
 // updateSpeakingPlan 更新口语方案。
@@ -473,6 +479,12 @@ func (h *Handler) updateSpeakingPlan(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, msg)
 		return
 	}
+	warnings, err := h.downgradeUnsupportedGrammarRequirements(c.Request.Context(), &plan, keys)
+	if err != nil {
+		h.logger.Printf("downgrade grammar requirements: %v", err)
+		writeError(c, http.StatusInternalServerError, "校验语法要求使用场景失败，请稍后重试")
+		return
+	}
 	existing, err := h.store.ListSpeakingPlans(c.Request.Context(), plan.Lang, plan.Level, false)
 	if err != nil {
 		h.logger.Printf("list speaking plans: %v", err)
@@ -494,7 +506,7 @@ func (h *Handler) updateSpeakingPlan(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "update speaking plan failed")
 		return
 	}
-	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true, "warnings": warnings})
 }
 
 // deleteSpeakingPlan 删除口语方案。
@@ -518,19 +530,20 @@ func (h *Handler) deleteSpeakingPlan(c *gin.Context) {
 
 // speakingItemUpsert 是口语题目的创建/更新请求体。
 type speakingItemUpsert struct {
-	ItemKey        string `json:"item_key"`
-	Lang           string `json:"lang"`
-	Level          string `json:"level"`
-	ExamPart       string `json:"exam_part"`
-	Topic          string `json:"topic"`
-	Role           string `json:"role"`
-	PromptDE       string `json:"prompt_de"`
-	PromptZH       string `json:"prompt_zh"`
-	ExpectedPoints string `json:"expected_points"`
-	RefAnswer      string `json:"ref_answer"`
-	ErrorNote      string `json:"error_note"`
-	SortOrder      int    `json:"sort_order"`
-	Active         bool   `json:"active"`
+	ItemKey        string   `json:"item_key"`
+	Lang           string   `json:"lang"`
+	Level          string   `json:"level"`
+	ExamPart       string   `json:"exam_part"`
+	Topic          string   `json:"topic"`
+	Role           string   `json:"role"`
+	PromptDE       string   `json:"prompt_de"`
+	PromptZH       string   `json:"prompt_zh"`
+	ExpectedPoints string   `json:"expected_points"`
+	TargetGrammar  []string `json:"target_grammar"`
+	RefAnswer      string   `json:"ref_answer"`
+	ErrorNote      string   `json:"error_note"`
+	SortOrder      int      `json:"sort_order"`
+	Active         bool     `json:"active"`
 }
 
 var validExamParts = map[string]bool{
@@ -581,6 +594,27 @@ func speakingItemFromRequest(req speakingItemUpsert) (store.SpeakingItem, string
 		}
 	}
 
+	targetGrammar := make([]string, 0, len(req.TargetGrammar))
+	seenGrammar := make(map[string]bool, len(req.TargetGrammar))
+	for _, raw := range req.TargetGrammar {
+		key := strings.TrimSpace(raw)
+		if key == "" || seenGrammar[key] {
+			continue
+		}
+		if len([]rune(key)) > 64 {
+			return store.SpeakingItem{}, "target_grammar 单项长度不能超过 64"
+		}
+		seenGrammar[key] = true
+		targetGrammar = append(targetGrammar, key)
+	}
+	if len(targetGrammar) > 8 {
+		return store.SpeakingItem{}, "target_grammar 最多 8 项"
+	}
+	targetJSON, err := json.Marshal(targetGrammar)
+	if err != nil {
+		return store.SpeakingItem{}, "target_grammar 格式不正确"
+	}
+
 	return store.SpeakingItem{
 		ItemKey:        req.ItemKey,
 		Lang:           req.Lang,
@@ -591,6 +625,7 @@ func speakingItemFromRequest(req speakingItemUpsert) (store.SpeakingItem, string
 		PromptDE:       req.PromptDE,
 		PromptZH:       req.PromptZH,
 		ExpectedPoints: req.ExpectedPoints,
+		TargetGrammar:  targetJSON,
 		RefAnswer:      req.RefAnswer,
 		ErrorNote:      req.ErrorNote,
 		SortOrder:      req.SortOrder,

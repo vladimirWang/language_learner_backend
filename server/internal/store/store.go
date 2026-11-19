@@ -109,21 +109,23 @@ func (LevelExam) TableName() string { return "level_exams" }
 
 // SpeakingItem 对应 speaking_items 一行：口语固定问答题库。
 type SpeakingItem struct {
-	ItemKey        string    `gorm:"primaryKey;column:item_key" json:"item_key"`
-	Lang           string    `gorm:"column:lang" json:"lang"`
-	Level          string    `gorm:"column:level" json:"level"`
-	ExamPart       string    `gorm:"column:exam_part" json:"exam_part"`
-	Topic          string    `gorm:"column:topic" json:"topic"`
-	Role           string    `gorm:"column:role" json:"role"`
-	PromptDE       string    `gorm:"column:prompt_de" json:"prompt_de"`
-	PromptZH       string    `gorm:"column:prompt_zh" json:"prompt_zh"`
-	ExpectedPoints string    `gorm:"column:expected_points" json:"expected_points"`
-	RefAnswer      string    `gorm:"column:ref_answer" json:"ref_answer"`
-	ErrorNote      string    `gorm:"column:error_note" json:"error_note"`
-	SortOrder      int       `gorm:"column:sort_order" json:"sort_order"`
-	Active         bool      `gorm:"column:active" json:"active"`
-	CreatedAt      time.Time `gorm:"column:created_at" json:"created_at"`
-	UpdatedAt      time.Time `gorm:"column:updated_at" json:"updated_at"`
+	ItemKey        string `gorm:"primaryKey;column:item_key" json:"item_key"`
+	Lang           string `gorm:"column:lang" json:"lang"`
+	Level          string `gorm:"column:level" json:"level"`
+	ExamPart       string `gorm:"column:exam_part" json:"exam_part"`
+	Topic          string `gorm:"column:topic" json:"topic"`
+	Role           string `gorm:"column:role" json:"role"`
+	PromptDE       string `gorm:"column:prompt_de" json:"prompt_de"`
+	PromptZH       string `gorm:"column:prompt_zh" json:"prompt_zh"`
+	ExpectedPoints string `gorm:"column:expected_points" json:"expected_points"`
+	// TargetGrammar 是该题能自然引出的语法点 key 列表（JSON 数组）。
+	TargetGrammar json.RawMessage `gorm:"column:target_grammar" json:"target_grammar"`
+	RefAnswer     string          `gorm:"column:ref_answer" json:"ref_answer"`
+	ErrorNote     string          `gorm:"column:error_note" json:"error_note"`
+	SortOrder     int             `gorm:"column:sort_order" json:"sort_order"`
+	Active        bool            `gorm:"column:active" json:"active"`
+	CreatedAt     time.Time       `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt     time.Time       `gorm:"column:updated_at" json:"updated_at"`
 }
 
 func (SpeakingItem) TableName() string { return "speaking_items" }
@@ -587,6 +589,7 @@ func (s *Store) UpdateSpeakingItem(ctx context.Context, item SpeakingItem) error
 			"prompt_de":       item.PromptDE,
 			"prompt_zh":       item.PromptZH,
 			"expected_points": item.ExpectedPoints,
+			"target_grammar":  item.TargetGrammar,
 			"ref_answer":      item.RefAnswer,
 			"error_note":      item.ErrorNote,
 			"sort_order":      item.SortOrder,
