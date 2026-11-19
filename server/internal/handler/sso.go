@@ -22,11 +22,25 @@ type SSOConfig struct {
 	ClientID      string
 	ClientSecret  string
 	RedirectURI   string
+	// DevMock 为 true 时跳过真实 SSO，固定返回 DevMockEmail（仅限本地开发）。
+	DevMock      bool
+	DevMockEmail string
 }
+
+// ssoMockToken 是开发挡板专用的固定 token。
+const ssoMockToken = "dev-sso-mock-token"
 
 // Enabled 判断 SSO 是否可用。
 func (c SSOConfig) Enabled() bool {
+	if c.DevMock {
+		return strings.TrimSpace(c.DevMockEmail) != ""
+	}
 	return c.BaseURL != "" && c.ClientID != "" && c.ClientSecret != "" && c.RedirectURI != ""
+}
+
+// mockUser 返回开发挡板固定账号。
+func (c SSOConfig) mockUser() ssoUser {
+	return ssoUser{UserID: 1, Email: c.DevMockEmail, Username: "开发账号"}
 }
 
 // ssoUser 是管理台登录用户的最小信息。
@@ -45,9 +59,21 @@ const ssoCacheTTL = time.Minute
 
 // ssoConfigHandler 返回前端构建授权地址所需的公开配置。
 func (h *Handler) ssoConfigHandler(c *gin.Context) {
+	if h.sso.DevMock {
+		writeJSON(c, http.StatusOK, map[string]any{
+			"enabled":       h.sso.Enabled(),
+			"mock":          true,
+			"mock_email":    h.sso.DevMockEmail,
+			"authorize_url": "",
+			"client_id":     "dev-mock",
+			"redirect_uri":  "",
+		})
+		return
+	}
 	base := strings.TrimRight(h.sso.PublicBaseURL, "/")
 	writeJSON(c, http.StatusOK, map[string]any{
 		"enabled":       h.sso.Enabled(),
+		"mock":          false,
 		"authorize_url": base + "/oauth/authorize",
 		"client_id":     h.sso.ClientID,
 		"redirect_uri":  h.sso.RedirectURI,
@@ -62,6 +88,15 @@ func (h *Handler) ssoExchange(c *gin.Context) {
 	}
 	if err := json.NewDecoder(io.LimitReader(c.Request.Body, 1<<20)).Decode(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if h.sso.DevMock {
+		writeJSON(c, http.StatusOK, map[string]any{
+			"access_token": ssoMockToken,
+			"token_type":   "Bearer",
+			"expires_in":   86400,
+			"user":         h.sso.mockUser(),
+		})
 		return
 	}
 	if !h.sso.Enabled() {
@@ -153,6 +188,14 @@ func (h *Handler) ssoMe(c *gin.Context) {
 	token := bearerToken(c)
 	if token == "" {
 		writeError(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if h.sso.DevMock {
+		if token != ssoMockToken {
+			writeError(c, http.StatusUnauthorized, "sso session invalid")
+			return
+		}
+		writeJSON(c, http.StatusOK, map[string]any{"user": h.sso.mockUser()})
 		return
 	}
 	if !h.sso.Enabled() {

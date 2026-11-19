@@ -47,6 +47,9 @@ type Config struct {
 	SSOClientID      string
 	SSOClientSecret  string
 	SSORedirectURI   string
+	// 仅本地开发：跳过真实 SSO，固定返回开发账号。
+	SSODevMock      bool
+	SSODevMockEmail string
 }
 
 // Load 读取环境变量并做缺省处理；不因缺少可选项而失败。
@@ -72,6 +75,8 @@ func Load() Config {
 		SSOClientID:     os.Getenv("SSO_CLIENT_ID"),
 		SSOClientSecret: os.Getenv("SSO_CLIENT_SECRET"),
 		SSORedirectURI:  os.Getenv("SSO_REDIRECT_URI"),
+		SSODevMock:      envBool("SSO_DEV_MOCK", false),
+		SSODevMockEmail: envOr("SSO_DEV_MOCK_EMAIL", "413114463@qq.com"),
 	}
 	cfg.SSOPublicBaseURL = envOr("SSO_PUBLIC_BASE_URL", cfg.SSOBaseURL)
 	cfg.S3AccessKey = os.Getenv("S3_ACCESS_KEY")
@@ -118,6 +123,21 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envBool(key string, fallback bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if v == "" {
+		return fallback
+	}
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func envInt(key string, fallback int) int {

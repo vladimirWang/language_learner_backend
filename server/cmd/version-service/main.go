@@ -92,8 +92,12 @@ func main() {
 		ClientID:      cfg.SSOClientID,
 		ClientSecret:  cfg.SSOClientSecret,
 		RedirectURI:   cfg.SSORedirectURI,
+		DevMock:       cfg.SSODevMock,
+		DevMockEmail:  cfg.SSODevMockEmail,
 	}
-	if ssoCfg.Enabled() {
+	if ssoCfg.DevMock {
+		logger.Printf("admin sso: DEV MOCK enabled (user=%s)", ssoCfg.DevMockEmail)
+	} else if ssoCfg.Enabled() {
 		logger.Printf("admin sso: enabled (client=%s)", ssoCfg.ClientID)
 	} else {
 		logger.Printf("admin sso: not configured, /api/auth/sso/* returns 503")
