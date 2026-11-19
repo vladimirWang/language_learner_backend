@@ -236,13 +236,14 @@ func (h *Handler) deleteSpeakingExamPart(c *gin.Context) {
 
 // speakingPlanUpsert 是口语方案的创建/更新请求体。
 type speakingPlanUpsert struct {
-	Lang        string   `json:"lang"`
-	Level       string   `json:"level"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Active      *bool    `json:"active"`
-	SortOrder   int      `json:"sort_order"`
-	ItemKeys    []string `json:"item_keys"`
+	Lang                string          `json:"lang"`
+	Level               string          `json:"level"`
+	Name                string          `json:"name"`
+	Description         string          `json:"description"`
+	Active              *bool           `json:"active"`
+	SortOrder           int             `json:"sort_order"`
+	ItemKeys            []string        `json:"item_keys"`
+	GrammarRequirements json.RawMessage `json:"grammar_requirements"`
 }
 
 // speakingPlanMetadataFromRequest 校验并规范化方案基础信息。
@@ -266,17 +267,23 @@ func speakingPlanMetadataFromRequest(req speakingPlanUpsert) (store.SpeakingPlan
 		return store.SpeakingPlan{}, "name is too long (max 100)"
 	}
 
+	requirements, msg := normalizeGrammarRequirements(req.GrammarRequirements)
+	if msg != "" {
+		return store.SpeakingPlan{}, msg
+	}
+
 	active := true
 	if req.Active != nil {
 		active = *req.Active
 	}
 	return store.SpeakingPlan{
-		Lang:        req.Lang,
-		Level:       req.Level,
-		Name:        req.Name,
-		Description: strings.TrimSpace(req.Description),
-		Active:      active,
-		SortOrder:   req.SortOrder,
+		Lang:                req.Lang,
+		Level:               req.Level,
+		Name:                req.Name,
+		Description:         strings.TrimSpace(req.Description),
+		Active:              active,
+		SortOrder:           req.SortOrder,
+		GrammarRequirements: store.JSONRaw(requirements),
 	}, ""
 }
 
@@ -350,7 +357,19 @@ func (h *Handler) getSpeakingPlan(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "get speaking plan failed")
 		return
 	}
-	writeJSON(c, http.StatusOK, map[string]any{"plan": plan, "items": items})
+	// 最近五天新词：仅提示与报告统计，不改变方案题目顺序；无 device_id 时为空数组。
+	recent := make([]store.RecentWord, 0)
+	if deviceID := strings.TrimSpace(c.Query("device_id")); deviceID != "" {
+		now := h.now()
+		startOfToday := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		words, err := h.store.RecentWords(c.Request.Context(), deviceID, plan.Lang, startOfToday.AddDate(0, 0, -4))
+		if err != nil {
+			h.logger.Printf("recent words device=%s plan=%d: %v", deviceID, id, err)
+		} else {
+			recent = words
+		}
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"plan": plan, "items": items, "recent_words": recent})
 }
 
 // createSpeakingPlan 新建口语方案。

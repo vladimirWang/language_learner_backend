@@ -73,8 +73,9 @@ class Store:
                 cur.executemany(
                     """
                     INSERT INTO rag_chunks
-                        (lang, level, chunk_type, lemma, title, content, source_path, source_hash, embedding, create_version)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        (lang, level, chunk_type, lemma, title, content, source_path, source_hash,
+                         patterns, embedding, create_version)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     [
                         (
@@ -86,6 +87,7 @@ class Store:
                             c.content,
                             c.source_path,
                             c.source_hash,
+                            c.patterns,
                             vector,
                             version,
                         )
@@ -96,6 +98,51 @@ class Store:
         except Exception:
             self._conn.rollback()
             raise
+
+    def upsert_vocab_words(self, lang: str, rows: list[dict]) -> int:
+        """按 (lang, lemma) upsert 词表，保持 word_id 稳定；返回写入行数。"""
+        if not rows:
+            return 0
+        payload = [
+            (
+                lang,
+                row.get("lemma", ""),
+                row.get("level", ""),
+                _none(row.get("word_type")),
+                _none(row.get("gender")),
+                _none(row.get("plural")),
+                row.get("chinese_mean", ""),
+                _none(row.get("english_mean")),
+                _none(row.get("example_de")),
+                _none(row.get("source_md_path")),
+            )
+            for row in rows
+        ]
+        sql = """
+            INSERT INTO vocab_words
+                (lang, lemma, level, word_type, gender, plural, chinese_mean, english_mean,
+                 example_de, source_md_path)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (lang, lemma) DO UPDATE SET
+                level = EXCLUDED.level,
+                word_type = EXCLUDED.word_type,
+                gender = EXCLUDED.gender,
+                plural = EXCLUDED.plural,
+                chinese_mean = EXCLUDED.chinese_mean,
+                english_mean = EXCLUDED.english_mean,
+                example_de = EXCLUDED.example_de,
+                source_md_path = EXCLUDED.source_md_path,
+                updated_at = now()
+        """
+        try:
+            with self._conn.cursor() as cur:
+                for start in range(0, len(payload), 500):
+                    cur.executemany(sql, payload[start : start + 500])
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return len(payload)
 
     def iter_chunks(self, lang: str) -> Iterator[StoredChunk]:
         with self._conn.cursor(name="snapshot_cursor") as cur:
@@ -162,3 +209,11 @@ def _vector_values(value) -> list[float]:
     if hasattr(value, "to_list"):
         value = value.to_list()
     return [float(v) for v in value]
+
+
+def _none(value: str | None) -> str | None:
+    """CSV 与词条 md 里的空串统一写成 NULL。"""
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None

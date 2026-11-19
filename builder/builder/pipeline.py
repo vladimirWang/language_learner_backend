@@ -79,6 +79,7 @@ def _run_lang(
 
     truth = ground_truth.build(settings, lang, version)
     store.log(version, "parse", f"ground_truth vocab={truth.vocab_count} forms={truth.form_count}")
+    store.log(version, "vocab", f"upserted={store.upsert_vocab_words(lang, truth.vocab_rows)}")
 
     snap = snapshot.export(store, lang, version, settings.work_dir / version / lang)
     store.log(version, "snapshot", f"chunks={snap.chunk_count}")

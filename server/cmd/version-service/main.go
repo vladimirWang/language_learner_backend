@@ -73,7 +73,20 @@ func main() {
 	pdfWorker := pdfworker.New(st, rn, cfg.RabbitMQURL, cfg.PDFQueue, cfg.WorkDir, logger)
 	pdfWorker.Start(ctx)
 
-	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, logger)
+	loc, err := time.LoadLocation(cfg.AppTZ)
+	if err != nil {
+		logger.Printf("invalid APP_TZ %q, fallback to local: %v", cfg.AppTZ, err)
+		loc = time.Local
+	}
+	if cfg.DailyWordsAPIKey == "" {
+		logger.Printf("daily words: DAILY_WORDS_API_KEY not configured, endpoints return 503")
+	}
+	dailyCfg := handler.DailyWordsConfig{
+		APIKey:    cfg.DailyWordsAPIKey,
+		RateLimit: cfg.DailyWordsRateLimit,
+		Location:  loc,
+	}
+	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, dailyCfg, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

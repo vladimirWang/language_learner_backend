@@ -44,11 +44,16 @@ type Handler struct {
 	planMu    sync.RWMutex
 	planCache map[string]topicPlanResp
 	planAt    time.Time
+
+	// 每日新词接口：API Key 校验与进程内近似限流。
+	daily    DailyWordsConfig
+	rateMu   sync.Mutex
+	rateHits map[string]rateWindow
 }
 
 // New 创建 HTTP 处理器。
-func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, logger *log.Logger) *Handler {
-	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, logger: logger}
+func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, daily DailyWordsConfig, logger *log.Logger) *Handler {
+	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, logger: logger}
 }
 
 // Routes 注册全部 API 路由。gin.Engine 实现了 http.Handler，签名保持不变。
@@ -62,6 +67,9 @@ func (h *Handler) Routes() http.Handler {
 	r.RedirectFixedPath = false
 	r.HandleMethodNotAllowed = true
 
+	// 豆包 OpenAPI 插件描述文件，供平台导入工具定义。
+	r.GET("/openapi/daily-words.json", h.dailyWordsSpec)
+
 	api := r.Group("/api")
 	{
 		// 基础：健康检查、版本清单、素材下载、仓库状态
@@ -73,6 +81,10 @@ func (h *Handler) Routes() http.Handler {
 		// 构建触发与构建状态
 		api.POST("/build/trigger", h.trigger)
 		api.GET("/build/status", h.buildStatus)
+
+		// 每日新词：供客户端与豆包插件调用，统一走 X-API-Key。
+		api.GET("/daily-words", h.dailyWords)
+		api.POST("/daily-words/learned", h.markWordsLearned)
 
 		// PDF 试卷导入：分片上传支持断点续传，合并后再投递解析队列
 		api.POST("/pdf/upload/init", h.pdfUploadInit)
@@ -160,6 +172,8 @@ func (h *Handler) Routes() http.Handler {
 		speaking.POST("/transcribe-base64", h.speakingTranscribeBase64)
 		speaking.POST("/topic-plan", h.speakingTopicPlan)
 		speaking.POST("/validate-item", h.validateSpeakingItem)
+		speaking.GET("/grammar-points", h.listGrammarPoints)
+		speaking.POST("/requirements/check", h.checkGrammarRequirements)
 		speaking.GET("/templates", h.listSpeakingTemplates)
 		speaking.GET("/topics", h.listSpeakingTopics)
 		speaking.POST("/templates", h.createSpeakingTemplate)
@@ -176,7 +190,7 @@ func (h *Handler) cors() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
 		c.Header("Access-Control-Max-Age", "86400")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)

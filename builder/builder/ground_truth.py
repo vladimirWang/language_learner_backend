@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,27 +91,45 @@ class GroundTruthResult:
     path: Path
     vocab_count: int
     form_count: int
+    vocab_rows: list[dict[str, str]]
+
+
+def load_vocab(settings: Settings, lang: str) -> list[dict[str, str]]:
+    """读取并校验 vocab.csv，返回带例句的规范化行；供真值库与 PG 词表共用。"""
+    plugin = get_plugin(lang)
+    vocab_path = settings.content_dir / lang / "vocab.csv"
+    if not vocab_path.is_file():
+        raise BuildError(f"vocab.csv not found for lang={lang}: {vocab_path}")
+
+    rows = _read_csv(vocab_path, _VOCAB_COLUMNS)
+    errors: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for line_no, row in rows:
+        errors.extend(plugin.validate_vocab(row, f"vocab.csv:{line_no}"))
+        key = (row["lang"], row["lemma"])
+        if key in seen:
+            errors.append(f"vocab.csv:{line_no}: duplicate lemma {row['lemma']}")
+        seen.add(key)
+        _warn_missing_md(settings, row.get("source_md_path", ""), f"vocab.csv:{line_no}")
+    if errors:
+        detail = "\n".join(errors[:20])
+        raise BuildError(f"content validation failed for lang={lang}:\n{detail}")
+
+    vocab: list[dict[str, str]] = []
+    for _, row in rows:
+        item = dict(row)
+        item["example_de"] = _first_example(settings, item.get("source_md_path", ""))
+        vocab.append(item)
+    return vocab
 
 
 def build(settings: Settings, lang: str, version: str) -> GroundTruthResult:
     plugin = get_plugin(lang)
     lang_dir = settings.content_dir / lang
 
-    vocab_path = lang_dir / "vocab.csv"
-    if not vocab_path.is_file():
-        raise BuildError(f"vocab.csv not found for lang={lang}: {vocab_path}")
-    vocab_rows = _read_csv(vocab_path, _VOCAB_COLUMNS)
+    vocab_rows = load_vocab(settings, lang)
 
     errors: list[str] = []
-    seen_vocab: set[tuple[str, str]] = set()
-    for line_no, row in vocab_rows:
-        errors.extend(plugin.validate_vocab(row, f"vocab.csv:{line_no}"))
-        key = (row["lang"], row["lemma"])
-        if key in seen_vocab:
-            errors.append(f"vocab.csv:{line_no}: duplicate lemma {row['lemma']}")
-        seen_vocab.add(key)
-        _warn_missing_md(settings, row.get("source_md_path", ""), f"vocab.csv:{line_no}")
-
     form_rows: list[tuple[int, dict[str, str]]] = []
     form_path = lang_dir / "grammar_forms.csv"
     if form_path.is_file():
@@ -165,7 +184,7 @@ def build(settings: Settings, lang: str, version: str) -> GroundTruthResult:
                     _blank_none(row["source_md_path"]),
                     version,
                 )
-                for _, row in vocab_rows
+                for row in vocab_rows
             ],
         )
         conn.executemany(
@@ -200,7 +219,12 @@ def build(settings: Settings, lang: str, version: str) -> GroundTruthResult:
 
     os.replace(tmp, dest)
     logger.info("ground truth built: %s (vocab=%d, forms=%d)", dest, len(vocab_rows), len(form_rows))
-    return GroundTruthResult(path=dest, vocab_count=len(vocab_rows), form_count=len(form_rows))
+    return GroundTruthResult(
+        path=dest,
+        vocab_count=len(vocab_rows),
+        form_count=len(form_rows),
+        vocab_rows=vocab_rows,
+    )
 
 
 def _read_csv(path: Path, required: list[str]) -> list[tuple[int, dict[str, str]]]:
@@ -221,6 +245,31 @@ def _read_csv(path: Path, required: list[str]) -> list[tuple[int, dict[str, str]
 def _warn_missing_md(settings: Settings, rel_path: str, where: str) -> None:
     if rel_path and not (settings.content_dir / rel_path).is_file():
         logger.warning("%s: source_md_path not found: %s", where, rel_path)
+
+
+_CJK = re.compile(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff]")
+
+
+def _first_example(settings: Settings, rel_path: str) -> str:
+    """取词条 md 中 `## 例句` 下的第一条德语例句；中文解释从首个 CJK 字符处截断。"""
+    if not rel_path:
+        return ""
+    path = settings.content_dir / rel_path
+    if not path.is_file():
+        return ""
+    in_section = False
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("## "):
+            in_section = line[3:].strip() == "例句"
+            continue
+        if in_section and line.startswith("- "):
+            text = line[2:].strip()
+            match = _CJK.search(text)
+            if match:
+                text = text[: match.start()].strip()
+            return text
+    return ""
 
 
 def _blank_none(value: str) -> str | None:

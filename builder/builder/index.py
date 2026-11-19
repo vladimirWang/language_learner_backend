@@ -18,6 +18,7 @@ class SourceEntry:
     path: str  # 相对 content 根目录的 posix 路径
     level: str | None
     tags: tuple[str, ...]
+    patterns: str  # 逗号分隔的正则，供口语语法要求判定
     source_hash: str
     chunk_type: str
 
@@ -63,13 +64,21 @@ def load_index(settings: Settings) -> list[SourceEntry]:
         if declared and declared != actual_hash:
             logger.warning("index hash mismatch for %s, using actual content hash", rel_path)
 
+        patterns = fields.get("patterns", "").strip()
+        # patterns 写在索引元数据里，参与增量 hash，否则修改规则不会触发重建。
+        source_hash = actual_hash
+        if patterns:
+            digest = hashlib.sha256(f"{actual_hash}\n{patterns}".encode("utf-8")).hexdigest()
+            source_hash = "sha256:" + digest
+
         entries.append(
             SourceEntry(
                 lang=lang,
                 path=rel_path,
                 level=fields.get("level") or None,
                 tags=tuple(t for t in fields.get("tags", "").split(",") if t),
-                source_hash=actual_hash,
+                patterns=patterns,
+                source_hash=source_hash,
                 chunk_type=_chunk_type(rel_path),
             )
         )
@@ -90,6 +99,7 @@ def load_pdfs(settings: Settings, lang: str) -> list[SourceEntry]:
                 path=rel_path,
                 level=None,
                 tags=("exam",),
+                patterns="",
                 source_hash=hash_file(pdf),
                 chunk_type="exam_paper",
             )

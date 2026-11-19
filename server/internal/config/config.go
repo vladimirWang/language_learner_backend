@@ -35,6 +35,11 @@ type Config struct {
 	RabbitMQURL string
 	PDFQueue    string
 	WorkDir     string
+
+	// 每日新词接口：无 key 时接口返回 503，避免匿名暴露。
+	DailyWordsAPIKey    string
+	DailyWordsRateLimit int
+	AppTZ               string
 }
 
 // Load 读取环境变量并做缺省处理；不因缺少可选项而失败。
@@ -51,6 +56,10 @@ func Load() Config {
 		RabbitMQURL: envOr("RABBITMQ_URL", "amqp://root:1234@rabbitmq:5672/"),
 		PDFQueue:    envOr("PDF_IMPORT_QUEUE", "pdf.import"),
 		WorkDir:     envOr("WORK_DIR", "work"),
+
+		DailyWordsAPIKey:    os.Getenv("DAILY_WORDS_API_KEY"),
+		DailyWordsRateLimit: envInt("DAILY_WORDS_RATE_LIMIT", 60),
+		AppTZ:               envOr("APP_TZ", "Asia/Shanghai"),
 	}
 	cfg.S3AccessKey = os.Getenv("S3_ACCESS_KEY")
 	cfg.S3SecretKey = os.Getenv("S3_SECRET_KEY")

@@ -723,19 +723,29 @@ func (s *Store) ListSpeakingItemsByTopic(ctx context.Context, lang, level, topic
 
 // SpeakingPlan 是同一难度下由若干口语题目组成的方案，可被多个关卡引用。
 type SpeakingPlan struct {
-	ID          int64     `gorm:"column:id;primaryKey" json:"id"`
-	Lang        string    `gorm:"column:lang" json:"lang"`
-	Level       string    `gorm:"column:level" json:"level"`
-	Name        string    `gorm:"column:name" json:"name"`
-	Description string    `gorm:"column:description" json:"description"`
-	Active      bool      `gorm:"column:active" json:"active"`
-	SortOrder   int       `gorm:"column:sort_order" json:"sort_order"`
-	ItemCount   int64     `gorm:"column:item_count" json:"item_count"`
-	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
-	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
+	ID          int64  `gorm:"column:id;primaryKey" json:"id"`
+	Lang        string `gorm:"column:lang" json:"lang"`
+	Level       string `gorm:"column:level" json:"level"`
+	Name        string `gorm:"column:name" json:"name"`
+	Description string `gorm:"column:description" json:"description"`
+	Active      bool   `gorm:"column:active" json:"active"`
+	SortOrder   int    `gorm:"column:sort_order" json:"sort_order"`
+	ItemCount   int64  `gorm:"column:item_count" json:"item_count"`
+	// GrammarRequirements 是方案级语法要求，整场任意回答达成即可。
+	GrammarRequirements JSONRaw   `gorm:"column:grammar_requirements" json:"grammar_requirements"`
+	CreatedAt           time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt           time.Time `gorm:"column:updated_at" json:"updated_at"`
 }
 
 func (SpeakingPlan) TableName() string { return "speaking_exam_plans" }
+
+// grammarRequirementsValue 空值按空数组写入，避免违反 NOT NULL 约束。
+func grammarRequirementsValue(raw JSONRaw) string {
+	if len(raw) == 0 {
+		return "[]"
+	}
+	return string(raw)
+}
 
 // ListSpeakingPlans 返回口语方案列表，activeOnly 为 false 时含停用项。
 func (s *Store) ListSpeakingPlans(ctx context.Context, lang, level string, activeOnly bool) ([]SpeakingPlan, error) {
@@ -743,7 +753,7 @@ func (s *Store) ListSpeakingPlans(ctx context.Context, lang, level string, activ
 	q := s.db.WithContext(ctx).
 		Table("speaking_exam_plans p").
 		Select(`p.id, p.lang, p.level, p.name, p.description, p.active, p.sort_order,
-			p.created_at, p.updated_at,
+			p.grammar_requirements, p.created_at, p.updated_at,
 			(SELECT COUNT(*) FROM speaking_exam_plan_items i WHERE i.plan_id = p.id) AS item_count`)
 	if activeOnly {
 		q = q.Where("p.active = ?", true)
@@ -764,7 +774,7 @@ func (s *Store) GetSpeakingPlan(ctx context.Context, id int64) (*SpeakingPlan, [
 	err := s.db.WithContext(ctx).
 		Table("speaking_exam_plans p").
 		Select(`p.id, p.lang, p.level, p.name, p.description, p.active, p.sort_order,
-			p.created_at, p.updated_at,
+			p.grammar_requirements, p.created_at, p.updated_at,
 			(SELECT COUNT(*) FROM speaking_exam_plan_items i WHERE i.plan_id = p.id) AS item_count`).
 		Where("p.id = ?", id).
 		Take(&plan).Error
@@ -820,12 +830,13 @@ func replacePlanItems(tx *gorm.DB, planID int64, keys []string) error {
 // createSpeakingPlan 在事务内创建方案及有序题目映射。
 func createSpeakingPlan(tx *gorm.DB, plan SpeakingPlan, itemKeys []string) (int64, error) {
 	if err := tx.Model(&SpeakingPlan{}).Create(map[string]any{
-		"lang":        plan.Lang,
-		"level":       plan.Level,
-		"name":        plan.Name,
-		"description": plan.Description,
-		"active":      plan.Active,
-		"sort_order":  plan.SortOrder,
+		"lang":                 plan.Lang,
+		"level":                plan.Level,
+		"name":                 plan.Name,
+		"description":          plan.Description,
+		"active":               plan.Active,
+		"sort_order":           plan.SortOrder,
+		"grammar_requirements": grammarRequirementsValue(plan.GrammarRequirements),
 	}).Error; err != nil {
 		return 0, err
 	}
@@ -873,13 +884,14 @@ func (s *Store) CreateGeneratedSpeakingPlan(ctx context.Context, plan SpeakingPl
 func (s *Store) UpdateSpeakingPlan(ctx context.Context, id int64, plan SpeakingPlan, itemKeys []string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&SpeakingPlan{}).Where("id = ?", id).Updates(map[string]any{
-			"lang":        plan.Lang,
-			"level":       plan.Level,
-			"name":        plan.Name,
-			"description": plan.Description,
-			"active":      plan.Active,
-			"sort_order":  plan.SortOrder,
-			"updated_at":  gorm.Expr("now()"),
+			"lang":                 plan.Lang,
+			"level":                plan.Level,
+			"name":                 plan.Name,
+			"description":          plan.Description,
+			"active":               plan.Active,
+			"sort_order":           plan.SortOrder,
+			"grammar_requirements": grammarRequirementsValue(plan.GrammarRequirements),
+			"updated_at":           gorm.Expr("now()"),
 		})
 		if res.Error != nil {
 			return res.Error

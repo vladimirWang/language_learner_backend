@@ -26,6 +26,7 @@ class Chunk:
     content: str
     source_path: str
     source_hash: str
+    patterns: str = ""
 
 
 def chunk_entry(settings: Settings, entry: SourceEntry) -> list[Chunk]:
@@ -88,6 +89,7 @@ def _make_chunk(entry: SourceEntry, title: str, body: str, lemma: str | None) ->
         content=body,
         source_path=entry.path,
         source_hash=entry.source_hash,
+        patterns=entry.patterns,
     )
 
 

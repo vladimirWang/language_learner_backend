@@ -1,0 +1,154 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "每日新词",
+    "version": "1.0.0",
+    "description": "为语言学习客户端和智能体提供每日新词与学习标记。部署后请把 servers.url 改为你的公网地址，并在豆包插件中配置 X-API-Key。"
+  },
+  "servers": [
+    {
+      "url": "https://your-domain.example.com",
+      "description": "替换为后端公网地址"
+    }
+  ],
+  "security": [
+    {
+      "ApiKeyAuth": []
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
+      }
+    },
+    "schemas": {
+      "DailyWord": {
+        "type": "object",
+        "properties": {
+          "word_id": { "type": "integer", "format": "int64" },
+          "lemma": { "type": "string" },
+          "word_type": { "type": "string", "nullable": true },
+          "gender": { "type": "string", "nullable": true },
+          "plural": { "type": "string", "nullable": true },
+          "chinese_mean": { "type": "string" },
+          "english_mean": { "type": "string", "nullable": true },
+          "example_de": { "type": "string", "nullable": true }
+        },
+        "required": ["word_id", "lemma", "chinese_mean"]
+      },
+      "DailyWordsResponse": {
+        "type": "object",
+        "properties": {
+          "date": { "type": "string", "format": "date" },
+          "lang": { "type": "string" },
+          "level": { "type": "string" },
+          "words": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DailyWord" }
+          },
+          "reason": { "type": "string", "description": "词表未就绪时为 vocab_not_ready" }
+        },
+        "required": ["date", "lang", "level", "words"]
+      },
+      "MarkLearnedRequest": {
+        "type": "object",
+        "properties": {
+          "device_id": { "type": "string", "description": "客户端生成的设备标识" },
+          "word_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": { "type": "integer", "format": "int64" }
+          }
+        },
+        "required": ["device_id", "word_ids"]
+      },
+      "MarkLearnedResponse": {
+        "type": "object",
+        "properties": {
+          "accepted": { "type": "integer", "description": "实际写入的词数" },
+          "ignored": { "type": "integer", "description": "不存在或无效的 ID 数" }
+        },
+        "required": ["accepted", "ignored"]
+      }
+    }
+  },
+  "paths": {
+    "/api/daily-words": {
+      "get": {
+        "operationId": "getDailyWords",
+        "summary": "获取每日新词",
+        "description": "同一天同一个 device_id 返回同一批词；不传 device_id 时返回公共分配。",
+        "parameters": [
+          {
+            "name": "lang",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "example": "de" }
+          },
+          {
+            "name": "level",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "example": "A1" }
+          },
+          {
+            "name": "count",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 20, "default": 5 }
+          },
+          {
+            "name": "device_id",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DailyWordsResponse" }
+              }
+            }
+          },
+          "401": { "description": "X-API-Key 错误" },
+          "503": { "description": "服务端未配置 DAILY_WORDS_API_KEY" }
+        }
+      }
+    },
+    "/api/daily-words/learned": {
+      "post": {
+        "operationId": "markDailyWordsLearned",
+        "summary": "标记新词已学",
+        "description": "记录 device_id 已学过的词，用于口语考试带上最近五天新词。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MarkLearnedRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MarkLearnedResponse" }
+              }
+            }
+          },
+          "400": { "description": "参数错误" },
+          "401": { "description": "X-API-Key 错误" },
+          "503": { "description": "服务端未配置 DAILY_WORDS_API_KEY" }
+        }
+      }
+    }
+  }
+}
