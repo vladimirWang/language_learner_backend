@@ -50,7 +50,7 @@ func NewFromEnv() *Client {
 		baseURL: base,
 		apiKey:  apiKey,
 		model:   model,
-		http:    &http.Client{Timeout: 20 * time.Second},
+		http:    &http.Client{Timeout: 120 * time.Second},
 	}
 }
 

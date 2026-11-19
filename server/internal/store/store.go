@@ -65,6 +65,33 @@ type ListeningJobLog struct {
 
 func (ListeningJobLog) TableName() string { return "listening_job_logs" }
 
+// ListeningJobNotification 对应 listening_job_notifications 一行。
+// 用于管理台"消息中心"：AI 听力生成、构建完成等系统事件。
+type ListeningJobNotification struct {
+	ID        int64      `gorm:"primaryKey;column:id" json:"id"`
+	JobID     string     `gorm:"column:job_id;index" json:"job_id"`
+	EventType string     `gorm:"column:event_type" json:"event_type"` // progress / success / error / info
+	Title     string     `gorm:"column:title" json:"title"`
+	Message   string     `gorm:"column:message" json:"message"`
+	Payload   string     `gorm:"column:payload" json:"-"` // jsonb raw string
+	CreatedAt time.Time  `gorm:"column:created_at" json:"created_at"`
+	ReadAt    *time.Time `gorm:"column:read_at" json:"read_at"`
+}
+
+// NotificationPayload 返回解析后的 payload；解析失败或空值均返回 nil。
+func (n *ListeningJobNotification) NotificationPayload() map[string]any {
+	if n.Payload == "" {
+		return nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(n.Payload), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func (ListeningJobNotification) TableName() string { return "listening_job_notifications" }
+
 // LogEntry 对应 build_logs 一行。
 type LogEntry struct {
 	Version   string    `gorm:"column:version" json:"-"`
@@ -931,7 +958,7 @@ func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamI
 			COALESCE(j.source_url, '') AS source_url,
 			COALESCE(NULLIF(j.name, ''), si.prompt_de, '') AS name`).
 		Joins("LEFT JOIN listening_jobs j ON le.item_type = 'listening' AND j.exam_id = le.exam_id AND j.deleted_at IS NULL").
-		Joins("LEFT JOIN speaking_items si ON le.item_type = 'speaking' AND si.item_key = le.exam_id").
+		Joins("LEFT JOIN speaking_items si ON le.item_type = 'speaking' AND si.item_key = le.exam_id AND si.active = true").
 		Where("le.level_id = ?", levelID).
 		Where("(le.item_type = 'listening' AND j.exam_id IS NOT NULL) OR (le.item_type = 'speaking' AND si.item_key IS NOT NULL)").
 		Order("le.sort_order ASC, le.id ASC").
@@ -946,9 +973,11 @@ func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamI
 			COALESCE(p.lang, l.lang, '') AS lang, '' AS source_url,
 			COALESCE(NULLIF(p.name, ''), le.exam_id) AS name`).
 		Joins("LEFT JOIN levels l ON l.id = le.level_id").
-		Joins("LEFT JOIN speaking_exam_plans p ON le.item_type = 'speaking_plan' AND p.id::text = le.exam_id").
-		Where(`le.level_id = ? AND (le.item_type = 'speaking_topic'
-			OR (le.item_type = 'speaking_plan' AND p.id IS NOT NULL))`, levelID).
+		Joins("LEFT JOIN speaking_exam_plans p ON le.item_type = 'speaking_plan' AND p.id::text = le.exam_id AND p.active = true").
+		Joins("LEFT JOIN speaking_items si_topic ON le.item_type = 'speaking_topic' AND si_topic.item_key = le.exam_id AND si_topic.active = true").
+		Where(`le.level_id = ? AND
+			(le.item_type = 'speaking_topic' AND si_topic.item_key IS NOT NULL)
+			OR (le.item_type = 'speaking_plan' AND p.id IS NOT NULL)`, levelID).
 		Order("le.sort_order ASC, le.id ASC").
 		Scan(&plans).Error
 	if err != nil {
@@ -1435,6 +1464,81 @@ func (s *Store) SoftDeleteListeningJob(ctx context.Context, jobID string) error 
 			"deleted_at": gorm.Expr("now()"),
 			"updated_at": gorm.Expr("now()"),
 		}).Error
+}
+
+// --- Listening Job Notifications ---
+
+// InsertNotification 新增一条系统通知；payload 为 nil 时不写入 JSONB 字段。
+func (s *Store) InsertNotification(ctx context.Context, jobID, eventType, title, message string, payload map[string]any) (int64, error) {
+	var payloadExpr any
+	if payload == nil {
+		payloadExpr = gorm.Expr("NULL::jsonb")
+	} else {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return 0, err
+		}
+		payloadExpr = gorm.Expr("?::jsonb", string(raw))
+	}
+	n := &ListeningJobNotification{
+		JobID:     jobID,
+		EventType: eventType,
+		Title:     title,
+		Message:   message,
+	}
+	if err := s.db.WithContext(ctx).Create(&struct {
+		ListeningJobNotification
+		Payload any `gorm:"column:payload"`
+	}{ListeningJobNotification: *n, Payload: payloadExpr}).Error; err != nil {
+		return 0, err
+	}
+	return n.ID, nil
+}
+
+// ListNotifications 按创建时间倒序拉取通知；limit 默认 50。
+func (s *Store) ListNotifications(ctx context.Context, limit int) ([]*ListeningJobNotification, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var out []*ListeningJobNotification
+	err := s.db.WithContext(ctx).
+		Table("listening_job_notifications").
+		Order("created_at DESC").
+		Limit(limit).
+		Scan(&out).Error
+	return out, err
+}
+
+// CountUnreadNotifications 统计未读通知数。
+func (s *Store) CountUnreadNotifications(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.db.WithContext(ctx).
+		Table("listening_job_notifications").
+		Where("read_at IS NULL").
+		Count(&n).Error
+	return n, err
+}
+
+// MarkNotificationRead 标记单条通知已读；不存在时返回 false。
+func (s *Store) MarkNotificationRead(ctx context.Context, id int64) (bool, error) {
+	res := s.db.WithContext(ctx).Exec(
+		`UPDATE listening_job_notifications SET read_at = now() WHERE id = ? AND read_at IS NULL`, id,
+	)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// MarkAllNotificationsRead 标记全部未读通知为已读。
+func (s *Store) MarkAllNotificationsRead(ctx context.Context) (int64, error) {
+	res := s.db.WithContext(ctx).Exec(
+		`UPDATE listening_job_notifications SET read_at = now() WHERE read_at IS NULL`,
+	)
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	return res.RowsAffected, nil
 }
 
 // SetListeningJobHasAnswers 标记该听力素材已绑定答案。

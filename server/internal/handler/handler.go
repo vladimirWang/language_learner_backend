@@ -157,6 +157,15 @@ func (h *Handler) Routes() http.Handler {
 		listening.DELETE("/job/:jobId", h.deleteListeningJob)
 	}
 
+	// SSE 实时事件订阅
+	api.GET("/events", h.listeningEvents)
+
+	// 系统通知（管理台消息中心）
+	{
+		api.GET("/notifications", h.listNotifications)
+		api.POST("/notifications/mark-read", h.markNotificationRead)
+	}
+
 	// 关卡配置
 	levels := api.Group("/levels")
 	{
