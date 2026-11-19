@@ -22,3 +22,5 @@ deploy/.env.*
 
 # macOS
 .DS_Store
+
+deploy/dist-images

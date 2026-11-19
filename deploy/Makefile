@@ -25,7 +25,7 @@ TAG ?= prod
 IMG_SERVICE = lang-service:$(TAG)
 IMG_BUILDER = lang-builder:$(TAG)
 IMG_NGINX   = lang-nginx:$(TAG)
-IMG_PG      = lang-postgres-pgvector:pg17
+IMG_PG      = pgvector/pgvector:pg17
 IMG_MIGRATE = migrate/migrate:v4.18.3
 
 # ---------- 构建 ----------
@@ -56,13 +56,21 @@ build-nginx:
 	docker pull --platform $(PLATFORM) nginx:1.27-alpine
 	docker tag nginx:1.27-alpine $(IMG_NGINX)
 
+# ---------- 基础镜像 ----------
+.PHONY: pull-base
+pull-base:
+	@echo "🔨 拉取第三方基础镜像（$(PLATFORM)）..."
+	docker pull --platform $(PLATFORM) $(IMG_PG)
+	docker pull --platform $(PLATFORM) $(IMG_MIGRATE)
+
 # ---------- 导出 ----------
 .PHONY: export-all export-service export-builder export-nginx
-export-all:
+export-all: pull-base
 	@mkdir -p $(OUT_DIR)
 	@echo "📦 导出全部镜像到 $(OUT_DIR)/ ..."
-	docker save $(IMG_SERVICE) $(IMG_BUILDER) $(IMG_NGINX) $(IMG_PG) $(IMG_MIGRATE) | \
-		gzip > $(OUT_DIR)/lang-images-$(TAG)-amd64.tar.gz
+	docker save -o $(OUT_DIR)/lang-images-$(TAG)-amd64.tar \
+		$(IMG_SERVICE) $(IMG_BUILDER) $(IMG_NGINX) $(IMG_PG) $(IMG_MIGRATE)
+	gzip -f $(OUT_DIR)/lang-images-$(TAG)-amd64.tar
 	@echo "✅ $(OUT_DIR)/lang-images-$(TAG)-amd64.tar.gz ($$(du -sh $(OUT_DIR)/lang-images-$(TAG)-amd64.tar.gz | cut -f1))"
 
 # ---------- 上传 ----------

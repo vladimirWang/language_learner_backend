@@ -13,8 +13,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates ffmpeg tesseract-ocr tesseract-ocr-deu tesseract-ocr-eng && \
     rm -rf /var/lib/apt/lists/*
 
-# 安装 uv（官方静态二进制）
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# 安装 uv（用 pip + 清华源，绕开 ghcr.io 被墙的问题）
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple uv
 
 WORKDIR /builder
 COPY builder/pyproject.toml builder/uv.lock ./

@@ -1,6 +1,8 @@
 # 构建阶段
 FROM golang:1.27-alpine AS builder
 WORKDIR /src
+# 国内加速：GOPROXY 走 goproxy.cn，避免 proxy.golang.org 被墙 EOF
+ENV GOPROXY=https://goproxy.cn,direct
 COPY server/go.mod server/go.sum ./
 RUN go mod download
 COPY server/ ./
