@@ -34,6 +34,9 @@ services:
       LLM_MODEL: ${LLM_MODEL:-}
       # 口语语音输入转写模型（复用 LLM 凭证，默认 qwen3-asr-flash）
       ASR_MODEL: ${ASR_MODEL:-}
+      # 口语朗读 TTS（复用 DASHSCOPE_API_KEY；留空则用默认 qwen-audio-3.1-tts-flash + 多语种音色）
+      TTS_MODEL: ${TTS_MODEL:-}
+      TTS_VOICE: ${TTS_VOICE:-}
       # PDF 解析队列：dev 复用 infra compose 中已运行的 rabbitmq（宿主机 5672）
       RABBITMQ_URL: ${RABBITMQ_URL:-amqp://root:1234@host.docker.internal:5672/}
       PDF_IMPORT_QUEUE: ${PDF_IMPORT_QUEUE:-pdf.import}

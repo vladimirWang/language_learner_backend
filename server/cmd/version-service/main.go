@@ -20,6 +20,7 @@ import (
 	"github.com/wangfernando/language-learner/server/internal/scheduler"
 	"github.com/wangfernando/language-learner/server/internal/storage"
 	"github.com/wangfernando/language-learner/server/internal/store"
+	"github.com/wangfernando/language-learner/server/internal/tts"
 )
 
 func main() {
@@ -46,6 +47,12 @@ func main() {
 	} else {
 		logger.Printf("speaking dialog: LLM not configured, using templates")
 	}
+	ttsClient := tts.NewFromEnv()
+	if ttsClient.Enabled() {
+		logger.Printf("speaking tts: enabled")
+	} else {
+		logger.Printf("speaking tts: not configured, audio playback disabled")
+	}
 	publisher := mq.NewPublisher(cfg.RabbitMQURL, cfg.PDFQueue, logger)
 	defer publisher.Close()
 	// 恢复上次进程退出时未完成的解析任务，避免任务停在 queued/running。
@@ -66,7 +73,7 @@ func main() {
 	pdfWorker := pdfworker.New(st, rn, cfg.RabbitMQURL, cfg.PDFQueue, cfg.WorkDir, logger)
 	pdfWorker.Start(ctx)
 
-	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, publisher, logger)
+	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

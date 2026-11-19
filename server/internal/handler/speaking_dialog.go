@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -798,6 +799,104 @@ func (h *Handler) speakingTranscribe(c *gin.Context) {
 		return
 	}
 	writeJSON(c, http.StatusOK, map[string]any{"text": text})
+}
+
+// speakingTranscribeBase64 是转写的 JSON/base64 入口，供真机调试使用。
+// 真机调试下 wx.uploadFile 走调试代理通道易 timeout，而 wx.request 正常；
+// 该入口让小程序把录音读成 base64 走普通 request，与 transcribe 共用同一转写逻辑。
+type speakingTranscribeBase64Req struct {
+	Audio string `json:"audio"`
+	Mime  string `json:"mime"`
+	Lang  string `json:"lang"`
+}
+
+func (h *Handler) speakingTranscribeBase64(c *gin.Context) {
+	if h.llm == nil || !h.llm.Enabled() {
+		writeError(c, http.StatusServiceUnavailable, "transcription unavailable")
+		return
+	}
+	var req speakingTranscribeBase64Req
+	// base64 会让体积膨胀约 4/3，这里放宽到 24MB（对应约 18MB 原始音频）。
+	if err := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 24<<20)).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	audio, err := base64.StdEncoding.DecodeString(req.Audio)
+	if err != nil || len(audio) == 0 {
+		writeError(c, http.StatusBadRequest, "audio is empty or invalid base64")
+		return
+	}
+	if len(audio) > 20<<20 {
+		writeError(c, http.StatusBadRequest, "audio is too large")
+		return
+	}
+	mime := strings.TrimSpace(req.Mime)
+	if !strings.HasPrefix(mime, "audio/") {
+		mime = "audio/mpeg"
+	}
+	lang := strings.TrimSpace(req.Lang)
+	if lang != "" && !langPattern.MatchString(lang) {
+		writeError(c, http.StatusBadRequest, "invalid lang")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+	text, err := h.llm.Transcribe(ctx, audio, mime, lang)
+	if err != nil {
+		h.logger.Printf("speaking transcribe(base64): %v", err)
+		writeError(c, http.StatusBadGateway, "transcription failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"text": text})
+}
+
+// ---------------------------------------------------------------------------
+// 语音合成（口语考官文本朗读）
+// ---------------------------------------------------------------------------
+
+type speakingTTSReq struct {
+	Text string `json:"text"`
+	Lang string `json:"lang"`
+}
+
+// speakingTTS 把考官/搭档文本合成为音频，以 base64 返回，供小程序写入本地文件播放。
+// 未配置 TTS 时返回 503，调用失败返回 502，均不阻塞对话流程（前端有文本兜底）。
+func (h *Handler) speakingTTS(c *gin.Context) {
+	if h.tts == nil || !h.tts.Enabled() {
+		writeError(c, http.StatusServiceUnavailable, "tts unavailable: not configured")
+		return
+	}
+	var req speakingTTSReq
+	if err := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 8<<10)).Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	req.Text = strings.TrimSpace(req.Text)
+	if req.Text == "" {
+		writeError(c, http.StatusBadRequest, "text is required")
+		return
+	}
+	if utf8.RuneCountInString(req.Text) > 300 {
+		writeError(c, http.StatusBadRequest, "text is too long")
+		return
+	}
+	lang := strings.TrimSpace(req.Lang)
+	if lang != "" && !langPattern.MatchString(lang) {
+		lang = ""
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 40*time.Second)
+	defer cancel()
+	data, mime, err := h.tts.Synthesize(ctx, req.Text, lang)
+	if err != nil {
+		h.logger.Printf("speaking tts: %v", err)
+		writeError(c, http.StatusBadGateway, "tts failed")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{
+		"audio":  base64.StdEncoding.EncodeToString(data),
+		"mime":   mime,
+		"source": "tts",
+	})
 }
 
 // ---------------------------------------------------------------------------

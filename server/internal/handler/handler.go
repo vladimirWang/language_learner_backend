@@ -14,6 +14,7 @@ import (
 	"github.com/wangfernando/language-learner/server/internal/scheduler"
 	"github.com/wangfernando/language-learner/server/internal/storage"
 	"github.com/wangfernando/language-learner/server/internal/store"
+	"github.com/wangfernando/language-learner/server/internal/tts"
 )
 
 var langPattern = regexp.MustCompile(`^[a-z]{2,5}$`)
@@ -30,6 +31,7 @@ type Handler struct {
 	presigner *storage.Presigner
 	repoURLs  map[string]string
 	llm       *llm.Client
+	tts       *tts.Client
 	pdfPub    JobPublisher
 	logger    *log.Logger
 
@@ -45,8 +47,8 @@ type Handler struct {
 }
 
 // New 创建 HTTP 处理器。
-func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, pdfPub JobPublisher, logger *log.Logger) *Handler {
-	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, pdfPub: pdfPub, logger: logger}
+func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, logger *log.Logger) *Handler {
+	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, logger: logger}
 }
 
 // Routes 注册全部 API 路由。gin.Engine 实现了 http.Handler，签名保持不变。
@@ -153,7 +155,9 @@ func (h *Handler) Routes() http.Handler {
 		speaking.DELETE("/items/:key", h.deleteSpeakingItem)
 		speaking.POST("/reply", h.speakingReply)
 		speaking.POST("/check", h.speakingCheck)
+		speaking.POST("/tts", h.speakingTTS)
 		speaking.POST("/transcribe", h.speakingTranscribe)
+		speaking.POST("/transcribe-base64", h.speakingTranscribeBase64)
 		speaking.POST("/topic-plan", h.speakingTopicPlan)
 		speaking.POST("/validate-item", h.validateSpeakingItem)
 		speaking.GET("/templates", h.listSpeakingTemplates)
