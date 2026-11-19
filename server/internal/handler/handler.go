@@ -91,6 +91,16 @@ func (h *Handler) Routes() http.Handler {
 		api.GET("/daily-words", h.dailyWords)
 		api.POST("/daily-words/learned", h.markWordsLearned)
 
+		// 新词库维护：管理台增删改查与 CSV 导入
+		vocab := api.Group("/vocab")
+		{
+			vocab.GET("", h.listVocabWords)
+			vocab.POST("", h.createVocabWord)
+			vocab.POST("/import", h.importVocabWords)
+			vocab.PUT("/:id", h.updateVocabWord)
+			vocab.DELETE("/:id", h.deleteVocabWord)
+		}
+
 		// 管理台 SSO 登录：配置、授权码换 token、会话校验
 		auth := api.Group("/auth")
 		{
