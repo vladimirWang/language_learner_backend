@@ -153,6 +153,36 @@ func (s *Store) DeleteVocabWord(ctx context.Context, id int64) (bool, error) {
 	return res.RowsAffected > 0, nil
 }
 
+// VocabWordIDsByLemmas 按 (lang, lemma 列表) 精确查找 word_id，顺序与输入一致，
+// 未命中的 lemma 自动跳过。供 CSV 导入后反查 word_id 用。
+func (s *Store) VocabWordIDsByLemmas(ctx context.Context, lang string, lemmas []string) ([]int64, error) {
+	if len(lemmas) == 0 {
+		return nil, nil
+	}
+	var rows []struct {
+		ID    int64  `gorm:"column:id"`
+		Lemma string `gorm:"column:lemma"`
+	}
+	if err := s.db.WithContext(ctx).
+		Table("vocab_words").
+		Select("id, lemma").
+		Where("lang = ? AND lemma IN ?", lang, lemmas).
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	byLemma := make(map[string]int64, len(rows))
+	for _, r := range rows {
+		byLemma[r.Lemma] = r.ID
+	}
+	out := make([]int64, 0, len(lemmas))
+	for _, lemma := range lemmas {
+		if id, ok := byLemma[lemma]; ok {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
 // UpsertVocabWords 在单个事务内批量 upsert，供 CSV 导入使用；返回新增与更新数量。
 func (s *Store) UpsertVocabWords(ctx context.Context, rows []VocabWordInput) (int, int, error) {
 	inserted, updated := 0, 0

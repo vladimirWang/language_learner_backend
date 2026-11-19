@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +18,19 @@ import (
 var validVocabWordTypes = map[string]bool{
 	"noun": true, "verb": true, "adj": true,
 	"adv": true, "prep": true, "particle": true,
+}
+
+// wordTypeAliases 把常见英文完整词归一化为 builder 内部用的短代码。
+// CSV 导入和单条录入都会先做这个归一化。
+var wordTypeAliases = map[string]string{
+	"adjective":    "adj",
+	"adverbs":      "adv",
+	"adverb":       "adv",
+	"preposition":  "prep",
+	"prepositions": "prep",
+	"particles":    "particle",
+	"nouns":        "noun",
+	"verbs":        "verb",
 }
 
 // validVocabLevels 覆盖 CEFR（de/en）与 JLPT（ja）。
@@ -69,6 +83,9 @@ func normalizeVocabWord(req vocabWordUpsert, forcedLang string) (store.VocabWord
 	}
 
 	req.WordType = strings.ToLower(strings.TrimSpace(req.WordType))
+	if alias, ok := wordTypeAliases[req.WordType]; ok {
+		req.WordType = alias
+	}
 	if !validVocabWordTypes[req.WordType] {
 		return store.VocabWordInput{}, "无效词性（noun/verb/adj/adv/prep/particle）"
 	}
@@ -229,11 +246,14 @@ func (h *Handler) deleteVocabWord(c *gin.Context) {
 }
 
 // importVocabWords 导入 CSV 文本；任一行校验失败时整批不写入。
+// 可选同时回填学习记录（learned_date），device_id 固定为 "admin"。
 func (h *Handler) importVocabWords(c *gin.Context) {
 	var req struct {
-		Lang   string `json:"lang"`
-		CSV    string `json:"csv"`
-		DryRun bool   `json:"dry_run"`
+		Lang        string `json:"lang"`
+		CSV         string `json:"csv"`
+		DryRun      bool   `json:"dry_run"`
+		TagLearned  bool   `json:"tag_learned"`
+		LearnedDate string `json:"learned_date"` // YYYY-MM-DD
 	}
 	if err := json.NewDecoder(io.LimitReader(c.Request.Body, 8<<20)).Decode(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "invalid json body")
@@ -246,6 +266,23 @@ func (h *Handler) importVocabWords(c *gin.Context) {
 	if !langPattern.MatchString(req.Lang) {
 		writeError(c, http.StatusBadRequest, "invalid lang")
 		return
+	}
+
+	// 学习记录标记：learned_date 必填，device_id 由后端固定为 "admin"。
+	tagLearned := req.TagLearned
+	if tagLearned {
+		req.LearnedDate = strings.TrimSpace(req.LearnedDate)
+		if req.LearnedDate == "" {
+			writeError(c, http.StatusBadRequest, "标记学习记录时必须提供 learned_date（YYYY-MM-DD）")
+			return
+		}
+		loc := h.now().Location()
+		parsed, err := time.ParseInLocation("2006-01-02", req.LearnedDate, loc)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "learned_date 格式应为 YYYY-MM-DD")
+			return
+		}
+		req.LearnedDate = parsed.Format("2006-01-02") // 规范化
 	}
 
 	rows, errs := parseVocabCSV(req.Lang, req.CSV)
@@ -273,9 +310,40 @@ func (h *Handler) importVocabWords(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "import vocab words failed")
 		return
 	}
-	writeJSON(c, http.StatusOK, map[string]any{
-		"dry_run": false, "inserted": inserted, "updated": updated, "total": len(rows),
-	})
+
+	resp := map[string]any{
+		"dry_run":  false,
+		"inserted": inserted,
+		"updated":  updated,
+		"total":    len(rows),
+	}
+
+	if tagLearned {
+		lemmas := make([]string, len(rows))
+		for i, r := range rows {
+			lemmas[i] = r.Lemma
+		}
+		ids, err := h.store.VocabWordIDsByLemmas(c.Request.Context(), req.Lang, lemmas)
+		if err != nil {
+			h.logger.Printf("import vocab words: resolve ids failed: %v", err)
+			writeError(c, http.StatusInternalServerError, "resolve vocab word ids failed")
+			return
+		}
+		loc := h.now().Location()
+		learnedAt, _ := time.ParseInLocation("2006-01-02", req.LearnedDate, loc)
+		accepted, ignored, err := h.store.MarkWordsLearnedAt(
+			c.Request.Context(), "admin", ids, learnedAt,
+		)
+		if err != nil {
+			h.logger.Printf("import vocab words: mark learned failed: %v", err)
+			writeError(c, http.StatusInternalServerError, "mark words learned failed")
+			return
+		}
+		resp["learned_marked"] = accepted
+		resp["learned_ignored"] = ignored
+	}
+
+	writeJSON(c, http.StatusOK, resp)
 }
 
 // parseVocabCSV 解析管理台导入的 CSV。支持与 content/<lang>/vocab.csv 相同的列，
