@@ -145,6 +145,7 @@ func (h *Handler) Routes() http.Handler {
 	listening := api.Group("/listening")
 	{
 		listening.POST("/import", h.listeningImport)
+		listening.POST("/generate", h.listeningGenerate)
 		listening.GET("/jobs", h.listeningJobs)
 		listening.GET("/job/:jobId", h.listeningJobDetail)
 		listening.GET("/job/:jobId/files", h.listeningFiles)
