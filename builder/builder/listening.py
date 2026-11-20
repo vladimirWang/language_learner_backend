@@ -366,14 +366,18 @@ def _probe_title(url: str, cookies: Path | None) -> str:
 
 
 def _download_best(url: str, out_dir: Path, cookies: Path | None) -> Path:
-    """下载最佳可用媒体（优先视频轨保留画面，无视频则只下音频）。"""
+    """下载媒体（优先 720p 以内的视频轨保留画面，无视频则只下音频）。
+
+    听力素材只需要音频转写 + 偶尔抽帧 OCR，1080p/4K 只会成倍增加下载与磁盘写入，
+    因此限制高度不超过 720；源站没有 720p 时才回退到最佳可用清晰度。
+    """
     template = out_dir / "source.%(ext)s"
     cmd = [
         "yt-dlp",
         "--no-warnings",
         "--no-playlist",
         "-f",
-        "bestvideo*+bestaudio/best",
+        "bestvideo[height<=720]+bestaudio/best[height<=720]/bestvideo*+bestaudio/best",
         "--merge-output-format", "mp4",
         "-o",
         str(template),
