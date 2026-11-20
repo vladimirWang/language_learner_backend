@@ -12,7 +12,7 @@
 #   :5432 → 5432 (PostgreSQL，仅限本机)
 services:
   postgres:
-    image: pgvector/pgvector:pg17
+    image: ${IMG_PG:-pgvector/pgvector:pg17}
     container_name: lang-postgres-prod
     env_file: .env.prod
     environment:
@@ -50,7 +50,7 @@ services:
       start_period: 5s
 
   migrate:
-    image: migrate/migrate:v4.18.3
+    image: ${IMG_MIGRATE:-migrate/migrate:v4.18.3}
     container_name: lang-migrate-prod
     env_file: .env.prod
     entrypoint:
@@ -68,7 +68,7 @@ services:
         condition: service_healthy
 
   version-service:
-    image: lang-service:prod
+    image: ${IMG_SERVICE:-lang-service:prod}
     container_name: lang-service-prod
     env_file: .env.prod
     environment:
@@ -117,7 +117,7 @@ services:
   #   docker compose --profile build run --rm builder --lang de
   # 复用 version-service 的合并镜像，无需单独构建 Python 镜像
   builder:
-    image: lang-service:prod
+    image: ${IMG_SERVICE:-lang-service:prod}
     container_name: lang-builder-prod
     profiles: ["build"]
     env_file: .env.prod

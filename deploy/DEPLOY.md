@@ -3,12 +3,15 @@
 ## 架构
 
 ```
-Mac (arm64)  ──  buildx  --platform linux/amd64  ──►  tar.gz  ── SCP ──►  Ubuntu 24.04 (amd64)
-                         │                                               │
-                    docker save                                    docker load
-                                                                     │
+Mac (arm64)  ──  buildx --platform linux/amd64  ──►  Docker Hub  ──►  Ubuntu 24.04 (amd64)
+                         │                          (按层复用)            │
+                    docker push                                   docker compose pull
+                                                                        │
                                                               docker compose up -d
 ```
+
+默认仓库：`docker.io/furchtlos`（`lang-service` / `lang-nginx` / `lang-pg` / `lang-migrate`）。
+离线备用仍可走 tar 上传：`make export-all` + `DEPLOY_MODE=tar ./deploy_all.sh`。
 
 ---
 
@@ -87,17 +90,30 @@ certbot certificates   # 查看
 ```bash
 cd language_learner_backend/deploy
 
-# 一键构建所有镜像（amd64）
-make build-all
-# 产物：本地 Docker Desktop 里有 lang-service:prod 等镜像
+# 首次：登录镜像仓库（Token 不要写进仓库；本机执行一次即可）
+docker login -u furchtlos
 
-# 打包导出
-make export-all
-# 产物：dist-images/lang-images-prod-amd64.tar.gz（约 800MB）
+# 构建并推送 service/nginx/base 镜像（amd64）
+make push-all
+# 推送两个 tag：lang-service:prod 和 lang-service:prod-<时间戳>，后者用于回滚
 
-# 上传到服务器
-make upload SERVER=root@your-server-ip DIR=/opt/lang-app
+# 同步部署文件并让服务器拉取镜像 + 启动
+./deploy_all.sh root@your-server-ip /opt/lang-app
 ```
+
+`deploy_all.sh` 默认走仓库模式，只同步 `deploy/content/builder` 等挂载文件，
+镜像由服务器 `docker compose pull` 获取，不再上传 tar 包。
+
+旧 tar 流程（离线备用，按镜像分包）：
+
+```bash
+make build-all
+make export-all     # 生成 lang-service-*.tar.gz 和 lang-base-*.tar.gz
+DEPLOY_MODE=tar ./deploy_all.sh root@your-server-ip /opt/lang-app
+```
+
+分包后 `lang-base`（nginx/pgvector/migrate）通常只在首次上传，
+后续只传 `lang-service`；未变化的包会自动跳过上传和 `docker load`。
 
 或者手动一步步：
 
@@ -117,18 +133,13 @@ scp -r language_learner_backend/builder/builder/ \
 
 ---
 
-## Step 2：服务器端加载 + 启动
+## Step 2：服务器端拉取 + 启动
 
 ```bash
-SSH 到服务器后：
+# 私有仓库需要先登录一次（公有仓库可跳过）
+docker login -u furchtlos
 
 cd /opt/lang-app
-
-# 加载镜像（约 1-2 分钟）
-docker load < dist-images/lang-images-prod-amd64.tar.gz
-
-# 确认镜像都在了
-docker images | grep -E "lang-|pgvector|migrate"
 
 # 准备环境变量（软链接让 docker compose 自动识别）
 ln -sf .env.prod .env
@@ -137,18 +148,24 @@ ln -sf .env.prod .env
 #    PG_PASSWORD / SSO_CLIENT_SECRET / SSO_BASE_URL
 vim .env.prod
 
+# 从镜像仓库拉取最新镜像
+docker compose -f docker-compose.prod.yml pull
+
+# 确认镜像都在了
+docker images | grep -E "furchtlos|pgvector|migrate"
+
 # 启动所有服务
-docker compose up -d
+docker compose -f docker-compose.prod.yml up -d
 
 # 查看启动过程
-docker compose ps
-docker compose logs -f --tail=100 version-service
+docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml logs -f --tail=100 version-service
 
 # 手动跑一次 migration（compose up 自动跑，也可以手动确认）
-docker compose run --rm migrate
+docker compose -f docker-compose.prod.yml run --rm migrate
 
 # 手动跑一次 builder（生产上应该由外部调度）
-docker compose run --rm builder --lang de
+docker compose -f docker-compose.prod.yml run --rm builder --lang de
 ```
 
 ---
@@ -256,8 +273,9 @@ docker compose run --rm migrate
 # 重新跑 builder
 docker compose run --rm builder --lang de
 
-# 版本回滚（如果有旧镜像 tag）
-docker compose up -d version-service  # 只要 tag 对了就拉旧镜像
+# 版本回滚：把 IMG_SERVICE 指向旧的时间戳 tag，重新 pull + up
+# IMG_SERVICE=docker.io/furchtlos/lang-service:prod-20261120-1530 \
+#   docker compose -f docker-compose.prod.yml up -d
 
 # 完全停止
 docker compose down
@@ -271,12 +289,14 @@ docker compose down -v
 ## 更新部署（改了代码后）
 
 ```bash
-# Mac 端
-make build-service              # 只重打 version-service
-make export-all                 # 重新打包
-make upload SERVER=...          # 上传
+# Mac 端：只重打并推送 version-service，然后同步文件 + 服务器 pull
+make push-service
+./deploy_all.sh root@your-server-ip /opt/lang-app
+```
 
-# 服务器端
-docker load < dist-images/lang-images-prod-amd64.tar.gz
-docker compose up -d version-service   # 只重启这个服务
+回滚到上一个镜像：
+
+```bash
+IMG_SERVICE=docker.io/furchtlos/lang-service:prod-20261120-1530 \
+  ./deploy_all.sh root@your-server-ip /opt/lang-app
 ```
