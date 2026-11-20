@@ -747,6 +747,107 @@ func (h *Handler) listeningEvents(c *gin.Context) {
 	}
 }
 
+// --- 听力解析任务状态通知 ---
+
+// listeningStageLabel 把 builder 输出的阶段标记映射为中文状态与通知类型。
+func listeningStageLabel(stage string) (label, eventType string) {
+	switch stage {
+	case "queued":
+		return "未下载", "info"
+	case "downloading":
+		return "下载中", "progress"
+	case "downloaded":
+		return "已下载", "progress"
+	case "parsing_pending":
+		return "未开始解析", "progress"
+	case "parsing":
+		return "解析中", "progress"
+	case "completed":
+		return "已完成", "success"
+	case "failed":
+		return "解析失败", "error"
+	default:
+		return stage, "info"
+	}
+}
+
+// onListeningStage 由 scheduler 回调：同一个 job 只保留一条通知（原地更新），
+// 并通过全局 SSE 推给管理台消息列表。
+func (h *Handler) onListeningStage(jobID, examID, stage, message string) {
+	label, eventType := listeningStageLabel(stage)
+	if message == "" {
+		message = label
+	}
+	title := "听力解析 · " + label
+	payload := map[string]any{
+		"exam_id": examID,
+		"stage":   stage,
+	}
+	ctx := context.Background()
+	id, err := h.store.UpsertNotificationByJob(ctx, jobID, eventType, title, message, payload)
+	if err != nil {
+		h.logger.Printf("upsert listening notification %s: %v", jobID, err)
+	}
+	unread, _ := h.store.CountUnreadNotifications(ctx)
+	globalSSEHub.PublishAll(sseEvent{
+		Type:    "notification",
+		JobID:   jobID,
+		Stage:   stage,
+		Level:   eventType,
+		Message: message,
+		Data: map[string]any{
+			"notification": map[string]any{
+				"id":         id,
+				"job_id":     jobID,
+				"event_type": eventType,
+				"title":      title,
+				"message":    message,
+				"payload":    payload,
+				"created_at": time.Now().Format(time.RFC3339),
+				"read_at":    nil,
+			},
+			"unread_count": unread,
+		},
+	})
+}
+
+// notificationEvents 是管理台消息中心的全局 SSE 端点：只推送任务状态变更通知。
+// 每隔 25 秒发一次 keepalive 防止代理/浏览器断连。
+func (h *Handler) notificationEvents(c *gin.Context) {
+	ch, release := globalSSEHub.SubscribeAll()
+	defer release()
+
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+
+	_, _ = c.Writer.Write([]byte(formatSSE(sseEvent{
+		Type:    "connected",
+		Message: "notification stream connected",
+	})))
+	c.Writer.Flush()
+
+	keepalive := time.NewTicker(25 * time.Second)
+	defer keepalive.Stop()
+
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-keepalive.C:
+			_, _ = c.Writer.Write([]byte(": keepalive\n\n"))
+			c.Writer.Flush()
+		case evt, ok := <-ch:
+			if !ok {
+				return
+			}
+			_, _ = c.Writer.Write([]byte(formatSSE(evt)))
+			c.Writer.Flush()
+		}
+	}
+}
+
 // --- 系统通知 CRUD ---
 
 func (h *Handler) listNotifications(c *gin.Context) {

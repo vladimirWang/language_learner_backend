@@ -62,7 +62,12 @@ type Handler struct {
 
 // New 创建 HTTP 处理器。
 func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, daily DailyWordsConfig, sso SSOConfig, wx wxauth.Config, logger *log.Logger) *Handler {
-	return &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, sso: sso, wx: wx, logger: logger}
+	h := &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, sso: sso, wx: wx, logger: logger}
+	if sch != nil {
+		// 听力解析任务的状态变更 → 消息中心通知 + 全局 SSE
+		sch.SetListeningNotifier(h.onListeningStage)
+	}
+	return h
 }
 
 // Routes 注册全部 API 路由。gin.Engine 实现了 http.Handler，签名保持不变。
@@ -170,6 +175,7 @@ func (h *Handler) Routes() http.Handler {
 	// 系统通知（管理台消息中心）
 	{
 		api.GET("/notifications", h.listNotifications)
+		api.GET("/notifications/stream", h.notificationEvents)
 		api.POST("/notifications/mark-read", h.markNotificationRead)
 	}
 

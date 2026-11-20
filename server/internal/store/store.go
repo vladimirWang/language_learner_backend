@@ -1495,6 +1495,46 @@ func (s *Store) InsertNotification(ctx context.Context, jobID, eventType, title,
 	return n.ID, nil
 }
 
+// UpsertNotificationByJob 为同一个听力任务维护一条状态通知：
+// 存在则原地更新（并重置为未读），不存在则新建。返回通知 id。
+// 听力解析是串行任务，每个 job 只会有一条随状态变化的消息，避免消息列表被刷屏。
+func (s *Store) UpsertNotificationByJob(ctx context.Context, jobID, eventType, title, message string, payload map[string]any) (int64, error) {
+	var id int64
+	if err := s.db.WithContext(ctx).Table("listening_job_notifications").
+		Where("job_id = ?", jobID).
+		Order("id DESC").
+		Limit(1).
+		Pluck("id", &id).Error; err != nil {
+		return 0, err
+	}
+	if id == 0 {
+		return s.InsertNotification(ctx, jobID, eventType, title, message, payload)
+	}
+
+	updates := map[string]any{
+		"event_type": eventType,
+		"title":      title,
+		"message":    message,
+		"created_at": gorm.Expr("now()"),
+		"read_at":    nil,
+	}
+	if payload == nil {
+		updates["payload"] = gorm.Expr("NULL::jsonb")
+	} else {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return 0, err
+		}
+		updates["payload"] = gorm.Expr("?::jsonb", string(raw))
+	}
+	if err := s.db.WithContext(ctx).Model(&ListeningJobNotification{}).
+		Where("id = ?", id).
+		Updates(updates).Error; err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
 // ListNotifications 按创建时间倒序拉取通知；limit 默认 50。
 func (s *Store) ListNotifications(ctx context.Context, limit int) ([]*ListeningJobNotification, error) {
 	if limit <= 0 {

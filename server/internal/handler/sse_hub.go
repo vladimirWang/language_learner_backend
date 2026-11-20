@@ -22,7 +22,7 @@ type sseEvent struct {
 type sseHub struct {
 	mu    sync.RWMutex
 	subs  map[string]map[chan sseEvent]struct{}
-	// 独立的"所有订阅者"扇出——用于广播 keepalive 等全局事件
+	// 独立的全局订阅者扇出——用来推送管理台消息中心的任务状态通知
 	all map[chan sseEvent]struct{}
 }
 
@@ -41,17 +41,30 @@ func (h *sseHub) Subscribe(jobID string) (chan sseEvent, func()) {
 		h.subs[jobID] = make(map[chan sseEvent]struct{})
 	}
 	h.subs[jobID][ch] = struct{}{}
-	h.all[ch] = struct{}{}
 	release := func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		delete(h.all, ch)
 		if set, ok := h.subs[jobID]; ok {
 			delete(set, ch)
 			if len(set) == 0 {
 				delete(h.subs, jobID)
 			}
 		}
+		close(ch)
+	}
+	return ch, release
+}
+
+// SubscribeAll 订阅全局事件（如任务状态变更通知），不区分 jobID。
+func (h *sseHub) SubscribeAll() (chan sseEvent, func()) {
+	ch := make(chan sseEvent, 32)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.all[ch] = struct{}{}
+	release := func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		delete(h.all, ch)
 		close(ch)
 	}
 	return ch, release

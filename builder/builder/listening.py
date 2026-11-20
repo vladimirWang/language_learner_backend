@@ -40,6 +40,14 @@ SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 HAS_TESSERACT = bool(shutil.which("tesseract"))
 
 
+def _stage(stage: str, message: str) -> None:
+    """向 stdout 输出机器可读的阶段标记。
+
+    Go 侧（scheduler）解析该行后更新任务通知并推 SSE；普通日志仍走 logging。
+    """
+    print(f"STAGE {json.dumps({'stage': stage, 'message': message}, ensure_ascii=False)}", flush=True)
+
+
 class ListeningError(RuntimeError):
     """下载 / 转写 / 切分失败。"""
 
@@ -81,11 +89,13 @@ def import_from_url(
     image_dir.mkdir(parents=True)
 
     title = _probe_title(url, cookies)
+    _stage("downloading", "开始下载音视频")
     logger.info("下载 url=%s", url)
     media = _download_best(url, download_dir, cookies)
     is_video = _has_video_stream(media)
     duration = _probe_duration(media)
     logger.info("已保存 %s（%.1fs video=%s）", media.name, duration, is_video)
+    _stage("downloaded", f"音视频已保存：{media.name}")
 
     # 音频轨（独立抽出来，避免后续转码重复解码视频）
     audio_source = media
@@ -95,7 +105,9 @@ def import_from_url(
 
     wav = download_dir / "source16k.wav"
     _to_wav(audio_source, wav)
+    _stage("parsing_pending", "媒体处理完成，等待开始转写")
     logger.info("开始转写 model=%s language=%s", model_name, target_lang)
+    _stage("parsing", f"开始转写 model={model_name}")
     segments = _transcribe(wav, work_root, model_name, target_lang)
     logger.info("转写完成 segments=%d", len(segments))
 

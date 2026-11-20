@@ -46,6 +46,9 @@ var (
 	ErrLowMemory = errors.New("available memory below threshold")
 )
 
+// ListeningNotifier 由 handler 注入：听力解析任务阶段变化时用（持久化通知 + 推 SSE）。
+type ListeningNotifier func(jobID, examID, stage, message string)
+
 // Scheduler 串行调度构建任务。
 type Scheduler struct {
 	store      *store.Store
@@ -53,6 +56,7 @@ type Scheduler struct {
 	minAvailMB int64
 	logger     *log.Logger
 	repoURLs   map[string]string
+	notifier   ListeningNotifier
 
 	mu   sync.Mutex
 	busy bool
@@ -61,6 +65,11 @@ type Scheduler struct {
 // New 创建调度器。
 func New(st *store.Store, rn *runner.Runner, minAvailMB int64, repoURLs map[string]string, logger *log.Logger) *Scheduler {
 	return &Scheduler{store: st, runner: rn, minAvailMB: minAvailMB, repoURLs: repoURLs, logger: logger}
+}
+
+// SetListeningNotifier 设置听力任务阶段变化回调。
+func (s *Scheduler) SetListeningNotifier(fn ListeningNotifier) {
+	s.notifier = fn
 }
 
 // Busy 返回当前是否有构建在跑。
@@ -136,9 +145,15 @@ func (s *Scheduler) runListening(ctx context.Context, jobID, examID, lang string
 		_ = s.store.AppendListeningLog(ctx, jobID, "init", "info",
 			"starting listening import exam="+examID+" lang="+lang)
 	}
+	s.notify(jobID, examID, "queued", "任务已创建，等待下载")
 
 	onLine := func(line string) {
 		s.logger.Printf("[listening %s] %s", jobID, line)
+		// builder 输出的机器可读阶段标记：STAGE {"stage":"downloading","message":"..."}
+		if stage, msg, ok := parseStageMarker(line); ok {
+			s.notify(jobID, examID, stage, msg)
+			return
+		}
 		if s.store != nil {
 			level := parseLogLevel(line)
 			stage := "builder"
@@ -154,12 +169,43 @@ func (s *Scheduler) runListening(ctx context.Context, jobID, examID, lang string
 		s.logger.Printf("listening job %s failed: %v", jobID, err)
 		_ = s.store.AppendListeningLog(ctx, jobID, "runner", "error", err.Error())
 		_ = s.store.FailListeningJob(ctx, jobID, err.Error())
+		s.notify(jobID, examID, "failed", err.Error())
 		return
 	}
 	// 成功：manifest 路径由 builder.listen 写入 work_root/manifest.json；
 	// 这里只把状态置为 built，manifest_path 留空（客户端后续通过扫描目录拿）。
 	_ = s.store.AppendListeningLog(ctx, jobID, "runner", "info", "builder.listen finished")
 	_ = s.store.FinishListeningJob(ctx, jobID, "")
+	s.notify(jobID, examID, "completed", "解析完成，可查看产物与日志")
+}
+
+// stageMarkerPrefix 是 builder 输出的阶段标记前缀。
+const stageMarkerPrefix = "STAGE "
+
+// parseStageMarker 解析 `STAGE {"stage":"downloading","message":"..."}` 行。
+func parseStageMarker(line string) (stage, message string, ok bool) {
+	if !strings.HasPrefix(line, stageMarkerPrefix) {
+		return "", "", false
+	}
+	var payload struct {
+		Stage   string `json:"stage"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(line, stageMarkerPrefix)), &payload); err != nil || payload.Stage == "" {
+		return "", "", false
+	}
+	return payload.Stage, payload.Message, true
+}
+
+// notify 落一条状态日志，并把阶段变化交给 handler（写通知 + 推 SSE）。
+func (s *Scheduler) notify(jobID, examID, stage, message string) {
+	if s.notifier == nil {
+		return
+	}
+	if s.store != nil && message != "" {
+		_ = s.store.AppendListeningLog(context.Background(), jobID, "status", "info", message)
+	}
+	s.notifier(jobID, examID, stage, message)
 }
 
 func (s *Scheduler) run(ctx context.Context, version, lang string) {
