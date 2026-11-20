@@ -64,6 +64,11 @@ COPYFILE_DISABLE=1 tar czf - -C "$LOCAL_ROOT" \
   --exclude='*/deploy/data' \
   --exclude='*/deploy/dist-images' \
   --exclude='*/deploy/nginx/html' \
+  --exclude='*/builder/.venv' \
+  --exclude='*/builder/work' \
+  --exclude='*/builder/.uv-cache' \
+  --exclude='*/__pycache__' \
+  --exclude='*.pyc' \
   language_learner_backend/deploy \
   language_learner_backend/content \
   language_learner_backend/builder \
@@ -71,14 +76,30 @@ COPYFILE_DISABLE=1 tar czf - -C "$LOCAL_ROOT" \
 echo "    ✅ 业务文件已同步"
 
 echo "==> 4/6 上传镜像包 ${TAR_NAME} ($(du -sh "$TAR_PATH" | cut -f1))..."
-scp "$TAR_PATH" "$SERVER:$REMOTE_ROOT/$TAR_NAME"
-echo "    ✅ 上传完成"
+# 镜像没变化时跳过上传（例如只改了挂载进容器的 builder/content，无需重建镜像）。
+LOCAL_SHA="$(shasum -a 256 "$TAR_PATH" | awk '{print $1}')"
+REMOTE_SHA="$(ssh "$SERVER" "sha256sum '$REMOTE_ROOT/$TAR_NAME' 2>/dev/null | awk '{print \$1}'" || true)"
+SKIP_UPLOAD=0
+if [[ -n "$REMOTE_SHA" && "$LOCAL_SHA" == "$REMOTE_SHA" ]]; then
+  echo "    ⏭  服务器已有相同镜像包（sha256=${LOCAL_SHA:0:12}），跳过上传与 load"
+  SKIP_UPLOAD=1
+else
+  # rsync 支持断点续传，网络中断后重跑不会从头再传；没有 rsync 时回退 scp。
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -h -I --partial --progress "$TAR_PATH" "$SERVER:$REMOTE_ROOT/$TAR_NAME"
+  else
+    scp "$TAR_PATH" "$SERVER:$REMOTE_ROOT/$TAR_NAME"
+  fi
+  echo "    ✅ 上传完成"
+fi
 
 echo "==> 5/6 docker load + compose up ..."
 ssh "$SERVER" bash -s <<REMOTE
 set -euo pipefail
 cd "$REMOTE_ROOT/language_learner_backend/deploy"
-docker load < "$REMOTE_ROOT/$TAR_NAME"
+if [[ "$SKIP_UPLOAD" != "1" ]]; then
+  docker load < "$REMOTE_ROOT/$TAR_NAME"
+fi
 ln -sf .env.prod .env
 mkdir -p data/builder-work data/builder-cache
 docker compose -f docker-compose.prod.yml up -d
