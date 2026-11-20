@@ -23,14 +23,13 @@ OUT_DIR := dist-images
 # ---------- 镜像标签 ----------
 TAG ?= prod
 IMG_SERVICE = lang-service:$(TAG)
-IMG_BUILDER = lang-builder:$(TAG)
 IMG_NGINX   = lang-nginx:$(TAG)
 IMG_PG      = pgvector/pgvector:pg17
 IMG_MIGRATE = migrate/migrate:v4.18.3
 
 # ---------- 构建 ----------
-.PHONY: build-all build-service build-builder build-nginx
-build-all: build-service build-builder build-nginx
+.PHONY: build-all build-service build-nginx
+build-all: build-service build-nginx
 	@echo "✅ 全部镜像构建完成（platform=$(PLATFORM)）"
 
 build-service:
@@ -39,15 +38,6 @@ build-service:
 		--platform $(PLATFORM) \
 		-t $(IMG_SERVICE) \
 		-f $(REPO_ROOT)/server/Dockerfile \
-		--load \
-		$(REPO_ROOT)
-
-build-builder:
-	@echo "🔨 构建 $(IMG_BUILDER) ..."
-	docker buildx build \
-		--platform $(PLATFORM) \
-		-t $(IMG_BUILDER) \
-		-f $(REPO_ROOT)/builder/Dockerfile \
 		--load \
 		$(REPO_ROOT)
 
@@ -64,12 +54,12 @@ pull-base:
 	docker pull --platform $(PLATFORM) $(IMG_MIGRATE)
 
 # ---------- 导出 ----------
-.PHONY: export-all export-service export-builder export-nginx
+.PHONY: export-all export-service export-nginx
 export-all: pull-base
 	@mkdir -p $(OUT_DIR)
 	@echo "📦 导出全部镜像到 $(OUT_DIR)/ ..."
 	docker save -o $(OUT_DIR)/lang-images-$(TAG)-amd64.tar \
-		$(IMG_SERVICE) $(IMG_BUILDER) $(IMG_NGINX) $(IMG_PG) $(IMG_MIGRATE)
+		$(IMG_SERVICE) $(IMG_NGINX) $(IMG_PG) $(IMG_MIGRATE)
 	gzip -f $(OUT_DIR)/lang-images-$(TAG)-amd64.tar
 	@echo "✅ $(OUT_DIR)/lang-images-$(TAG)-amd64.tar.gz ($$(du -sh $(OUT_DIR)/lang-images-$(TAG)-amd64.tar.gz | cut -f1))"
 
@@ -107,5 +97,5 @@ logs:
 # ---------- 清理 ----------
 clean:
 	rm -rf $(OUT_DIR)
-	docker rmi $(IMG_SERVICE) $(IMG_BUILDER) $(IMG_NGINX) 2>/dev/null || true
+	docker rmi $(IMG_SERVICE) $(IMG_NGINX) 2>/dev/null || true
 	@echo "✅ 清理完成"

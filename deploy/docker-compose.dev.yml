@@ -22,7 +22,7 @@ services:
   version-service:
     build:
       context: ..
-      dockerfile: server/Dockerfile.dev
+      dockerfile: server/Dockerfile
     container_name: lang-service-dev
     env_file: .env.dev
     environment:

@@ -350,8 +350,13 @@ def _run(cmd: list[str], *, cwd: Path | None = None, allow_stderr: bool = False)
         cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
     if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-5:]
-        raise ListeningError(f"命令失败（{cmd[0]}）：{' | '.join(tail)}")
+        tail = proc.stderr or proc.stdout or ""
+        tail_lines = tail.strip().splitlines()[-5:]
+        msg = f"命令失败（{cmd[0]}）：{' | '.join(tail_lines)}"
+        # B 站对机房 IP 有反爬风控，会直接返回 412，此时需要登录态 cookies
+        if "412" in tail and any("bilibili" in arg.lower() for arg in cmd):
+            msg += "。B 站返回 412（反爬风控），当前服务器 IP 被拦截，请在上传时附带已登录 B 站的 cookies.txt"
+        raise ListeningError(msg)
     if not allow_stderr and proc.stderr.strip():
         logger.debug("%s stderr: %s", cmd[0], proc.stderr.strip()[:300])
     return proc
