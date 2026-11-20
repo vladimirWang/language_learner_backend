@@ -225,14 +225,9 @@ func (h *Handler) listeningFiles(c *gin.Context) {
 
 	files := make([]listeningFile, 0, 32)
 
-	// 确保 zip 缓存存在（不存在则预生成），这样用户可直接在文件列表里下载 zip，
-	// 走 /download 路径，与单文件下载完全一致，避免 /archive 路径被网关限制。
-	zipPath := filepath.Join(dir, examID+".zip")
-	if _, statErr := os.Stat(zipPath); statErr != nil {
-		if err := buildListeningZip(dir, zipPath); err != nil {
-			h.logger.Printf("prebuild listening zip failed: %v", err)
-		}
-	}
+	// zip 不在解析阶段预生成，也不在列表接口顺手生成——否则打开一次详情页
+	// 就会把整个任务目录（含原视频）再复制一份。用户点「打包下载」时再由
+	// listeningDownload 按需生成。
 
 	walkErr := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {

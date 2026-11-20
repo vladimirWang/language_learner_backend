@@ -8,8 +8,6 @@ import logging
 import re
 import shutil
 import subprocess
-import wave
-import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -103,16 +101,17 @@ def import_from_url(
         audio_source = download_dir / "audio_source.m4a"
         _extract_audio(media, audio_source)
 
-    wav = download_dir / "source16k.wav"
-    _to_wav(audio_source, wav)
+    # 直接解码为 16k 单声道 PCM 传给 Whisper，不落盘中间 wav（减少磁盘写入）
     _stage("parsing_pending", "媒体处理完成，等待开始转写")
+    logger.info("解码音频（内存中，不落盘）")
+    audio, sample_rate = _decode_audio(audio_source)
     logger.info("开始转写 model=%s language=%s", model_name, target_lang)
     _stage("parsing", f"开始转写 model={model_name}")
-    segments = _transcribe(wav, work_root, model_name, target_lang)
+    segments = _transcribe(audio, work_root, model_name, target_lang)
     logger.info("转写完成 segments=%d", len(segments))
 
     logger.info("开始说话人分离（对话题用 A/B/C 区分）")
-    speaker_count = assign_speakers(segments, wav)
+    speaker_count = assign_speakers(segments, audio, sample_rate)
     is_dialogue = speaker_count > 1
     logger.info("说话人分离完成 speakers=%d dialogue=%s", speaker_count, is_dialogue)
 
@@ -133,11 +132,11 @@ def import_from_url(
 
         # 视频抽帧 + OCR（有视频轨时）
         if is_video:
-            frame_path = image_dir / f"q{number:02d}.png"
+            frame_path = image_dir / f"q{number:02d}.jpg"
             image_time = question.pop("image_time")
             try:
                 _extract_frame(media, frame_path, image_time)
-                question["image"] = f"images/q{number:02d}.png"
+                question["image"] = f"images/q{number:02d}.jpg"
             except ListeningError as e:
                 logger.debug("抽帧失败（跳过该题图）：%s", e)
                 question["image"] = None
@@ -189,27 +188,8 @@ def import_from_url(
     )
     logger.info("导入完成 manifest=%s questions=%d", manifest_path, len(questions))
 
-    # 清理转写中间产物（16k wav 体积大，转写完成后无保留价值）
-    wav_path = download_dir / "source16k.wav"
-    if wav_path.exists():
-        wav_path.unlink()
-        logger.info("已清理中间产物 %s", wav_path.name)
-
-    # 预生成 zip 包（Store 不压缩），供管理后台直接下载，避免请求时临时打包。
-    zip_path = exam_dir / f"{exam_id}.zip"
-    try:
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
-            for path in exam_dir.rglob("*"):
-                if not path.is_file():
-                    continue
-                if path.name == zip_path.name:
-                    continue
-                if path.name == "source16k.wav":
-                    continue
-                zf.write(path, path.relative_to(exam_dir).as_posix())
-        logger.info("zip 包已生成：%s (%.1f MB)", zip_path.name, zip_path.stat().st_size / 1024 / 1024)
-    except OSError as e:
-        logger.warning("生成 zip 失败（不影响主流程）：%s", e)
+    # zip 不再在解析阶段预生成：体积大且大多数任务不需要下载整包，
+    # 交给管理台在用户点「打包下载」时按需生成，避免解析任务额外写一份全量副本。
 
     return manifest_path
 
@@ -469,30 +449,44 @@ def _extract_audio(source: Path, target: Path) -> None:
     )
 
 
-def _to_wav(source: Path, target: Path) -> None:
-    _run(
-        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
-         "-vn", "-ac", "1", "-ar", "16000", str(target)]
-    )
+def _decode_audio(source: Path) -> tuple[np.ndarray, int]:
+    """用 ffmpeg 把任意媒体解码为 16k 单声道 float32 PCM，全程不落盘。
+
+    之前会先写一份 source16k.wav 再读回内存，长音频动辄几十到上百 MB；
+    这里直接走 stdout 管道，磁盘上不再产生中间 wav。
+    """
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", str(source),
+        "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None and proc.stderr is not None
+    chunks: list[bytes] = []
+    while True:
+        chunk = proc.stdout.read(4 * 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    stderr = proc.stderr.read().decode("utf-8", "replace")
+    return_code = proc.wait()
+    proc.stdout.close()
+    proc.stderr.close()
+    if return_code != 0:
+        tail = " | ".join(stderr.strip().splitlines()[-5:])
+        raise ListeningError(f"音频解码失败：{tail}")
+    data = b"".join(chunks)
+    if not data:
+        raise ListeningError("音频解码结果为空，请检查媒体文件")
+    audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+    return audio, 16000
 
 
-def _read_wav(path: Path) -> tuple[np.ndarray, int]:
-    with wave.open(str(path), "rb") as handle:
-        if handle.getsampwidth() != 2:
-            raise ListeningError("仅支持 16bit PCM 音频")
-        sample_rate = handle.getframerate()
-        frames = handle.readframes(handle.getnframes())
-    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-    return audio, sample_rate
-
-
-def _transcribe(wav: Path, work_root: Path, model_name: str, language: str) -> list[Segment]:
+def _transcribe(audio: np.ndarray, work_root: Path, model_name: str, language: str) -> list[Segment]:
     cache = Path(work_root) / ".models"
     cache.mkdir(parents=True, exist_ok=True)
     logger.info("加载 Whisper 模型 model=%s device=cpu compute=int8 cache=%s", model_name, cache)
     model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=str(cache))
     logger.info("Whisper 模型加载完成，开始转写（可能耗时较久）")
-    audio, _sample_rate = _read_wav(wav)
     segments_iter, _info = model.transcribe(
         audio,
         language=language,
@@ -607,13 +601,17 @@ def _silhouette(points: np.ndarray, labels: np.ndarray) -> float:
     return float(np.mean(scores)) if scores else -1.0
 
 
-def assign_speakers(segments: list[Segment], wav: Path, max_speakers: int = 3) -> int:
+def assign_speakers(
+    segments: list[Segment],
+    audio: np.ndarray,
+    sample_rate: int,
+    max_speakers: int = 3,
+) -> int:
     """轻量说话人分离：基频 + 频谱质心聚类，对话场景给 segment 打 A/B/C 标签。
 
     不依赖 pyannote（CPU 上更快、无需模型下载）。返回识别出的说话人数；
     返回 1 表示独白，此时所有 segment.speaker 保持 None。
     """
-    audio, sample_rate = _read_wav(wav)
     features: list[np.ndarray] = []
     holders: list[Segment] = []
     for seg in segments:
@@ -770,10 +768,11 @@ def _cut_clip(source: Path, target: Path, start: float, end: float) -> None:
 
 
 def _extract_frame(source: Path, target: Path, at_time: float) -> None:
+    # 抽帧只用于题目配图 + OCR，JPEG 比 PNG 小一个数量级，写入压力更低
     _run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
          "-ss", f"{at_time:.2f}", "-i", str(source),
-         "-frames:v", "1", "-q:v", "2", str(target)]
+         "-frames:v", "1", "-q:v", "3", str(target)]
     )
 
 
