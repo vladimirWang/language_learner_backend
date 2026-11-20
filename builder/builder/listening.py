@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -448,7 +449,7 @@ def _has_video_stream(path: Path) -> bool:
 
 def _extract_audio(source: Path, target: Path) -> None:
     _run(
-        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-threads", "1", "-i", str(source),
          "-vn", "-ac", "1", "-ar", "48000", "-c:a", "aac", "-b:a", "96k", str(target)]
     )
 
@@ -460,7 +461,7 @@ def _decode_audio(source: Path) -> tuple[np.ndarray, int]:
     这里直接走 stdout 管道，磁盘上不再产生中间 wav。
     """
     cmd = [
-        "ffmpeg", "-v", "error", "-i", str(source),
+        "ffmpeg", "-v", "error", "-threads", "1", "-i", str(source),
         "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1",
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -489,7 +490,17 @@ def _transcribe(audio: np.ndarray, work_root: Path, model_name: str, language: s
     cache = Path(work_root) / ".models"
     cache.mkdir(parents=True, exist_ok=True)
     logger.info("加载 Whisper 模型 model=%s device=cpu compute=int8 cache=%s", model_name, cache)
-    model = WhisperModel(model_name, device="cpu", compute_type="int8", download_root=str(cache))
+    # 2C 小机器上 Whisper 默认会吃满所有核心，导致同容器里的 Go API 和 PG 被饿死。
+    # 默认单线程，把另一核留给常驻服务；CPU 充裕的机器可用 WHISPER_CPU_THREADS 调大。
+    cpu_threads = max(1, int(os.getenv("WHISPER_CPU_THREADS", "1")))
+    model = WhisperModel(
+        model_name,
+        device="cpu",
+        compute_type="int8",
+        download_root=str(cache),
+        cpu_threads=cpu_threads,
+        num_workers=1,
+    )
     logger.info("Whisper 模型加载完成，开始转写（可能耗时较久）")
     segments_iter, _info = model.transcribe(
         audio,
@@ -767,7 +778,7 @@ def _cut_clip(source: Path, target: Path, start: float, end: float) -> None:
     _run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
          "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
-         "-i", str(source), "-vn", "-c:a", "aac", "-b:a", "96k", str(target)]
+         "-threads", "1", "-i", str(source), "-vn", "-c:a", "aac", "-b:a", "96k", str(target)]
     )
 
 
@@ -775,7 +786,7 @@ def _extract_frame(source: Path, target: Path, at_time: float) -> None:
     # 抽帧只用于题目配图 + OCR，JPEG 比 PNG 小一个数量级，写入压力更低
     _run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-         "-ss", f"{at_time:.2f}", "-i", str(source),
+         "-ss", f"{at_time:.2f}", "-threads", "1", "-i", str(source),
          "-frames:v", "1", "-q:v", "3", str(target)]
     )
 

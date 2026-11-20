@@ -120,8 +120,14 @@ func (h *Handler) listeningImport(c *gin.Context) {
 		args = append(args, "--cookies", cookiesPath)
 	}
 
-	// 触发调度
-	err := h.sched.TriggerListening(jobID, examID, lang, args, nil)
+	// 触发调度。限制 Python 数值库的线程数：2C 机器上 whisper/OpenBLAS 默认会吃满
+	// 所有核心，导致同容器的 Go API 和 PostgreSQL 被 CPU 饿死、请求卡住。
+	err := h.sched.TriggerListening(jobID, examID, lang, args, map[string]string{
+		"OMP_NUM_THREADS":      "1",
+		"MKL_NUM_THREADS":      "1",
+		"OPENBLAS_NUM_THREADS": "1",
+		"NUMEXPR_NUM_THREADS":  "1",
+	})
 	switch {
 	case errors.Is(err, scheduler.ErrBusy):
 		writeError(c, http.StatusConflict, err.Error())
