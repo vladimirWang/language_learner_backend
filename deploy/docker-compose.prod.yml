@@ -19,6 +19,7 @@ services:
       POSTGRES_USER: ${PG_USER}
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       POSTGRES_DB: ${PG_DATABASE}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
@@ -29,12 +30,18 @@ services:
     restart: always
     command:
       - postgres
-      - -c shared_buffers=64MB
-      - -c work_mem=2MB
-      - -c maintenance_work_mem=16MB
-      - -c max_connections=32
-      - -c effective_cache_size=256MB
-      - -c wal_buffers=1MB
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=16MB
+      - -c
+      - max_connections=32
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - wal_buffers=1MB
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${PG_USER} -d $${PG_DATABASE}"]
       interval: 5s
@@ -90,7 +97,7 @@ services:
         condition: service_completed_successfully
 
   nginx:
-    image: nginx:1.27-alpine
+    image: ${IMG_NGINX:-lang-nginx:prod}
     container_name: lang-nginx-prod
     ports:
       - "5080:80"
@@ -98,7 +105,7 @@ services:
     volumes:
       - ./nginx/admin.conf:/etc/nginx/conf.d/default.conf:ro
       - ./nginx/certs:/etc/nginx/certs:ro
-      - ${ADMIN_DIST_DIR:-../../language_learner_frontend/dist}:/usr/share/nginx/html:ro
+      - ./nginx/html:/usr/share/nginx/html:ro
     mem_limit: 64m
     memswap_limit: 64m
     cpus: 0.5
@@ -106,11 +113,12 @@ services:
     depends_on:
       - version-service
 
-  # 一次性构建任务
-  #   docker compose run --rm builder --lang de
+  # 一次性构建任务（默认不随 up -d 启动）
+  #   docker compose --profile build run --rm builder --lang de
   builder:
     image: lang-builder:prod
     container_name: lang-builder-prod
+    profiles: ["build"]
     env_file: .env.prod
     entrypoint: ["uv", "run", "python", "-m", "builder"]
     mem_limit: 1g

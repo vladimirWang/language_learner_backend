@@ -168,7 +168,7 @@ curl -vk https://localhost:5443/api/health
 # 预期：200 + JSON + TLS 协商成功
 
 # PostgreSQL（内部）
-docker exec lang-postgres-prod pg_isready -U lang_app -d lang_learning
+docker exec lang-postgres-prod pg_isready -U postgres -d lang_learning
 
 # 全部容器状态
 docker compose ps
