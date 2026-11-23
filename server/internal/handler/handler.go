@@ -20,6 +20,9 @@ import (
 
 var langPattern = regexp.MustCompile(`^[a-z]{2,5}$`)
 
+// profilePattern 限定考试规则 id，对应 builder/builder/profiles/<id>.json。
+var profilePattern = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
+
 // JobPublisher 抽象异步任务投递，便于在未配置 MQ 时降级。
 type JobPublisher interface {
 	Publish(ctx context.Context, payload any) error
@@ -157,6 +160,7 @@ func (h *Handler) Routes() http.Handler {
 	listening := api.Group("/listening")
 	{
 		listening.POST("/import", h.listeningImport)
+		listening.POST("/upload", h.listeningUpload)
 		listening.POST("/generate", h.listeningGenerate)
 		listening.GET("/jobs", h.listeningJobs)
 		listening.GET("/job/:jobId", h.listeningJobDetail)

@@ -22,11 +22,13 @@ logger = logging.getLogger(__name__)
 
 # 题目分界：Goethe/telc 听力里通常是 "Nummer 1"、"Frage 2"、"Aufgabe 3"。
 # \b 前缀避免把 Rufnummer / Zimmernummer 这类合成词误当成题号提示。
-CUE_RE = re.compile(r"\b(nummer|frage|aufgabe)\s+(\d{1,3}|[a-zäöüß]+)", re.IGNORECASE)
+CUE_RE = re.compile(r"\b(nummer|nr\.?|frage|aufgabe)\s+(\d{1,3}|[a-zäöüß]+)", re.IGNORECASE)
 # Teil 2 的判断题常只出现裸题号（"Sieben?"、"10."），单独一行时视为题号提示。
 BARE_NUM_RE = re.compile(r"^(\d{1,3}|[a-zäöüß]+)[\s\.\!\?,;:]*$", re.IGNORECASE)
 # 相邻题号跨越过大的阈值，超过则视为 ASR 误识别（如把 "Rufnummer 089" 听成第 89 题）
 MAX_CUE_JUMP = 10
+# "Ende Teil 2" 中的 Teil 2 是结束提示，不能当作下一部分的开始
+ENDE_TEIL_RE = re.compile(r"ende\s+teil\s+\w+", re.IGNORECASE)
 NUMBER_WORDS = {
     "eins": 1, "zwei": 2, "drei": 3, "vier": 4, "fünf": 5, "fuenf": 5,
     "sechs": 6, "sieben": 7, "acht": 8, "neun": 9, "zehn": 10,
@@ -35,6 +37,63 @@ NUMBER_WORDS = {
     "neunzehn": 19, "zwanzig": 20,
 }
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# 考试规则文件目录：按考试类型描述 Teil 划分、题号范围和读法。
+PROFILES_DIR = Path(__file__).with_name("profiles")
+PROFILE_ID_RE = re.compile(r"^[a-z0-9-]{1,40}$")
+
+
+@dataclass(frozen=True)
+class ProfileSection:
+    name: str
+    cues: tuple[str, ...]
+    end_cues: tuple[str, ...]
+    start_number: int
+    end_number: int
+
+
+@dataclass(frozen=True)
+class ExamProfile:
+    id: str
+    name: str
+    lang: str
+    total_questions: int
+    number_keywords: tuple[str, ...]
+    sections: tuple[ProfileSection, ...]
+
+    def cue_re(self) -> re.Pattern[str]:
+        keywords = "|".join(re.escape(k) for k in self.number_keywords)
+        return re.compile(rf"\b({keywords})\s+(\d{{1,3}}|[a-zäöüß]+)", re.IGNORECASE)
+
+
+def load_exam_profile(profile_id: str | None) -> ExamProfile | None:
+    """按 id 加载考试规则；为空时返回 None，沿用通用正则规则。"""
+    if not profile_id:
+        return None
+    if not PROFILE_ID_RE.match(profile_id):
+        raise ListeningError(f"非法的 profile id：{profile_id}")
+    path = PROFILES_DIR / f"{profile_id}.json"
+    if not path.is_file():
+        raise ListeningError(f"未找到考试规则：{profile_id}")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    sections = tuple(
+        ProfileSection(
+            name=str(item["name"]),
+            cues=tuple(str(c).lower() for c in item["cues"]),
+            end_cues=tuple(str(c).lower() for c in item.get("end_cues", [])),
+            start_number=int(item["from"]),
+            end_number=int(item["to"]),
+        )
+        for item in raw["sections"]
+    )
+    return ExamProfile(
+        id=str(raw.get("id", profile_id)),
+        name=str(raw.get("name", profile_id)),
+        lang=str(raw.get("lang", "de")),
+        total_questions=int(raw.get("total_questions", 0)),
+        number_keywords=tuple(str(k).lower() for k in raw.get("number_keywords", ["nummer"])),
+        sections=sections,
+    )
 
 # OCR：tesseract 可用才启用，不可用时静默降级。
 HAS_TESSERACT = bool(shutil.which("tesseract"))
@@ -82,12 +141,22 @@ def _stub_after(stage: str) -> None:
 # #endregion
 
 
+@dataclass(frozen=True)
+class Word:
+    start: float
+    end: float
+    text: str
+
+
 @dataclass
 class Segment:
     start: float
     end: float
     text: str
     speaker: str | None = None  # 对话场景下的 A/B/C；独白为 None
+    # 词级时间戳：ASR 常把上一题尾句和下一题的 "Nummer 4" 并进同一 segment，
+    # 只有词级时间才能定位题号提示在 segment 内部的真实起点。
+    words: tuple[Word, ...] = ()
 
 
 def import_from_url(
@@ -101,6 +170,7 @@ def import_from_url(
     model_name: str = "small",
     target_lang: str = "de",
     ocr_enabled: bool = True,
+    profile_id: str | None = None,
 ) -> Path:
     """完整导入流程，返回写出的 manifest 路径。"""
     if not SAFE_ID_RE.match(exam_id):
@@ -172,7 +242,22 @@ def import_from_url(
     _stub_after("speakers")
     # #endregion
 
-    questions = split_questions(segments, duration)
+    profile = load_exam_profile(profile_id)
+    if profile is not None:
+        logger.info("使用考试规则 profile=%s（%s）", profile.id, profile.name)
+    anchor_segments: list[Segment] | None = None
+    if profile is not None and _profile_needs_anchor_repair(segments, duration, profile):
+        # VAD 偶发把整句题号提示（如 "Nummer 4"）过滤掉；关掉 VAD 再转写一遍，
+        # 只用它填补主转写缺失的题号，题目文本仍取自主转写，避免重复内容。
+        logger.warning("部分 Teil/题号提示缺失，使用无 VAD 转写补齐锚点")
+        _stage("parsing", "补齐题号锚点（无 VAD 转写）")
+        anchor_segments = _transcribe(
+            audio, work_root, model_name, target_lang,
+            vad_filter=False, progress=True, progress_label="补转写",
+        )
+    questions = split_questions(
+        segments, duration, profile=profile, anchor_segments=anchor_segments
+    )
     if not questions:
         raise ListeningError("没有识别到题目分界（Nummer/Frage/Aufgabe），请检查音频或人工校对转写")
 
@@ -234,6 +319,7 @@ def import_from_url(
         "model": model_name,
         "duration": round(duration, 2),
         "ocr_enabled": ocr_enabled,
+        "profile": profile.id if profile else None,
         "speaker_count": speaker_count,
         "is_dialogue": is_dialogue,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -255,14 +341,374 @@ def import_from_url(
     return manifest_path
 
 
-def split_questions(segments: Iterable[Segment], duration: float) -> list[dict]:
+def _word_positions(segment: Segment) -> list[tuple[int, Word]]:
+    """把词级时间戳对齐到 segment.text 的字符下标；对齐失败时返回空列表。"""
+    positions: list[tuple[int, Word]] = []
+    cursor = 0
+    for word in segment.words:
+        word_text = word.text.strip()
+        if not word_text:
+            continue
+        index = segment.text.find(word_text, cursor)
+        if index < 0:
+            return []
+        positions.append((index, word))
+        cursor = index + len(word_text)
+    return positions
+
+
+def _time_at(segment: Segment, char_index: int) -> float:
+    """估算 segment.text 中第 char_index 个字符对应的绝对时间。
+
+    优先用词级时间戳精确定位；没有词级时间戳（旧转写结果）时按字符比例回退。
+    """
+    text = segment.text
+    char_index = min(max(char_index, 0), len(text))
+    if char_index == 0:
+        return segment.start
+    if char_index >= len(text):
+        return segment.end
+    for index, word in reversed(_word_positions(segment)):
+        if char_index >= index:
+            length = max(1, len(word.text.strip()))
+            ratio = min(1.0, (char_index - index) / length)
+            return word.start + ratio * (word.end - word.start)
+    ratio = char_index / max(1, len(text))
+    return segment.start + ratio * (segment.end - segment.start)
+
+
+def _text_index_at(segment: Segment, time: float) -> int:
+    """_time_at 的逆运算：把绝对时间换算成 segment.text 的字符下标。"""
+    text = segment.text
+    if time <= segment.start:
+        return 0
+    if time >= segment.end:
+        return len(text)
+    for index, word in _word_positions(segment):
+        if time < word.end:
+            if time <= word.start:
+                return index
+            length = max(1, len(word.text.strip()))
+            ratio = (time - word.start) / max(1e-6, word.end - word.start)
+            return index + int(round(ratio * length))
+    ratio = (time - segment.start) / max(1e-6, segment.end - segment.start)
+    return int(round(ratio * len(text)))
+
+
+def _slice_segment(segment: Segment, start: float, end: float) -> Segment | None:
+    """把 segment 裁剪到 [start, end)，跨边界时按词级时间（或字符比例）截断文本。"""
+    seg_start = max(segment.start, start)
+    seg_end = min(segment.end, end)
+    if seg_end <= seg_start:
+        return None
+    left = _text_index_at(segment, seg_start) if seg_start > segment.start else 0
+    right = _text_index_at(segment, seg_end) if seg_end < segment.end else len(segment.text)
+    text = segment.text[left:right].strip() if right > left else ""
+    if not text:
+        return None
+    words = tuple(
+        word
+        for word in segment.words
+        if seg_start <= (word.start + word.end) / 2 <= seg_end
+    )
+    return Segment(start=seg_start, end=seg_end, text=text, speaker=segment.speaker, words=words)
+
+
+def _make_question(number: int, clip_start: float, clip_end: float, rows_all: list[Segment]) -> dict:
+    """按时间区间生成题目记录，文本区间与音频区间保持一致。
+
+    跨题边界的 segment 会被裁剪：上一题尾句留在上一题，下一题的题号提示
+    归入下一题，避免 "Nummer 3 的结尾跑到 Nummer 4 的头部"。
+    """
+    clip_start = max(0.0, clip_start)
+    clip_end = max(clip_start + 1.0, clip_end)
+    image_time = clip_start + (clip_end - clip_start) * 0.45
+    rows: list[Segment] = []
+    for row in rows_all:
+        if row.end <= clip_start or row.start >= clip_end:
+            continue
+        if row.start >= clip_start and row.end <= clip_end:
+            rows.append(row)
+            continue
+        # 只与题目区间轻微重叠的 segment 视为噪声，避免把半句残片带进来
+        if min(row.end, clip_end) - max(row.start, clip_start) < 0.2:
+            continue
+        sliced = _slice_segment(row, clip_start, clip_end)
+        if sliced is not None:
+            rows.append(sliced)
+    question_speakers = sorted({row.speaker for row in rows if row.speaker})
+    return {
+        "number": number,
+        "start": round(clip_start, 2),
+        "end": round(clip_end, 2),
+        "image_time": round(image_time, 2),
+        "audio": f"audio/q{number:02d}.m4a",
+        "image": None,
+        "ocr_text": None,
+        "transcript": _join_with_speakers(rows),
+        "speakers": question_speakers,
+        "answer": None,
+        "options": [],
+    }
+
+
+def _norm_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def _fill_section_positions(
+    section: ProfileSection,
+    section_start: float,
+    section_end: float,
+    found: list[tuple[int, float]],
+) -> dict[int, float]:
+    """把该 Teil 内的题号补齐成连续序列。
+
+    found 是按时间升序、已识别出的 (题号, 起点)。缺失的题号在相邻锚点间等分；
+    段首/段尾缺失时分别向 Teil 开头、结尾等分，保证题号范围完整。
+    """
+    numbers = range(section.start_number, section.end_number + 1)
+    if not found:
+        step = (section_end - section_start) / max(1, len(numbers))
+        return {n: section_start + step * i for i, n in enumerate(numbers)}
+
+    positions: dict[int, float] = {}
+    for index, (number, start) in enumerate(found):
+        positions[number] = start
+        if index + 1 < len(found):
+            next_number, next_start = found[index + 1]
+            gap = next_number - number
+            if gap > 1:
+                step = (next_start - start) / gap
+                for k in range(1, gap):
+                    positions[number + k] = start + step * k
+
+    first_number, first_start = found[0]
+    if first_number > section.start_number:
+        missing = first_number - section.start_number
+        step = (first_start - section_start) / missing
+        for k in range(missing):
+            positions[section.start_number + k] = section_start + step * k
+
+    last_number, last_start = found[-1]
+    if last_number < section.end_number:
+        missing = section.end_number - last_number
+        step = (section_end - last_start) / (missing + 1)
+        for k in range(1, missing + 1):
+            positions[last_number + k] = last_start + step * k
+
+    return positions
+
+
+def _find_section_starts(rows: Iterable[Segment], profile: ExamProfile) -> dict[str, float]:
+    """定位每个 Teil 的起点；找不到的 Teil 不会出现在结果里。"""
+    section_starts: dict[str, float] = {}
+    for row in rows:
+        # "Ende Teil 2" 里的 "teil 2" 不是 Teil 2 的开始，先剔除再匹配
+        text = ENDE_TEIL_RE.sub(" ", _norm_text(row.text))
+        for section in profile.sections:
+            if section.name in section_starts:
+                continue
+            if any(cue in text for cue in section.cues):
+                section_starts[section.name] = row.start
+    return section_starts
+
+
+def _section_anchor_rows(
+    rows: Iterable[Segment], section: ProfileSection, section_start: float, section_limit: float
+) -> list[Segment]:
+    return [row for row in rows if section_start <= row.start < section_limit]
+
+
+def _collect_section_anchors(
+    rows: Iterable[Segment],
+    section: ProfileSection,
+    section_start: float,
+    section_limit: float,
+    cue_re: re.Pattern[str],
+) -> list[tuple[int, float]]:
+    """收集一个 Teil 内已识别到的 (题号, 起点)，题号必须递增且落在本 Teil 范围内。"""
+    found: list[tuple[int, float]] = []
+    for row in _section_anchor_rows(rows, section, section_start, section_limit):
+        matches = list(cue_re.finditer(row.text))
+        for match in matches:
+            number = _cue_number(match.group(2))
+            if number is None:
+                continue
+            # 题号提示可能与上一题尾句同处一个 segment，取提示本身的词级起点
+            cue_time = _time_at(row, match.start())
+            # 只接受落在本 Teil 题号范围内的锚点，过滤电话号码等假数字
+            if not (section.start_number <= number <= section.end_number):
+                continue
+            if found and number <= found[-1][0]:
+                continue
+            found.append((number, cue_time))
+        if matches:
+            continue
+        bare = BARE_NUM_RE.match(row.text.strip())
+        if bare:
+            number = _cue_number(bare.group(1))
+            if number is None:
+                continue
+            if not (section.start_number <= number <= section.end_number):
+                continue
+            if found and number <= found[-1][0]:
+                continue
+            found.append((number, row.start))
+    return found
+
+
+def _profile_needs_anchor_repair(
+    rows_all: list[Segment], duration: float, profile: ExamProfile
+) -> bool:
+    """判断是否有影响切分精度的锚点缺失。
+
+    ASR 的 VAD 偶尔会把一整段（含 "Nummer 4"）过滤掉，导致题号只能靠等分补齐。
+    只有当缺失题号跨越较长音频（等分会明显偏）时才值得再跑一遍无 VAD 转写。
+    """
+    section_starts = _find_section_starts(rows_all, profile)
+    if len(section_starts) < len(profile.sections):
+        return True
+    cue_re = profile.cue_re()
+    for index, section in enumerate(profile.sections):
+        section_limit = (
+            section_starts[profile.sections[index + 1].name]
+            if index + 1 < len(profile.sections)
+            else duration
+        )
+        found = _collect_section_anchors(
+            rows_all, section, section_starts[section.name], section_limit, cue_re
+        )
+        if not found:
+            # 整个 Teil 一个题号都没识别到，等分补齐全靠猜，值得补转写
+            return True
+        for (number, start), (next_number, next_start) in zip(found, found[1:]):
+            if next_number - number > 1 and next_start - start > 45:
+                return True
+    return False
+
+
+def _split_with_profile(
+    rows_all: list[Segment],
+    duration: float,
+    profile: ExamProfile,
+    anchor_rows: list[Segment] | None = None,
+) -> list[dict]:
+    """按考试规则切分：先找 Teil，再在各 Teil 的题号范围内找题号。
+
+    anchor_rows 只用于找题号锚点（可包含无 VAD 补转写的结果），
+    题目文本仍取自 rows_all，避免重复内容进入 transcript。
+    """
+    anchors_all = anchor_rows if anchor_rows is not None else rows_all
+    section_starts = _find_section_starts(rows_all, profile)
+    if len(section_starts) < len(profile.sections):
+        # 主转写缺少 Teil 锚点时，用补转写再找一遍
+        section_starts = _find_section_starts([*rows_all, *anchors_all], profile)
+
+    if len(section_starts) < len(profile.sections):
+        logger.warning(
+            "profile %s 只找到 %d/%d 个 Teil 锚点，回退通用切分",
+            profile.id, len(section_starts), len(profile.sections),
+        )
+        return _split_with_legacy(rows_all, duration)
+
+    cue_re = profile.cue_re()
+    starts_by_number: dict[int, float] = {}
+    last_question_end: dict[int, float] = {}
+
+    for index, section in enumerate(profile.sections):
+        section_start = section_starts[section.name]
+        section_limit = (
+            section_starts[profile.sections[index + 1].name]
+            if index + 1 < len(profile.sections)
+            else duration
+        )
+        # "Ende Teil X" 之后是下一部分的说明，不应算进本题音频。
+        # 结束提示也可能只出现在补转写里，所以两路结果一起找。
+        content_rows = [*rows_all, *anchors_all] if anchor_rows is not None else rows_all
+        content_end = section_limit
+        for row in _section_anchor_rows(content_rows, section, section_start, section_limit):
+            text = _norm_text(row.text)
+            if any(cue in text for cue in section.end_cues):
+                content_end = min(content_end, row.start)
+
+        found = _collect_section_anchors(
+            rows_all, section, section_start, section_limit, cue_re
+        )
+        if anchor_rows is not None:
+            # 补转写可能时间略有漂移：主转写已找到的题号保持原锚点，
+            # 只用补转写填补缺失题号。
+            have = {number for number, _ in found}
+            extra = _collect_section_anchors(
+                anchors_all, section, section_start, section_limit, cue_re
+            )
+            found.extend(
+                (number, cue_time) for number, cue_time in extra if number not in have
+            )
+            found.sort(key=lambda item: item[0])
+            deduped: list[tuple[int, float]] = []
+            for number, cue_time in found:
+                if deduped and number <= deduped[-1][0]:
+                    continue
+                deduped.append((number, cue_time))
+            found = deduped
+        starts_by_number.update(
+            _fill_section_positions(section, section_start, content_end, found)
+        )
+        last_question_end[section.end_number] = content_end
+
+    expected = [
+        number
+        for section in profile.sections
+        for number in range(section.start_number, section.end_number + 1)
+    ]
+    if profile.total_questions and len(expected) != profile.total_questions:
+        logger.warning(
+            "profile %s 题号范围合计 %d，与 total_questions=%d 不一致",
+            profile.id, len(expected), profile.total_questions,
+        )
+
+    # 第 1 题从视频开头起算，保留开头的考试说明
+    if rows_all and expected:
+        intro_start = max(0.0, rows_all[0].start - 0.3)
+        if intro_start < starts_by_number[expected[0]]:
+            starts_by_number[expected[0]] = intro_start
+
+    questions: list[dict] = []
+    for index, number in enumerate(expected):
+        start = starts_by_number[number]
+        end = starts_by_number[expected[index + 1]] if index + 1 < len(expected) else duration
+        # 每个 Teil 的最后一题截止到 "Ende Teil X"，避免把下一部分的说明带进本题
+        end = min(end, last_question_end.get(number, end))
+        questions.append(_make_question(number, start, end, rows_all))
+    return questions
+
+
+def split_questions(
+    segments: Iterable[Segment],
+    duration: float,
+    profile: ExamProfile | None = None,
+    *,
+    anchor_segments: Iterable[Segment] | None = None,
+) -> list[dict]:
     """按题号提示切分，返回题目列表；没有可用提示时返回空列表。
 
     转写质量不稳时会出现两类问题，这里一并处理：
     1. 一句里挤进多个题号（"Nummer 4, Nummer 5, Nummer 6"）→ 全部收集
     2. 题号整句被漏识别（如 "Nummer 2" 没转出来）→ 相邻锚点之间等分补齐
+
+    anchor_segments 可选：额外用于定位题号锚点（例如关闭 VAD 的补转写结果），
+    题目文本仍由 segments 生成。
     """
     rows_all = list(segments)
+    if profile is not None:
+        anchors = list(anchor_segments) if anchor_segments is not None else None
+        return _split_with_profile(rows_all, duration, profile, anchor_rows=anchors)
+    return _split_with_legacy(rows_all, duration)
+
+
+def _split_with_legacy(rows_all: list[Segment], duration: float) -> list[dict]:
+    """通用规则：不依赖考试类型，只按 "Nummer/Nr." 锚点切分。"""
     anchors: list[tuple[int, float]] = []
 
     def accept(number: int | None, start: float) -> None:
@@ -278,7 +724,8 @@ def split_questions(segments: Iterable[Segment], duration: float) -> list[dict]:
         matches = list(CUE_RE.finditer(row.text))
         if matches:
             for match in matches:
-                accept(_cue_number(match.group(2)), row.start)
+                # 与 profile 模式一致：用题号提示自身的词级起点，而不是整段起点
+                accept(_cue_number(match.group(2)), _time_at(row, match.start()))
             continue
         # 整句只有一个裸题号（Teil 2 常见）
         bare = BARE_NUM_RE.match(row.text.strip())
@@ -299,30 +746,20 @@ def split_questions(segments: Iterable[Segment], duration: float) -> list[dict]:
         else:
             cues.append((number, start))
 
+    # 第 1 题从视频开头起算，避免把开头的考试说明（"Teil 1 / Was ist richtig? ..."）
+    # 切在第 1 题之外——ASR 已识别，但之前没有归属到任何题目。
+    if cues and rows_all:
+        intro_start = max(0.0, rows_all[0].start - 0.3)
+        if intro_start < cues[0][1]:
+            cues[0] = (cues[0][0], intro_start)
+
     questions: list[dict] = []
     for index, (number, start) in enumerate(cues):
         end = cues[index + 1][1] if index + 1 < len(cues) else duration
-        clip_start = max(0.0, start - 0.3)
-        clip_end = max(clip_start + 1.0, end - 0.3)
-        # 视频抽帧选每题中段（题干刚出、选项画面稳定）
-        image_time = clip_start + (clip_end - clip_start) * 0.45
-        rows = [row for row in rows_all if start - 0.2 <= (row.start + row.end) / 2 < end - 0.2]
-        question_speakers = sorted({row.speaker for row in rows if row.speaker})
-        questions.append(
-            {
-                "number": number,
-                "start": round(clip_start, 2),
-                "end": round(clip_end, 2),
-                "image_time": round(image_time, 2),
-                "audio": f"audio/q{number:02d}.m4a",
-                "image": None,
-                "ocr_text": None,
-                "transcript": _join_with_speakers(rows),
-                "speakers": question_speakers,
-                "answer": None,
-                "options": [],
-            }
-        )
+        # 起点直接用本题锚点：第 1 题已在上面扩展到视频开头；
+        # 其余题目不再向前多取 0.3s，否则会把上一题结尾的对话一起截进来。
+        # 终点直接取下一题锚点，保证本题音频完整。
+        questions.append(_make_question(number, start, end, rows_all))
     return questions
 
 
@@ -550,7 +987,16 @@ def _decode_audio(source: Path) -> tuple[np.ndarray, int]:
     return audio, 16000
 
 
-def _transcribe(audio: np.ndarray, work_root: Path, model_name: str, language: str) -> list[Segment]:
+def _transcribe(
+    audio: np.ndarray,
+    work_root: Path,
+    model_name: str,
+    language: str,
+    *,
+    vad_filter: bool = True,
+    progress: bool = True,
+    progress_label: str = "转写中",
+) -> list[Segment]:
     cache = Path(work_root) / ".models"
     cache.mkdir(parents=True, exist_ok=True)
     logger.info("加载 Whisper 模型 model=%s device=cpu compute=int8 cache=%s", model_name, cache)
@@ -569,21 +1015,31 @@ def _transcribe(audio: np.ndarray, work_root: Path, model_name: str, language: s
     segments_iter, _info = model.transcribe(
         audio,
         language=language,
-        vad_filter=True,
+        vad_filter=vad_filter,
         beam_size=5,
         condition_on_previous_text=False,
+        # 词级时间戳用于定位 segment 内部的题号提示（如 "ich Handball. Nummer 4."）
+        word_timestamps=True,
     )
     # faster_whisper 的 segments 是 generator，边解包边打进度
     segments: list[Segment] = []
+    total_seconds = float(getattr(_info, "duration", 0.0) or 0.0)
     for seg in segments_iter:
         segments.append(Segment(
             start=round(seg.start, 2),
             end=round(seg.end, 2),
             text=seg.text.strip(),
+            words=tuple(
+                Word(start=round(word.start, 2), end=round(word.end, 2), text=word.word)
+                for word in (seg.words or [])
+            ),
         ))
         if len(segments) % 20 == 0:
             logger.info("转写中已处理 %d 个 segment（最后时刻 %.1fs）",
                         len(segments), seg.end)
+            if progress:
+                # STAGE 会同步到管理台/desktop 的进度显示，避免长转写看起来卡死
+                _stage("parsing", f"{progress_label}：{seg.end:.0f}s / {total_seconds:.0f}s")
     logger.info("转写完成 segments=%d", len(segments))
     return [seg for seg in segments if seg.text.strip()]
 
@@ -808,11 +1264,17 @@ def write_transcript_files(
         lines.append("=" * 76)
         lines.append(f"Frage {question['number']}  [{_fmt_time(start)} - {_fmt_time(end)}]")
         lines.append("=" * 76)
-        rows = [
-            seg
-            for seg in segments
-            if start - 0.2 <= (seg.start + seg.end) / 2 < end - 0.2
-        ]
+        # 与题目清单一致：跨题边界的 segment 按时间裁剪后再展示
+        rows: list[Segment] = []
+        for seg in segments:
+            if seg.end <= start or seg.start >= end:
+                continue
+            if seg.start >= start and seg.end <= end:
+                rows.append(seg)
+                continue
+            sliced = _slice_segment(seg, start, end)
+            if sliced is not None:
+                rows.append(sliced)
         for seg in rows:
             prefix = f"[{seg.speaker}] " if seg.speaker else ""
             lines.append(f"{prefix}{_fmt_time(seg.start)} - {_fmt_time(seg.end)}  {seg.text}")
@@ -838,11 +1300,27 @@ def write_transcript_files(
     return [json_path, text_path, srt_path]
 
 
+# 每题音频首尾各补 1 秒静音：开头留出准备时间，结尾避免和下一题紧贴。
+CLIP_GAP_SECONDS = 1.0
+
+
 def _cut_clip(source: Path, target: Path, start: float, end: float) -> None:
+    """截取 [start, end) 并首尾补 CLIP_GAP_SECONDS 静音。
+
+    - `-ss/-t` 作为输入选项：ffmpeg 会先 seek 再精确丢弃到时间点，
+      既快又不会像 `-to` 那样把上一题的尾音带进来；
+    - `adelay` 在开头插入静音，`apad` 在结尾补齐静音；
+    - 重新编码 AAC，保证拼接后的时长精确等于「内容时长 + 两段 gap」。
+    """
+    duration = max(0.5, end - start)
+    gap_ms = int(CLIP_GAP_SECONDS * 1000)
     _run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-         "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
-         "-threads", "1", "-i", str(source), "-vn", "-c:a", "aac", "-b:a", "96k", str(target)]
+         "-ss", f"{start:.2f}", "-t", f"{duration:.2f}",
+         "-threads", "1", "-i", str(source),
+         "-vn",
+         "-af", f"adelay={gap_ms}:all=1,apad=pad_dur={CLIP_GAP_SECONDS}",
+         "-c:a", "aac", "-b:a", "96k", str(target)]
     )
 
 

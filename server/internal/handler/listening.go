@@ -36,6 +36,7 @@ func (h *Handler) listeningImport(c *gin.Context) {
 	examID := strings.TrimSpace(c.Request.FormValue("examId"))
 	lang := strings.TrimSpace(c.Request.FormValue("lang"))
 	model := strings.TrimSpace(c.Request.FormValue("model"))
+	profile := strings.TrimSpace(c.Request.FormValue("profile"))
 
 	if url == "" {
 		writeError(c, http.StatusBadRequest, "url is required")
@@ -51,6 +52,10 @@ func (h *Handler) listeningImport(c *gin.Context) {
 	}
 	if model == "" {
 		model = "small"
+	}
+	if profile != "" && !profilePattern.MatchString(profile) {
+		writeError(c, http.StatusBadRequest, "invalid profile id (e.g. goethe-a1)")
+		return
 	}
 
 	// 生成 job_id
@@ -112,6 +117,9 @@ func (h *Handler) listeningImport(c *gin.Context) {
 		"--lang", lang,
 		"--target-lang", lang,
 		"--model", model,
+	}
+	if profile != "" {
+		args = append(args, "--profile", profile)
 	}
 	if answersPath != "" {
 		args = append(args, "--answers", answersPath)

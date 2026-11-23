@@ -27,6 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--answers", help="官方答案 CSV：题号,答案")
     parser.add_argument("--cookies", help="yt-dlp cookies 文件（B 站登录态）")
     parser.add_argument("--model", default=os.getenv("WHISPER_MODEL", "small"), help="whisper 模型")
+    parser.add_argument("--profile", default="", help="考试规则 id，如 goethe-a1；留空使用通用规则")
     args = parser.parse_args(argv)
 
     settings = Settings.from_env()
@@ -40,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
             cookies=Path(args.cookies) if args.cookies else None,
             model_name=args.model,
             target_lang=args.target_lang,
+            profile_id=args.profile or None,
         )
     except listening.ListeningError as exc:
         logging.error("import failed: %s", exc)

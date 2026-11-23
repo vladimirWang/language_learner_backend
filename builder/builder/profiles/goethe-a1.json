@@ -1,0 +1,30 @@
+{
+  "id": "goethe-a1",
+  "name": "Goethe-Zertifikat A1 听力",
+  "lang": "de",
+  "total_questions": 15,
+  "number_keywords": ["nummer", "nr.", "frage", "aufgabe"],
+  "sections": [
+    {
+      "name": "Teil 1",
+      "cues": ["teil eins", "teil 1"],
+      "end_cues": ["ende teil eins", "ende teil 1"],
+      "from": 1,
+      "to": 6
+    },
+    {
+      "name": "Teil 2",
+      "cues": ["teil zwei", "teil 2"],
+      "end_cues": ["ende teil zwei", "ende teil 2"],
+      "from": 7,
+      "to": 10
+    },
+    {
+      "name": "Teil 3",
+      "cues": ["teil drei", "teil 3"],
+      "end_cues": ["ende teil drei", "ende teil 3"],
+      "from": 11,
+      "to": 15
+    }
+  ]
+}
