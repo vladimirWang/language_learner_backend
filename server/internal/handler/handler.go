@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/wangfernando/language-learner/server/internal/challenge"
 	"github.com/wangfernando/language-learner/server/internal/llm"
 	"github.com/wangfernando/language-learner/server/internal/scheduler"
 	"github.com/wangfernando/language-learner/server/internal/storage"
@@ -61,11 +62,15 @@ type Handler struct {
 
 	// 微信小程序登录配置。
 	wx wxauth.Config
+
+	// 每日关卡生成器（真值表 + 模板出题）。
+	challenge *challenge.Builder
 }
 
 // New 创建 HTTP 处理器。
 func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, daily DailyWordsConfig, sso SSOConfig, wx wxauth.Config, logger *log.Logger) *Handler {
 	h := &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, sso: sso, wx: wx, logger: logger}
+	h.challenge = challenge.NewBuilder(st)
 	if sch != nil {
 		// 听力解析任务的状态变更 → 消息中心通知 + 全局 SSE
 		sch.SetListeningNotifier(h.onListeningStage)
@@ -196,6 +201,24 @@ func (h *Handler) Routes() http.Handler {
 		tests.POST("/:id/exams", h.addLevelExam)
 		tests.DELETE("/:id/exams/:examId", h.removeLevelExam)
 		tests.GET("/:id/exams/available", h.listAvailableExams)
+	}
+
+	// 每日关卡：全局统一关卡，身份取自微信登录 token。
+	levels := api.Group("/levels")
+	{
+		levels.GET("/today", h.dailyChallengeToday)
+		levels.POST("/:id/submit", h.submitDailyChallenge)
+		levels.GET("/calendar", h.dailyChallengeCalendar)
+		levels.GET("/streak", h.dailyChallengeStreak)
+	}
+
+	// 管理台每日关卡维护：列表、预览、重新生成、发布。
+	adminLevels := api.Group("/admin/levels")
+	{
+		adminLevels.GET("", h.adminListChallenges)
+		adminLevels.GET("/:day", h.adminGetChallenge)
+		adminLevels.POST("/:day/regenerate", h.adminRegenerateChallenge)
+		adminLevels.PATCH("/:day", h.adminUpdateChallenge)
 	}
 
 	// 口语题库与兜底话术

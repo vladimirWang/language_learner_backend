@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/wangfernando/language-learner/server/internal/challenge"
 	"github.com/wangfernando/language-learner/server/internal/config"
 	"github.com/wangfernando/language-learner/server/internal/handler"
 	"github.com/wangfernando/language-learner/server/internal/llm"
@@ -87,6 +88,8 @@ func main() {
 		RateLimit: cfg.DailyWordsRateLimit,
 		Location:  loc,
 	}
+	// 每日关卡：启动时补当天内容，之后每天 00:05（APP_TZ）生成。
+	challenge.NewScheduler(challenge.NewBuilder(st), loc, logger).Start(ctx)
 	ssoCfg := handler.SSOConfig{
 		BaseURL:       cfg.SSOBaseURL,
 		PublicBaseURL: cfg.SSOPublicBaseURL,
