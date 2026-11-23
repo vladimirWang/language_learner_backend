@@ -184,18 +184,18 @@ func (h *Handler) Routes() http.Handler {
 		api.POST("/notifications/mark-read", h.markNotificationRead)
 	}
 
-	// 关卡配置
-	levels := api.Group("/levels")
+	// 测试配置（原「关卡」）。/api/levels 留给新的每日关卡模块，不做旧路径兼容。
+	tests := api.Group("/tests")
 	{
-		levels.GET("", h.listLevels)
-		levels.POST("", h.createLevel)
-		levels.GET("/:id", h.getLevel)
-		levels.PUT("/:id", h.updateLevel)
-		levels.DELETE("/:id", h.deleteLevel)
-		levels.GET("/:id/exams", h.listLevelExams)
-		levels.POST("/:id/exams", h.addLevelExam)
-		levels.DELETE("/:id/exams/:examId", h.removeLevelExam)
-		levels.GET("/:id/exams/available", h.listAvailableExams)
+		tests.GET("", h.listLevels)
+		tests.POST("", h.createLevel)
+		tests.GET("/:id", h.getLevel)
+		tests.PUT("/:id", h.updateLevel)
+		tests.DELETE("/:id", h.deleteLevel)
+		tests.GET("/:id/exams", h.listLevelExams)
+		tests.POST("/:id/exams", h.addLevelExam)
+		tests.DELETE("/:id/exams/:examId", h.removeLevelExam)
+		tests.GET("/:id/exams/available", h.listAvailableExams)
 	}
 
 	// 口语题库与兜底话术

@@ -104,10 +104,10 @@ type LogEntry struct {
 func (LogEntry) TableName() string { return "build_logs" }
 
 // ---------------------------------------------------------------------------
-// 关卡配置（levels / level_exams）
+// 测试配置（tests / test_items，原名 levels / level_exams）
 // ---------------------------------------------------------------------------
 
-// Level 对应 levels 一行：管理员维护的学习关卡。
+// Level 对应 tests 一行：管理员维护的学习测试。
 type Level struct {
 	ID          int64     `gorm:"primaryKey;column:id" json:"id"`
 	Name        string    `gorm:"column:name" json:"name"`
@@ -120,9 +120,9 @@ type Level struct {
 	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
 }
 
-func (Level) TableName() string { return "levels" }
+func (Level) TableName() string { return "tests" }
 
-// LevelExam 对应 level_exams 一行：关卡与题目（听力 exam / 口语题目）的关联。
+// LevelExam 对应 test_items 一行：测试与题目（听力 exam / 口语题目）的关联。
 type LevelExam struct {
 	ID        int64     `gorm:"primaryKey;column:id" json:"-"`
 	LevelID   int64     `gorm:"column:level_id" json:"level_id"`
@@ -132,7 +132,7 @@ type LevelExam struct {
 	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
 }
 
-func (LevelExam) TableName() string { return "level_exams" }
+func (LevelExam) TableName() string { return "test_items" }
 
 // SpeakingItem 对应 speaking_items 一行：口语固定问答题库。
 type SpeakingItem struct {
@@ -670,7 +670,7 @@ func (s *Store) UpdateLevel(ctx context.Context, id int64, name, difficulty, des
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if active {
 			var cnt int64
-			if err := tx.Table("level_exams").Where("level_id = ?", id).Count(&cnt).Error; err != nil {
+			if err := tx.Table("test_items").Where("level_id = ?", id).Count(&cnt).Error; err != nil {
 				return err
 			}
 			if cnt == 0 {
@@ -695,7 +695,7 @@ func (s *Store) SetLevelActive(ctx context.Context, id int64, active bool) error
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if active {
 			var cnt int64
-			if err := tx.Table("level_exams").Where("level_id = ?", id).Count(&cnt).Error; err != nil {
+			if err := tx.Table("test_items").Where("level_id = ?", id).Count(&cnt).Error; err != nil {
 				return err
 			}
 			if cnt == 0 {
@@ -711,7 +711,7 @@ func (s *Store) SetLevelActive(ctx context.Context, id int64, active bool) error
 	})
 }
 
-// DeleteLevel 删除关卡（级联删除 level_exams）。
+// DeleteLevel 删除测试（级联删除 test_items）。
 func (s *Store) DeleteLevel(ctx context.Context, id int64) error {
 	return s.db.WithContext(ctx).Delete(&Level{}, id).Error
 }
@@ -952,7 +952,7 @@ func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamI
 	rows := make([]LevelExamInfo, 0)
 	// 听力 exam 与历史遗留的单题口语关联。
 	if err := s.db.WithContext(ctx).
-		Table("level_exams le").
+		Table("test_items le").
 		Select(`le.exam_id, le.item_type, le.sort_order, le.created_at,
 			COALESCE(j.lang, si.lang, '') AS lang,
 			COALESCE(j.source_url, '') AS source_url,
@@ -968,11 +968,11 @@ func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamI
 
 	plans := make([]LevelExamInfo, 0)
 	err := s.db.WithContext(ctx).
-		Table("level_exams le").
+		Table("test_items le").
 		Select(`le.exam_id, le.item_type, le.sort_order, le.created_at,
 			COALESCE(p.lang, l.lang, '') AS lang, '' AS source_url,
 			COALESCE(NULLIF(p.name, ''), le.exam_id) AS name`).
-		Joins("LEFT JOIN levels l ON l.id = le.level_id").
+		Joins("LEFT JOIN tests l ON l.id = le.level_id").
 		Joins("LEFT JOIN speaking_exam_plans p ON le.item_type = 'speaking_plan' AND p.id::text = le.exam_id AND p.active = true").
 		Joins("LEFT JOIN speaking_items si_topic ON le.item_type = 'speaking_topic' AND si_topic.item_key = le.exam_id AND si_topic.active = true").
 		Where(`le.level_id = ? AND
@@ -1031,7 +1031,7 @@ func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]Availa
 		FROM listening_jobs
 		WHERE status = 'built' AND deleted_at IS NULL AND has_answers = true
 		  AND exam_id NOT IN (
-		      SELECT exam_id FROM level_exams WHERE level_id = ? AND item_type = 'listening'
+		      SELECT exam_id FROM test_items WHERE level_id = ? AND item_type = 'listening'
 		  )
 		UNION ALL
 		SELECT 'speaking_plan' AS item_type, p.id::text AS exam_id,
@@ -1041,7 +1041,7 @@ func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]Availa
 		WHERE p.active = true AND p.lang = ? AND p.level = ?
 		  AND EXISTS (SELECT 1 FROM speaking_exam_plan_items i WHERE i.plan_id = p.id)
 		  AND p.id::text NOT IN (
-		      SELECT exam_id FROM level_exams WHERE level_id = ? AND item_type = 'speaking_plan'
+		      SELECT exam_id FROM test_items WHERE level_id = ? AND item_type = 'speaking_plan'
 		  )
 		ORDER BY item_type ASC, created_at DESC
 	`, levelID, lv.Lang, lv.Difficulty, levelID).Scan(&rows).Error

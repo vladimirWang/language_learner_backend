@@ -1,0 +1,2 @@
+ALTER TABLE IF EXISTS test_items RENAME TO level_exams;
+ALTER TABLE IF EXISTS tests RENAME TO levels;
