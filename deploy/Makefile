@@ -15,7 +15,10 @@ OUT_DIR := dist-images
 
 # ---------- 镜像标签 ----------
 TAG ?= prod
-STAMP ?= $(shell date +%Y%m%d-%H%M)
+# 立即展开（:=）保证一次 make 内所有目标用同一个时间戳，版本 tag 不会前后不一致
+ifeq ($(origin STAMP),undefined)
+STAMP := $(shell date +%Y%m%d-%H%M)
+endif
 TAG_VERSIONED = $(TAG)-$(STAMP)
 
 # 镜像仓库：默认 Docker Hub，部署到其他仓库时改这两个变量
@@ -81,13 +84,17 @@ push-all: push-service push-nginx push-base
 
 push-service:
 	@echo "🚀 构建并推送 $(IMG_SERVICE) + $(IMG_SERVICE_VERSIONED) ..."
+	# 注意：buildx --push 会走 daemon 的 registry-mirrors（镜像加速器只允许拉取，
+	# 推送会报 unauthorized）。因此先 --load 到本地，再用 docker push 直连 Docker Hub。
 	docker buildx build \
 		--platform $(PLATFORM) \
 		-t $(IMG_SERVICE) \
 		-t $(IMG_SERVICE_VERSIONED) \
 		-f $(REPO_ROOT)/server/Dockerfile \
-		--push \
+		--load \
 		$(REPO_ROOT)
+	docker push $(IMG_SERVICE)
+	docker push $(IMG_SERVICE_VERSIONED)
 
 push-nginx:
 	@echo "🚀 镜像并推送 $(IMG_NGINX) ..."
