@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import resource
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -51,6 +52,36 @@ class ListeningError(RuntimeError):
     """下载 / 转写 / 切分失败。"""
 
 
+# #region debug-point A:stage-instrumentation
+def _stub_stage() -> str:
+    configured = os.getenv("LISTEN_STUB_AFTER", "").strip()
+    if configured:
+        return configured
+    try:
+        return (Path(os.getenv("WORK_DIR", "work")) / "listen_stub_after").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _debug_probe(hypothesis: str, point: str) -> None:
+    if os.getenv("LISTEN_DEBUG") != "1" and not _stub_stage():
+        return
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    logger.info(
+        "[DEBUG] sessionId=listening-prod-stall runId=%s hypothesisId=%s location=%s "
+        "cpu_user=%.2f cpu_sys=%.2f maxrss_kb=%d",
+        os.getenv("LISTEN_DEBUG_RUN_ID", "pre-fix"), hypothesis, point,
+        usage.ru_utime, usage.ru_stime, usage.ru_maxrss,
+    )
+
+
+def _stub_after(stage: str) -> None:
+    if _stub_stage() == stage:
+        logger.warning("[DEBUG-STUB] stop after %s", stage)
+        raise ListeningError(f"debug stub stop after {stage}")
+# #endregion
+
+
 @dataclass
 class Segment:
     start: float
@@ -87,6 +118,10 @@ def import_from_url(
     audio_dir.mkdir(parents=True)
     image_dir.mkdir(parents=True)
 
+    # #region debug-point A:control
+    _debug_probe("A", "before_download")
+    _stub_after("start")
+    # #endregion
     title = _probe_title(url, cookies)
     _stage("downloading", "开始下载音视频")
     logger.info("下载 url=%s", url)
@@ -95,26 +130,47 @@ def import_from_url(
     duration = _probe_duration(media)
     logger.info("已保存 %s（%.1fs video=%s）", media.name, duration, is_video)
     _stage("downloaded", f"音视频已保存：{media.name}")
+    # #region debug-point F:after-download
+    _debug_probe("F", "after_download")
+    _stub_after("download")
+    # #endregion
 
     # 音频轨（独立抽出来，避免后续转码重复解码视频）
     audio_source = media
     if is_video:
+        # 音视频同步 + 抽音频合并为一次 ffmpeg 解码，避免整片被读两遍
         audio_source = download_dir / "audio_source.m4a"
-        _extract_audio(media, audio_source)
+        media = _prepare_media(media, audio_source)
+    # #region debug-point C:after-media
+    _debug_probe("C", "after_media_prepare")
+    _stub_after("media")
+    # #endregion
 
     # 直接解码为 16k 单声道 PCM 传给 Whisper，不落盘中间 wav（减少磁盘写入）
     _stage("parsing_pending", "媒体处理完成，等待开始转写")
     logger.info("解码音频（内存中，不落盘）")
     audio, sample_rate = _decode_audio(audio_source)
+    # #region debug-point B:after-decode
+    _debug_probe("B", "after_pcm_decode")
+    _stub_after("decode")
+    # #endregion
     logger.info("开始转写 model=%s language=%s", model_name, target_lang)
     _stage("parsing", f"开始转写 model={model_name}")
     segments = _transcribe(audio, work_root, model_name, target_lang)
     logger.info("转写完成 segments=%d", len(segments))
+    # #region debug-point A:after-transcribe
+    _debug_probe("A", "after_transcribe")
+    _stub_after("transcribe")
+    # #endregion
 
     logger.info("开始说话人分离（对话题用 A/B/C 区分）")
     speaker_count = assign_speakers(segments, audio, sample_rate)
     is_dialogue = speaker_count > 1
     logger.info("说话人分离完成 speakers=%d dialogue=%s", speaker_count, is_dialogue)
+    # #region debug-point A:after-speakers
+    _debug_probe("A", "after_speakers")
+    _stub_after("speakers")
+    # #endregion
 
     questions = split_questions(segments, duration)
     if not questions:
@@ -164,6 +220,10 @@ def import_from_url(
 
         logger.info("第 %d/%d 题 完成 number=%d clip=%s", idx, len(questions), number, clip.name)
 
+    # #region debug-point C:after-clips
+    _debug_probe("C", "after_clips")
+    _stub_after("clips")
+    # #endregion
     manifest = {
         "exam_id": exam_id,
         "lang": lang,
@@ -397,30 +457,34 @@ def _download_best(url: str, out_dir: Path, cookies: Path | None) -> Path:
     media = max(candidates, key=lambda path: path.stat().st_size)
 
     # 分离下载的视频流和音频流可能时间戳不匹配（B站常见），
-    # 导致画面倍速而音频正常。重新生成 PTS 并强制同步。
-    if _has_video_stream(media):
-        _sync_av(media)
+    # 导致画面倍速而音频正常；同步与抽音频在 import_from_url 里合并为一次解码。
     return media
 
 
-def _sync_av(media: Path) -> None:
-    """重新生成时间戳并强制音视频同步，覆盖原文件。"""
+def _prepare_media(media: Path, audio_target: Path) -> Path:
+    """一次 ffmpeg 完成音视频同步 + 抽取音频轨，返回同步后的媒体路径。
+
+    之前 _sync_av（整片读+写）和 _extract_audio（再整片读一遍）分别执行，
+    同一视频被完整读取两次；合并成单次 demux 后只读一遍，降低解析期磁盘读取。
+    """
     tmp = media.with_suffix(".synced" + media.suffix)
     try:
         _run([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-i", str(media),
-            "-c", "copy",
-            "-fflags", "+genpts",
-            "-async", "1",
-            "-movflags", "+faststart",
-            str(tmp),
+            "-map", "0", "-c", "copy",
+            "-fflags", "+genpts", "-movflags", "+faststart", str(tmp),
+            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "48000",
+            "-c:a", "aac", "-b:a", "96k", str(audio_target),
         ])
         tmp.replace(media)
+        return media
     except ListeningError as e:
         logger.warning("音视频同步失败，使用原始文件：%s", e)
         if tmp.exists():
             tmp.unlink()
+        _extract_audio(media, audio_target)
+        return media
 
 
 def _probe_duration(path: Path) -> float:
