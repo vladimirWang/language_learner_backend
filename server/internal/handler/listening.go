@@ -22,6 +22,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/wangfernando/language-learner/server/internal/scheduler"
+	"github.com/wangfernando/language-learner/server/internal/store"
 )
 
 // listeningImport 接收音视频 URL + 可选的 answers/cookies 文件，异步启动 builder.listen。
@@ -101,6 +102,16 @@ func (h *Handler) listeningImport(c *gin.Context) {
 		cookiesPath = dst
 	}
 
+	// 同 exam_id 已存在活跃（未删除）任务时拒绝，避免违反部分唯一索引。
+	if active, err := h.store.CountActiveListeningJobsByExamID(c.Request.Context(), examID, ""); err != nil {
+		h.logger.Printf("check active listening job for exam %s: %v", examID, err)
+		writeError(c, http.StatusInternalServerError, "check exam conflict failed")
+		return
+	} else if active > 0 {
+		writeError(c, http.StatusConflict, "该 exam_id 已存在未删除的任务，请先删除后再导入")
+		return
+	}
+
 	// 入库 pending
 	hasAnswers := answersPath != ""
 	if err := h.store.CreateListeningJob(c.Request.Context(), jobID, examID, lang, url, hasAnswers); err != nil {
@@ -167,7 +178,8 @@ func (h *Handler) listeningJobs(c *gin.Context) {
 			return
 		}
 	}
-	jobs, err := h.store.ListListeningJobs(c.Request.Context(), limit)
+	includeDeleted := c.Query("include_deleted") == "1" || strings.EqualFold(c.Query("include_deleted"), "true")
+	jobs, err := h.store.ListListeningJobs(c.Request.Context(), limit, includeDeleted)
 	if err != nil {
 		h.logger.Printf("list listening jobs: %v", err)
 		writeError(c, http.StatusInternalServerError, "query jobs failed")
@@ -685,16 +697,80 @@ func (h *Handler) updateListeningJobMeta(c *gin.Context) {
 	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
-// deleteListeningJob 软删除听力任务（标记 deleted_at，不删除产物文件）。
+// deleteListeningJob：未删除的任务执行软删除（保留产物文件，可恢复）；
+// 已软删除的任务再次删除则执行硬删除（连 DB 记录与产物文件一并清除）。
 func (h *Handler) deleteListeningJob(c *gin.Context) {
 	jobID := c.Param("jobId")
 	if jobID == "" {
 		writeError(c, http.StatusBadRequest, "missing jobId")
 		return
 	}
-	if err := h.store.SoftDeleteListeningJob(c.Request.Context(), jobID); err != nil {
-		h.logger.Printf("soft delete listening job %s: %v", jobID, err)
+	job, err := h.store.GetListeningJob(c.Request.Context(), jobID)
+	if err != nil {
+		h.logger.Printf("get listening job %s: %v", jobID, err)
+		writeError(c, http.StatusInternalServerError, "query job failed")
+		return
+	}
+	if job == nil {
+		writeError(c, http.StatusNotFound, "job not found: "+jobID)
+		return
+	}
+
+	if job.DeletedAt == nil {
+		// 软删除：仅标记 deleted_at，产物文件保留，可在“已删除”中恢复。
+		if err := h.store.SoftDeleteListeningJob(c.Request.Context(), jobID); err != nil {
+			h.logger.Printf("soft delete listening job %s: %v", jobID, err)
+			writeError(c, http.StatusInternalServerError, "delete job failed")
+			return
+		}
+		writeJSON(c, http.StatusOK, map[string]any{"ok": true, "deleted": "soft"})
+		return
+	}
+
+	// 已软删除 → 硬删除：先判断产物目录是否还被其他活跃任务引用。
+	active, err := h.store.CountActiveListeningJobsByExamID(c.Request.Context(), job.ExamID, jobID)
+	if err != nil {
+		h.logger.Printf("count active jobs for exam %s: %v", job.ExamID, err)
 		writeError(c, http.StatusInternalServerError, "delete job failed")
+		return
+	}
+	if err := h.store.HardDeleteListeningJob(c.Request.Context(), jobID); err != nil {
+		h.logger.Printf("hard delete listening job %s: %v", jobID, err)
+		writeError(c, http.StatusInternalServerError, "delete job failed")
+		return
+	}
+	// 没有其他活跃任务共享该 exam_id 目录时，一并删除产物文件释放磁盘。
+	if active == 0 {
+		workRoot := os.Getenv("WORK_DIR")
+		if workRoot == "" {
+			workRoot = "work"
+		}
+		examDir := filepath.Join(workRoot, "listening", job.ExamID)
+		if err := os.RemoveAll(examDir); err != nil {
+			h.logger.Printf("hard delete: remove exam dir %s: %v", examDir, err)
+		}
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true, "deleted": "hard"})
+}
+
+// restoreListeningJob 恢复已软删除的听力任务。
+func (h *Handler) restoreListeningJob(c *gin.Context) {
+	jobID := c.Param("jobId")
+	if jobID == "" {
+		writeError(c, http.StatusBadRequest, "missing jobId")
+		return
+	}
+	err := h.store.RestoreListeningJob(c.Request.Context(), jobID)
+	switch {
+	case errors.Is(err, store.ErrListeningExamIDActiveConflict):
+		writeError(c, http.StatusConflict, err.Error())
+		return
+	case errors.Is(err, store.ErrListeningJobNotFound):
+		writeError(c, http.StatusNotFound, "job not found: "+jobID)
+		return
+	case err != nil:
+		h.logger.Printf("restore listening job %s: %v", jobID, err)
+		writeError(c, http.StatusInternalServerError, "restore job failed")
 		return
 	}
 	writeJSON(c, http.StatusOK, map[string]any{"ok": true})

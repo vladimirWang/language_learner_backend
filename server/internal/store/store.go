@@ -45,7 +45,7 @@ type ListeningJob struct {
 	LogPath      string     `gorm:"column:log_path" json:"log_path"`
 	ErrorMsg     string     `gorm:"column:error_msg" json:"error_msg"`
 	LastLogAt    *time.Time `gorm:"column:last_log_at" json:"last_log_at"`
-	DeletedAt    *time.Time `gorm:"column:deleted_at" json:"-"`
+	DeletedAt    *time.Time `gorm:"column:deleted_at" json:"deleted_at"`
 	HasAnswers   bool       `gorm:"column:has_answers" json:"has_answers"`
 	CreatedAt    time.Time  `gorm:"column:created_at" json:"created_at"`
 	UpdatedAt    time.Time  `gorm:"column:updated_at" json:"updated_at"`
@@ -1466,6 +1466,106 @@ func (s *Store) SoftDeleteListeningJob(ctx context.Context, jobID string) error 
 		}).Error
 }
 
+// ErrListeningExamIDActiveConflict 表示同 exam_id 已存在一条活跃（未删除）记录，
+// 由部分唯一索引 uq_listening_jobs_exam_id_active 约束。
+var ErrListeningExamIDActiveConflict = errors.New("该 exam_id 已存在未删除的任务")
+
+// ErrListeningJobNotFound 表示指定 job_id 不存在。
+var ErrListeningJobNotFound = errors.New("listening job not found")
+
+// GetListeningJob 按 job_id 取单条任务（含已软删除），不存在返回 nil。
+func (s *Store) GetListeningJob(ctx context.Context, jobID string) (*ListeningJob, error) {
+	var j ListeningJob
+	err := s.db.WithContext(ctx).Table("listening_jobs").
+		Select(`job_id, exam_id, name, lang, level, source_url, status,
+			COALESCE(manifest_path,'') AS manifest_path,
+			COALESCE(log_path,'') AS log_path,
+			COALESCE(error_msg,'') AS error_msg,
+			last_log_at, deleted_at, has_answers, created_at, updated_at`).
+		Where("job_id = ?", jobID).
+		Take(&j).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &j, nil
+}
+
+// CountActiveListeningJobsByExamID 统计指定 exam_id 的活跃（未删除）任务数；
+// excludeJobID 非空时排除该 job（用于硬删除前判断产物目录是否还有其他任务引用）。
+func (s *Store) CountActiveListeningJobsByExamID(ctx context.Context, examID, excludeJobID string) (int64, error) {
+	q := s.db.WithContext(ctx).Table("listening_jobs").
+		Where("exam_id = ? AND deleted_at IS NULL", examID)
+	if excludeJobID != "" {
+		q = q.Where("job_id <> ?", excludeJobID)
+	}
+	var n int64
+	if err := q.Count(&n).Error; err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// SoftDeleteActiveListeningJobsByExamID 软删除指定 exam_id 的全部活跃任务，
+// 返回受影响行数。overwrite 上传前调用，保证部分唯一索引不冲突。
+func (s *Store) SoftDeleteActiveListeningJobsByExamID(ctx context.Context, examID string) (int64, error) {
+	res := s.db.WithContext(ctx).Model(&ListeningJob{}).
+		Where("exam_id = ? AND deleted_at IS NULL", examID).
+		Updates(map[string]any{
+			"deleted_at": gorm.Expr("now()"),
+			"updated_at": gorm.Expr("now()"),
+		})
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	return res.RowsAffected, nil
+}
+
+// HardDeleteListeningJob 物理删除任务记录及其日志（产物文件由调用方决定是否删除）。
+func (s *Store) HardDeleteListeningJob(ctx context.Context, jobID string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("DELETE FROM listening_job_logs WHERE job_id = ?", jobID).Error; err != nil {
+			return err
+		}
+		return tx.Exec("DELETE FROM listening_jobs WHERE job_id = ?", jobID).Error
+	})
+}
+
+// RestoreListeningJob 恢复已软删除的任务。若同 exam_id 已有活跃记录，
+// 会违反部分唯一索引，返回 ErrListeningExamIDActiveConflict。
+func (s *Store) RestoreListeningJob(ctx context.Context, jobID string) error {
+	var examID string
+	if err := s.db.WithContext(ctx).Table("listening_jobs").
+		Where("job_id = ?", jobID).Pluck("exam_id", &examID).Error; err != nil {
+		return err
+	}
+	if examID == "" {
+		return ErrListeningJobNotFound
+	}
+	active, err := s.CountActiveListeningJobsByExamID(ctx, examID, jobID)
+	if err != nil {
+		return err
+	}
+	if active > 0 {
+		return ErrListeningExamIDActiveConflict
+	}
+	res := s.db.WithContext(ctx).Model(&ListeningJob{}).
+		Where("job_id = ?", jobID).
+		Updates(map[string]any{
+			"deleted_at": nil,
+			"updated_at": gorm.Expr("now()"),
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrListeningJobNotFound
+	}
+	return nil
+}
+
 // --- Listening Job Notifications ---
 
 // InsertNotification 新增一条系统通知；payload 为 nil 时不写入 JSONB 字段。
@@ -1604,26 +1704,28 @@ func (s *Store) AppendListeningLog(ctx context.Context, jobID, stage, level, mes
 	})
 }
 
-// ListListeningJobs 返回最近 N 条任务（已软删除的除外）。
-func (s *Store) ListListeningJobs(ctx context.Context, limit int) ([]ListeningJob, error) {
+// ListListeningJobs 返回最近 N 条任务；includeDeleted=false 时排除已软删除的。
+func (s *Store) ListListeningJobs(ctx context.Context, limit int, includeDeleted bool) ([]ListeningJob, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	jobs := make([]ListeningJob, 0)
-	err := s.db.WithContext(ctx).Table("listening_jobs").
+	q := s.db.WithContext(ctx).Table("listening_jobs").
 		Select(`job_id, exam_id, name, lang, level, source_url, status,
 			COALESCE(manifest_path,'') AS manifest_path,
 			COALESCE(log_path,'') AS log_path,
 			COALESCE(error_msg,'') AS error_msg,
-			last_log_at, created_at, updated_at`).
-		Where("deleted_at IS NULL").
+			last_log_at, deleted_at, has_answers, created_at, updated_at`).
 		Order("updated_at DESC").
-		Limit(limit).
-		Find(&jobs).Error
+		Limit(limit)
+	if !includeDeleted {
+		q = q.Where("deleted_at IS NULL")
+	}
+	err := q.Find(&jobs).Error
 	return jobs, err
 }
 
-// ListeningJobDetail 返回单个任务及其日志（已软删除的返回 not found）。
+// ListeningJobDetail 返回单个任务及其日志（含已软删除的，便于管理台查看历史）。
 // afterLogID > 0 时只返回该日志 ID 之后的增量日志（升序）；否则返回最近 300 条（降序）。
 func (s *Store) ListeningJobDetail(ctx context.Context, jobID string, afterLogID int64) (*ListeningJob, []ListeningJobLog, error) {
 	var j ListeningJob
@@ -1632,8 +1734,8 @@ func (s *Store) ListeningJobDetail(ctx context.Context, jobID string, afterLogID
 			COALESCE(manifest_path,'') AS manifest_path,
 			COALESCE(log_path,'') AS log_path,
 			COALESCE(error_msg,'') AS error_msg,
-			last_log_at, created_at, updated_at`).
-		Where("job_id = ? AND deleted_at IS NULL", jobID).
+			last_log_at, deleted_at, has_answers, created_at, updated_at`).
+		Where("job_id = ?", jobID).
 		Take(&j).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {

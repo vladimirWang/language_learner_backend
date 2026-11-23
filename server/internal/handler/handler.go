@@ -171,6 +171,7 @@ func (h *Handler) Routes() http.Handler {
 		listening.POST("/job/:jobId/answers", h.listeningUpdateAnswers)
 		listening.PATCH("/job/:jobId", h.updateListeningJobMeta)
 		listening.DELETE("/job/:jobId", h.deleteListeningJob)
+		listening.POST("/job/:jobId/restore", h.restoreListeningJob)
 	}
 
 	// SSE 实时事件订阅

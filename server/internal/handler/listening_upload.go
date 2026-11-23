@@ -23,6 +23,12 @@ import (
 // listeningExamIDPattern 与 builder 侧 SAFE_ID_RE 保持一致，作为目录名。
 var listeningExamIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
+// listeningUploadWriteTimeout 单独放宽上传请求的写超时。HTTP/1.x 下 WriteTimeout
+// 从读完请求头就开始计时，涵盖整个 handler 执行期；大素材包在磁盘/网络较慢时
+// 可能耗时数分钟，若沿用全局 2 分钟会被提前掐断连接——数据已落库但响应丢失，
+// 前端只看到 502。这里放宽到略大于 ReadTimeout(10 分钟)。
+const listeningUploadWriteTimeout = 12 * time.Minute
+
 // uploadedManifest 是素材包 manifest.json 中本接口需要的字段。
 type uploadedManifest struct {
 	ExamID        string            `json:"exam_id"`
@@ -45,6 +51,12 @@ type uploadedManifest struct {
 //
 // 成功后立即把任务标记为 built，不再触发 Python 解析。
 func (h *Handler) listeningUpload(c *gin.Context) {
+	// 大素材包上传可能耗时数分钟，先单独延长本连接的写超时，避免响应被全局
+	// WriteTimeout 掐断（数据已写入但前端收到 502）。
+	if err := http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(listeningUploadWriteTimeout)); err != nil {
+		h.logger.Printf("extend write deadline for listening upload: %v", err)
+	}
+
 	maxMB := envInt("LISTENING_UPLOAD_MAX_MB", 4096)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, int64(maxMB)<<20)
 	if err := c.Request.ParseMultipartForm(16 << 20); err != nil {
@@ -133,7 +145,22 @@ func (h *Handler) listeningUpload(c *gin.Context) {
 
 	listeningRoot := filepath.Join(workRoot, "listening")
 	examDir := filepath.Join(listeningRoot, examID)
-	if _, statErr := os.Stat(examDir); statErr == nil && !overwrite {
+	// 冲突判定：产物目录存在，或已有未删除的任务记录（部分唯一索引也要求活跃唯一）。
+	dirExists := false
+	if _, statErr := os.Stat(examDir); statErr == nil {
+		dirExists = true
+	}
+	exists := dirExists
+	if !exists {
+		if active, err := h.store.CountActiveListeningJobsByExamID(c.Request.Context(), examID, ""); err != nil {
+			h.logger.Printf("check active job for exam %s: %v", examID, err)
+			writeError(c, http.StatusInternalServerError, "检查 exam_id 冲突失败")
+			return
+		} else if active > 0 {
+			exists = true
+		}
+	}
+	if exists && !overwrite {
 		writeError(c, http.StatusConflict, "该 exam_id 已存在，确认覆盖请传 overwrite=1")
 		return
 	}
@@ -192,6 +219,14 @@ func (h *Handler) listeningUpload(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+	// overwrite 时先软删除同 exam_id 的旧活跃任务，保证部分唯一索引不冲突。
+	if overwrite {
+		if _, err := h.store.SoftDeleteActiveListeningJobsByExamID(ctx, examID); err != nil {
+			h.logger.Printf("soft delete old active jobs for exam %s: %v", examID, err)
+			writeError(c, http.StatusInternalServerError, "清理旧任务记录失败")
+			return
+		}
+	}
 	if err := h.store.CreateListeningJob(ctx, jobID, examID, lang, "upload:"+fileHeader.Filename, false); err != nil {
 		h.logger.Printf("create listening job %s: %v", jobID, err)
 		writeError(c, http.StatusInternalServerError, "写入任务记录失败")

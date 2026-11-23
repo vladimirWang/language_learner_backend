@@ -33,6 +33,21 @@ UPSTREAM_NGINX   = nginx:1.27-alpine
 UPSTREAM_PG      = pgvector/pgvector:pg17
 UPSTREAM_MIGRATE = migrate/migrate:v4.18.3
 
+# 仅当本地缺少目标架构的镜像时才拉取：Docker Hub 偶发 EOF/限流时，
+# 本地已有镜像仍可正常 tag + push，避免 make push-all 因无关的 pull 失败。
+# 用法：$(call ensure_image,nginx:1.27-alpine)
+define ensure_image
+	@if [ "$$(docker image inspect $(1) --format '{{.Architecture}}' 2>/dev/null)" != "$(patsubst linux/%,%,$(PLATFORM))" ]; then \
+		echo "⬇️  拉取 $(1)（$(PLATFORM)）..."; \
+		docker pull --platform $(PLATFORM) $(1) || { \
+			echo "❌ 拉取 $(1) 失败。可先在 Docker Hub 可达的网络下执行 make pull-base，或配置镜像加速器后重试"; \
+			exit 1; \
+		}; \
+	else \
+		echo "✅ 本地已有 $(1)（$(PLATFORM)），跳过拉取"; \
+	fi
+endef
+
 # 旧 tar 流程使用的本地镜像名
 LEGACY_IMG_SERVICE = lang-service:$(TAG)
 LEGACY_IMG_NGINX   = lang-nginx:$(TAG)
@@ -54,8 +69,8 @@ build-service:
 		$(REPO_ROOT)
 
 build-nginx:
-	@echo "🔨 拉取 $(IMG_NGINX) 基础镜像 ..."
-	docker pull --platform $(PLATFORM) $(UPSTREAM_NGINX)
+	@echo "🔨 准备 $(IMG_NGINX) 基础镜像 ..."
+	$(call ensure_image,$(UPSTREAM_NGINX))
 	docker tag $(UPSTREAM_NGINX) $(LEGACY_IMG_NGINX)
 	docker tag $(UPSTREAM_NGINX) $(IMG_NGINX)
 
@@ -76,16 +91,16 @@ push-service:
 
 push-nginx:
 	@echo "🚀 镜像并推送 $(IMG_NGINX) ..."
-	docker pull --platform $(PLATFORM) $(UPSTREAM_NGINX)
+	$(call ensure_image,$(UPSTREAM_NGINX))
 	docker tag $(UPSTREAM_NGINX) $(IMG_NGINX)
 	docker push $(IMG_NGINX)
 
 push-base:
 	@echo "🚀 镜像并推送基础镜像（pgvector / migrate）..."
-	docker pull --platform $(PLATFORM) $(UPSTREAM_PG)
+	$(call ensure_image,$(UPSTREAM_PG))
 	docker tag $(UPSTREAM_PG) $(IMG_PG)
 	docker push $(IMG_PG)
-	docker pull --platform $(PLATFORM) $(UPSTREAM_MIGRATE)
+	$(call ensure_image,$(UPSTREAM_MIGRATE))
 	docker tag $(UPSTREAM_MIGRATE) $(IMG_MIGRATE)
 	docker push $(IMG_MIGRATE)
 
