@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/wangfernando/language-learner/server/internal/challenge"
 	"github.com/wangfernando/language-learner/server/internal/store"
+	"github.com/wangfernando/language-learner/server/internal/streak"
 )
 
 var challengeLevelPattern = regexp.MustCompile(`^(A[12]|B[12]|C[12]|N[1-5])$`)
@@ -92,14 +93,14 @@ func (h *Handler) todayDay() time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 }
 
-// currentStreak 读取并按今天日期修正连续打卡天数（断档显示为 0）。
-func (h *Handler) currentStreak(ctx context.Context, openid, lang string) store.UserStreak {
-	streak, err := h.store.GetStreak(ctx, openid, lang)
+// currentStreak 从 Redis bitmap 读取连续打卡；读取失败按零值降级。
+func (h *Handler) currentStreak(ctx context.Context, openid, lang string) streak.Streak {
+	out, err := h.streak.Get(ctx, openid, lang, h.todayDay().Format("2006-01-02"))
 	if err != nil {
 		h.logger.Printf("daily challenge streak openid=%s: %v", openid, err)
-		return store.UserStreak{Lang: lang}
+		return streak.Streak{Lang: lang}
 	}
-	return store.NormalizeStreak(streak, h.todayDay().Format("2006-01-02"))
+	return out
 }
 
 // challengeItemView 是下发给客户端的题目（不含标准答案）。
@@ -350,7 +351,7 @@ func (h *Handler) submitDailyChallenge(c *gin.Context) {
 		Score:       score,
 		Total:       total,
 		Stars:       stars,
-	}, ch.Lang, ch.Day)
+	})
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(c, http.StatusNotFound, "challenge not found")
@@ -361,7 +362,13 @@ func (h *Handler) submitDailyChallenge(c *gin.Context) {
 		return
 	}
 	attempt := submission.Attempt
-	streak := store.NormalizeStreak(submission.Streak, h.todayDay().Format("2006-01-02"))
+	// 达到签到条件后写入 Redis bitmap；写入失败不回滚已保存的成绩。
+	if attempt.Passed {
+		if err := h.streak.Mark(c.Request.Context(), openid, ch.Lang, ch.Day); err != nil {
+			h.logger.Printf("mark streak openid=%s day=%s: %v", openid, ch.Day, err)
+		}
+	}
+	streak := h.currentStreak(c.Request.Context(), openid, ch.Lang)
 	resp := map[string]any{
 		"score":             attempt.Score,
 		"total":             attempt.Total,

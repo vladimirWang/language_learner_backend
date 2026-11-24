@@ -45,6 +45,10 @@ services:
       # PDF 解析队列：dev 复用 infra compose 中已运行的 rabbitmq（宿主机 5672）
       RABBITMQ_URL: ${RABBITMQ_URL:-amqp://root:1234@host.docker.internal:5672/}
       PDF_IMPORT_QUEUE: ${PDF_IMPORT_QUEUE:-pdf.import}
+      # 连续签到 bitmap：与 PostgreSQL 共用 infra compose 的 redis（宿主机 16379）
+      REDIS_ADDR: ${REDIS_ADDR:-host.docker.internal:16379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: ${REDIS_DB:-0}
     ports:
       - "8080:8080"
     # 同容器内会跑一次性 Python 构建任务（含 whisper 转写 / OCR / ffmpeg），放宽到 2g

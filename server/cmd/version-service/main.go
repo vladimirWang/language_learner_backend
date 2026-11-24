@@ -21,6 +21,7 @@ import (
 	"github.com/wangfernando/language-learner/server/internal/scheduler"
 	"github.com/wangfernando/language-learner/server/internal/storage"
 	"github.com/wangfernando/language-learner/server/internal/store"
+	"github.com/wangfernando/language-learner/server/internal/streak"
 	"github.com/wangfernando/language-learner/server/internal/tts"
 	"github.com/wangfernando/language-learner/server/internal/wxauth"
 )
@@ -46,6 +47,26 @@ func main() {
 		logger.Fatalf("startup check failed: RabbitMQ is unavailable (queue=%s), application will not start: %v", cfg.PDFQueue, err)
 	}
 	logger.Printf("startup check: RabbitMQ connected (queue=%s)", cfg.PDFQueue)
+
+	streakStore := streak.New(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	defer streakStore.Close()
+	if err := streakStore.Ping(ctx); err != nil {
+		logger.Fatalf("startup check failed: Redis is unavailable (addr=%s), application will not start: %v", cfg.RedisAddr, err)
+	}
+	logger.Printf("startup check: Redis connected (addr=%s)", cfg.RedisAddr)
+	if days, err := st.PassedChallengeDays(ctx); err != nil {
+		logger.Printf("streak backfill: %v", err)
+	} else {
+		history := make([]streak.Day, 0, len(days))
+		for _, d := range days {
+			history = append(history, streak.Day{OpenID: d.OpenID, Lang: d.Lang, Day: d.Day})
+		}
+		if n, err := streakStore.Backfill(ctx, history); err != nil {
+			logger.Printf("streak backfill: %v", err)
+		} else if n > 0 {
+			logger.Printf("streak backfill: %d check-in days loaded", n)
+		}
+	}
 
 	presigner, err := storage.NewPresigner(cfg.S3Endpoint, cfg.S3Bucket, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3UseSSL)
 	if err != nil {
@@ -130,7 +151,7 @@ func main() {
 	} else {
 		logger.Printf("wechat miniapp login: not configured, /api/auth/wx-* returns 503")
 	}
-	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, dailyCfg, ssoCfg, wxCfg, logger)
+	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, dailyCfg, ssoCfg, wxCfg, streakStore, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

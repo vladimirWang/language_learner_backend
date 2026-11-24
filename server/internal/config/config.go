@@ -36,6 +36,11 @@ type Config struct {
 	PDFQueue    string
 	WorkDir     string
 
+	// Redis 保存连续签到的 bitmap；与 PostgreSQL 部署在同一网络。
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+
 	// 每日新词接口：无 key 时接口返回 503，避免匿名暴露。
 	DailyWordsAPIKey         string
 	DailyWordsRateLimit      int
@@ -73,6 +78,10 @@ func Load() Config {
 		RabbitMQURL: envOr("RABBITMQ_URL", "amqp://root:1234@rabbitmq:5672/"),
 		PDFQueue:    envOr("PDF_IMPORT_QUEUE", "pdf.import"),
 		WorkDir:     envOr("WORK_DIR", "work"),
+
+		RedisAddr:     envOr("REDIS_ADDR", "redis:16379"),
+		RedisPassword: os.Getenv("REDIS_PASSWORD"),
+		RedisDB:       envInt("REDIS_DB", 0),
 
 		DailyWordsAPIKey:         os.Getenv("DAILY_WORDS_API_KEY"),
 		DailyWordsRateLimit:      envInt("DAILY_WORDS_RATE_LIMIT", 60),

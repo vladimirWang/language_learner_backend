@@ -59,17 +59,13 @@ type ChallengeSubmission struct {
 	StarsAdded       int
 	TotalStars       int64
 	AlreadySubmitted bool
-	Streak           UserStreak
 }
 
-// UserStreak 对应 user_streaks 一行。
-type UserStreak struct {
-	OpenID    string    `gorm:"column:openid" json:"-"`
-	Lang      string    `gorm:"column:lang" json:"lang"`
-	Current   int       `gorm:"column:current" json:"current"`
-	Longest   int       `gorm:"column:longest" json:"longest"`
-	LastDay   *string   `gorm:"column:last_day" json:"last_day"`
-	UpdatedAt time.Time `gorm:"column:updated_at" json:"-"`
+// ChallengePassDay 是一条已签到记录，用于回填 Redis bitmap。
+type ChallengePassDay struct {
+	OpenID string `gorm:"column:openid"`
+	Lang   string `gorm:"column:lang"`
+	Day    string `gorm:"column:day"`
 }
 
 // ChallengeCalendarEntry 是用户视角的打卡日历一行。
@@ -320,9 +316,9 @@ func (s *Store) GetAttempt(ctx context.Context, openid string, challengeID int64
 	return &a, nil
 }
 
-// SubmitChallengeAttempt 保存最新作答，并在同一事务内维护最高星、累计星和自动签到。
+// SubmitChallengeAttempt 保存最新作答，并在同一事务内维护最高星与累计星。
 // 对微信用户行加锁可串行化同一用户的提交，避免并发重复补差或丢失累计更新。
-func (s *Store) SubmitChallengeAttempt(ctx context.Context, a ChallengeAttempt, lang, day string) (ChallengeSubmission, error) {
+func (s *Store) SubmitChallengeAttempt(ctx context.Context, a ChallengeAttempt) (ChallengeSubmission, error) {
 	var out ChallengeSubmission
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var user struct {
@@ -386,104 +382,22 @@ func (s *Store) SubmitChallengeAttempt(ctx context.Context, a ChallengeAttempt, 
 			}
 		}
 
-		var err error
-		if out.Attempt.Stars >= 2 {
-			out.Streak, err = updateStreakTx(tx, a.OpenID, lang, day)
-		} else {
-			out.Streak, err = getStreakTx(tx, a.OpenID, lang)
-		}
-		return err
+		return nil
 	})
 	return out, err
 }
 
-// UpdateStreakOnPass 在用户达到签到条件后更新连续天数；较早日期不倒退 last_day。
-func (s *Store) UpdateStreakOnPass(ctx context.Context, openid, lang, day string) (UserStreak, error) {
-	var out UserStreak
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var err error
-		out, err = updateStreakTx(tx, openid, lang, day)
-		return err
-	})
-	return out, err
-}
-
-func updateStreakTx(tx *gorm.DB, openid, lang, day string) (UserStreak, error) {
-	var out UserStreak
-	err := tx.Raw(
-		`INSERT INTO user_streaks (openid, lang, current, longest, last_day, updated_at)
-		 VALUES (?, ?, 1, 1, ?::date, now())
-		 ON CONFLICT (openid, lang) DO UPDATE SET
-		     current = CASE
-		         WHEN user_streaks.last_day IS NULL THEN 1
-		         WHEN EXCLUDED.last_day < user_streaks.last_day THEN user_streaks.current
-		         WHEN user_streaks.last_day = EXCLUDED.last_day THEN user_streaks.current
-		         WHEN user_streaks.last_day = EXCLUDED.last_day - 1 THEN user_streaks.current + 1
-		         ELSE 1
-		     END,
-		     longest = GREATEST(
-		         user_streaks.longest,
-		         CASE
-		             WHEN user_streaks.last_day IS NULL THEN 1
-		             WHEN EXCLUDED.last_day < user_streaks.last_day THEN user_streaks.current
-		             WHEN user_streaks.last_day = EXCLUDED.last_day THEN user_streaks.current
-		             WHEN user_streaks.last_day = EXCLUDED.last_day - 1 THEN user_streaks.current + 1
-		             ELSE 1
-		         END
-		     ),
-		     last_day = CASE
-		         WHEN user_streaks.last_day IS NULL OR EXCLUDED.last_day >= user_streaks.last_day
-		             THEN EXCLUDED.last_day
-		         ELSE user_streaks.last_day
-		     END,
-		     updated_at = now()
-		 RETURNING openid, lang, current, longest, to_char(last_day, 'YYYY-MM-DD') AS last_day`,
-		openid, lang, day,
-	).Scan(&out).Error
-	return out, err
-}
-
-func getStreakTx(tx *gorm.DB, openid, lang string) (UserStreak, error) {
-	out := UserStreak{OpenID: openid, Lang: lang}
-	err := tx.Raw(
-		`SELECT openid, lang, current, longest, to_char(last_day, 'YYYY-MM-DD') AS last_day, updated_at
-		 FROM user_streaks WHERE openid = ? AND lang = ?`,
-		openid, lang,
-	).Scan(&out).Error
-	return out, err
-}
-
-// GetStreak 读取用户某语种的连续打卡；无记录时返回零值。
-func (s *Store) GetStreak(ctx context.Context, openid, lang string) (UserStreak, error) {
-	out := UserStreak{OpenID: openid, Lang: lang}
+// PassedChallengeDays 返回所有已签到的 (openid, lang, day)，供启动时回填 Redis bitmap。
+func (s *Store) PassedChallengeDays(ctx context.Context) ([]ChallengePassDay, error) {
+	days := make([]ChallengePassDay, 0, 256)
 	err := s.db.WithContext(ctx).Raw(
-		`SELECT openid, lang, current, longest, to_char(last_day, 'YYYY-MM-DD') AS last_day, updated_at
-		 FROM user_streaks WHERE openid = ? AND lang = ?`,
-		openid, lang,
-	).Scan(&out).Error
-	return out, err
-}
-
-// NormalizeStreak 按今天的日期修正连续天数：昨天之前最后一次打卡视为断档，current 归零。
-// 仅影响展示；数据库中的历史记录保持原样，下次通关时由 UpdateStreakOnPass 重置。
-func NormalizeStreak(streak UserStreak, today string) UserStreak {
-	if streak.LastDay == nil || *streak.LastDay == "" {
-		streak.Current = 0
-		return streak
-	}
-	todayDate, err := time.Parse("2006-01-02", today)
-	if err != nil {
-		return streak
-	}
-	lastDate, err := time.Parse("2006-01-02", *streak.LastDay)
-	if err != nil {
-		return streak
-	}
-	yesterday := todayDate.AddDate(0, 0, -1)
-	if !lastDate.Equal(todayDate) && !lastDate.Equal(yesterday) {
-		streak.Current = 0
-	}
-	return streak
+		`SELECT a.openid, c.lang, to_char(c.day, 'YYYY-MM-DD') AS day
+		 FROM challenge_attempts a
+		 JOIN daily_challenges c ON c.id = a.challenge_id
+		 WHERE a.passed
+		 ORDER BY c.day ASC`,
+	).Scan(&days).Error
+	return days, err
 }
 
 // ChallengeCalendar 返回某月已发布关卡及当前用户的作答情况。

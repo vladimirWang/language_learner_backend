@@ -10,34 +10,6 @@ import (
 	"time"
 )
 
-func TestNormalizeStreak(t *testing.T) {
-	day := func(value string) *string { return &value }
-	cases := []struct {
-		name    string
-		streak  UserStreak
-		today   string
-		current int
-	}{
-		{"从未打卡", UserStreak{}, "2026-11-23", 0},
-		{"今天已打卡", UserStreak{Current: 5, Longest: 9, LastDay: day("2026-11-23")}, "2026-11-23", 5},
-		{"昨天已打卡", UserStreak{Current: 5, Longest: 9, LastDay: day("2026-11-22")}, "2026-11-23", 5},
-		{"断档两天", UserStreak{Current: 5, Longest: 9, LastDay: day("2026-11-21")}, "2026-11-23", 0},
-		{"跨月连续", UserStreak{Current: 3, Longest: 3, LastDay: day("2026-10-31")}, "2026-11-01", 3},
-		{"未来日期异常", UserStreak{Current: 3, Longest: 3, LastDay: day("2026-11-25")}, "2026-11-23", 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := NormalizeStreak(tc.streak, tc.today)
-			if got.Current != tc.current {
-				t.Fatalf("current = %d, want %d", got.Current, tc.current)
-			}
-			if got.Longest != tc.streak.Longest {
-				t.Fatalf("longest = %d, want %d", got.Longest, tc.streak.Longest)
-			}
-		})
-	}
-}
-
 // TestChallengeSubmissionIntegration 需先用全部迁移初始化空库，再设置 PG_TEST_DSN 运行。
 func TestChallengeSubmissionIntegration(t *testing.T) {
 	dsn := os.Getenv("PG_TEST_DSN")
@@ -63,7 +35,6 @@ func TestChallengeSubmissionIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = sqlDB.Exec("DELETE FROM user_streaks WHERE openid = $1", openid)
 		_, _ = sqlDB.Exec("DELETE FROM challenge_attempts WHERE openid = $1", openid)
 		_, _ = sqlDB.Exec("DELETE FROM daily_challenge_items WHERE challenge_id IN (SELECT id FROM daily_challenges WHERE lang = $1)", lang)
 		_, _ = sqlDB.Exec("DELETE FROM daily_challenges WHERE lang = $1", lang)
@@ -110,7 +81,7 @@ func TestChallengeSubmissionIntegration(t *testing.T) {
 			OpenID: openid, ChallengeID: challengeID,
 			Answers: json.RawMessage(fmt.Sprintf(`[{"seq":1,"value":%q}]`, answer)),
 			Score:   score, Total: 6, Stars: stars,
-		}, lang, day)
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -119,15 +90,12 @@ func TestChallengeSubmissionIntegration(t *testing.T) {
 
 	day1 := createChallenge("2026-11-24")
 	first := submit(day1, 1, 2, "2026-11-24", "first")
-	if first.StarsAdded != 1 || first.TotalStars != 1 || first.Attempt.Passed || first.Streak.LastDay != nil {
+	if first.StarsAdded != 1 || first.TotalStars != 1 || first.Attempt.Passed {
 		t.Fatalf("一星首次提交不应签到: %+v", first)
 	}
 	second := submit(day1, 2, 4, "2026-11-24", "second")
 	if !second.AlreadySubmitted || second.StarsAdded != 1 || second.TotalStars != 2 || second.Attempt.BestStars != 2 || !second.Attempt.Passed {
 		t.Fatalf("补到两星结果错误: %+v", second)
-	}
-	if second.Streak.Current != 1 || second.Streak.LastDay == nil || *second.Streak.LastDay != "2026-11-24" {
-		t.Fatalf("两星应自动签到: %+v", second.Streak)
 	}
 	lower := submit(day1, 1, 2, "2026-11-24", "latest")
 	if lower.StarsAdded != 0 || lower.TotalStars != 2 || lower.Attempt.Stars != 1 || lower.Attempt.BestStars != 2 || !lower.Attempt.Passed {
@@ -145,19 +113,16 @@ func TestChallengeSubmissionIntegration(t *testing.T) {
 		t.Fatalf("应保存最新答案: %s, err=%v", latest.Answers, err)
 	}
 	third := submit(day1, 3, 6, "2026-11-24", "third")
-	if third.StarsAdded != 1 || third.TotalStars != 3 || third.Attempt.BestStars != 3 || third.Streak.Current != 1 {
+	if third.StarsAdded != 1 || third.TotalStars != 3 || third.Attempt.BestStars != 3 {
 		t.Fatalf("同日重复提交应只补最高星正差额: %+v", third)
 	}
 
 	day2 := createChallenge("2026-11-25")
 	next := submit(day2, 2, 4, "2026-11-25", "next")
-	if next.Streak.Current != 2 || next.Streak.LastDay == nil || *next.Streak.LastDay != "2026-11-25" {
-		t.Fatalf("次日签到应连续: %+v", next.Streak)
-	}
 	earlier := createChallenge("2026-11-20")
 	backfill := submit(earlier, 2, 4, "2026-11-20", "earlier")
-	if backfill.Streak.Current != 2 || backfill.Streak.LastDay == nil || *backfill.Streak.LastDay != "2026-11-25" {
-		t.Fatalf("补交较早关卡不得倒退签到: %+v", backfill.Streak)
+	if todayPassed := next.Attempt.Passed && backfill.Attempt.Passed; !todayPassed {
+		t.Fatalf("补交较早关卡应保持签到: next=%+v earlier=%+v", next, backfill)
 	}
 
 	before := backfill.TotalStars
@@ -174,7 +139,7 @@ func TestChallengeSubmissionIntegration(t *testing.T) {
 				OpenID: openid, ChallengeID: concurrentID,
 				Answers: json.RawMessage(fmt.Sprintf(`[{"seq":1,"value":"concurrent-%d"}]`, i)),
 				Score:   6, Total: 6, Stars: 3,
-			}, lang, "2026-11-26")
+			})
 			if err != nil {
 				errs <- err
 				return

@@ -81,6 +81,10 @@ services:
       TTS_VOICE: ${TTS_VOICE:-}
       RABBITMQ_URL: ${RABBITMQ_URL:-}
       PDF_IMPORT_QUEUE: ${PDF_IMPORT_QUEUE:-pdf.import}
+      # 连续签到 bitmap：与 PostgreSQL 同网络的 redis
+      REDIS_ADDR: ${REDIS_ADDR:-redis:16379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: ${REDIS_DB:-0}
     ports:
       - "127.0.0.1:8080:8080"
     mem_limit: 2g

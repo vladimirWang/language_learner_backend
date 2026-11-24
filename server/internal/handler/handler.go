@@ -15,6 +15,7 @@ import (
 	"github.com/wangfernando/language-learner/server/internal/scheduler"
 	"github.com/wangfernando/language-learner/server/internal/storage"
 	"github.com/wangfernando/language-learner/server/internal/store"
+	"github.com/wangfernando/language-learner/server/internal/streak"
 	"github.com/wangfernando/language-learner/server/internal/tts"
 	"github.com/wangfernando/language-learner/server/internal/wxauth"
 )
@@ -65,11 +66,14 @@ type Handler struct {
 
 	// 每日关卡生成器（真值表 + 模板出题）。
 	challenge *challenge.Builder
+
+	// 连续签到 bitmap（Redis）。
+	streak *streak.Store
 }
 
 // New 创建 HTTP 处理器。
-func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, daily DailyWordsConfig, sso SSOConfig, wx wxauth.Config, logger *log.Logger) *Handler {
-	h := &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, sso: sso, wx: wx, logger: logger}
+func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, daily DailyWordsConfig, sso SSOConfig, wx wxauth.Config, streakStore *streak.Store, logger *log.Logger) *Handler {
+	h := &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, sso: sso, wx: wx, streak: streakStore, logger: logger}
 	h.challenge = challenge.NewBuilder(st)
 	if sch != nil {
 		// 听力解析任务的状态变更 → 消息中心通知 + 全局 SSE
