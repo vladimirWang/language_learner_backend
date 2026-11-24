@@ -32,9 +32,20 @@ func main() {
 
 	st, err := store.New(ctx, cfg.PGDSN, cfg.PGMaxConns)
 	if err != nil {
-		logger.Fatalf("init store: %v", err)
+		logger.Fatalf("startup check failed: PostgreSQL initialization error: %v", err)
 	}
 	defer st.Close()
+	if err := st.Ping(ctx); err != nil {
+		logger.Fatalf("startup check failed: PostgreSQL is unavailable, application will not start: %v", err)
+	}
+	logger.Printf("startup check: PostgreSQL connected")
+
+	publisher := mq.NewPublisher(cfg.RabbitMQURL, cfg.PDFQueue, logger)
+	defer publisher.Close()
+	if err := publisher.Check(); err != nil {
+		logger.Fatalf("startup check failed: RabbitMQ is unavailable (queue=%s), application will not start: %v", cfg.PDFQueue, err)
+	}
+	logger.Printf("startup check: RabbitMQ connected (queue=%s)", cfg.PDFQueue)
 
 	presigner, err := storage.NewPresigner(cfg.S3Endpoint, cfg.S3Bucket, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3UseSSL)
 	if err != nil {
@@ -55,8 +66,6 @@ func main() {
 	} else {
 		logger.Printf("speaking tts: not configured, audio playback disabled")
 	}
-	publisher := mq.NewPublisher(cfg.RabbitMQURL, cfg.PDFQueue, logger)
-	defer publisher.Close()
 	// 恢复上次进程退出时未完成的解析任务，避免任务停在 queued/running。
 	if ids, err := st.RequeueStalePDFJobs(ctx); err != nil {
 		logger.Printf("requeue stale pdf jobs: %v", err)

@@ -23,9 +23,20 @@ type Publisher struct {
 	ch   *amqp.Channel
 }
 
-// NewPublisher 创建发布器；此时不建立连接，首次投递时再连。
+// NewPublisher 创建发布器；此时不建立连接，由 Check 或首次投递建立连接。
 func NewPublisher(url, queue string, logger *log.Logger) *Publisher {
 	return &Publisher{url: url, queue: queue, logger: logger}
+}
+
+// Check 建立连接并验证通道与队列可用，供服务启动时做依赖检查。
+func (p *Publisher) Check() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.ensureLocked(); err != nil {
+		p.closeLocked()
+		return err
+	}
+	return nil
 }
 
 // Publish 投递一条 JSON 消息。连接失效时自动重连一次。
