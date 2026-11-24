@@ -1,5 +1,5 @@
-// Package challenge 生成每日关卡：用真值表（词库、固定搭配、语法点）加模板出题，
-// 不调用模型。生成的题目以快照写入 daily_challenge_items，发布后内容锁定。
+// Package challenge 生成每日关卡：每关只出一种题型，按 单词/搭配 → 语法 → 听力 轮转。
+// 题目以快照写入 daily_challenge_items，发布后内容锁定。
 package challenge
 
 import (
@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -18,12 +21,21 @@ import (
 
 const (
 	wordsPerChallenge        = 3
-	collocationsPerChallenge = 2
-	grammarPerChallenge      = 1
-	totalItems               = wordsPerChallenge + collocationsPerChallenge + grammarPerChallenge
+	collocationsPerChallenge = 3
+	itemsPerChallenge        = 6
 	// 每题固定 4 个选项；候选不足时按实际数量下发。
 	optionsPerQuestion = 4
 )
+
+// challengeCycle 是固定的题型轮转顺序。
+var challengeCycle = []string{
+	store.ChallengeTypeVocab,
+	store.ChallengeTypeGrammar,
+	store.ChallengeTypeListening,
+}
+
+// cycleAnchor 是轮转起点：该日生成单词/搭配关。
+var cycleAnchor = time.Date(2026, 11, 24, 0, 0, 0, 0, time.UTC)
 
 // ErrNoContent 表示真值库素材不足，无法生成关卡。
 var ErrNoContent = errors.New("challenge content not ready")
@@ -31,11 +43,37 @@ var ErrNoContent = errors.New("challenge content not ready")
 // Builder 负责从 store 读取素材并生成关卡快照。
 type Builder struct {
 	st *store.Store
+	// workDir 是听力产物根目录，manifest 位于 workDir/listening/{exam_id}/manifest.json。
+	workDir string
 }
 
 // NewBuilder 创建关卡生成器。
 func NewBuilder(st *store.Store) *Builder {
-	return &Builder{st: st}
+	workDir := os.Getenv("WORK_DIR")
+	if workDir == "" {
+		workDir = "work"
+	}
+	return &Builder{st: st, workDir: workDir}
+}
+
+// challengeTypeForDay 按固定顺序计算某天的题型。
+func challengeTypeForDay(day time.Time) string {
+	d := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC)
+	days := int(d.Sub(cycleAnchor).Hours() / 24)
+	index := ((days % len(challengeCycle)) + len(challengeCycle)) % len(challengeCycle)
+	return challengeCycle[index]
+}
+
+// typeLabel 返回关卡题型的中文名。
+func typeLabel(challengeType string) string {
+	switch challengeType {
+	case store.ChallengeTypeGrammar:
+		return "语法"
+	case store.ChallengeTypeListening:
+		return "听力"
+	default:
+		return "单词与搭配"
+	}
 }
 
 // choicePrompt 是选择题题面。
@@ -45,12 +83,22 @@ type choicePrompt struct {
 	Options  []string `json:"options"`
 }
 
+// audioChoicePrompt 是听力题题面；audio 为相对 workDir 的路径。
+type audioChoicePrompt struct {
+	Type     string   `json:"type"`
+	Question string   `json:"question"`
+	Options  []string `json:"options"`
+	Audio    string   `json:"audio"`
+	Duration float64  `json:"duration"`
+}
+
 // choiceAnswer 是标准答案。
 type choiceAnswer struct {
 	Value string `json:"value"`
 }
 
 // EnsureDay 返回指定日期的关卡；不存在时生成。publish=true 时直接发布。
+// 当轮到的题型素材不足时，按轮转顺序降级到下一可用题型。
 func (b *Builder) EnsureDay(ctx context.Context, lang, level string, day time.Time, publish bool) (*store.DailyChallenge, []store.DailyChallengeItem, error) {
 	dayStr := day.Format("2006-01-02")
 	existing, err := b.st.GetChallengeByDay(ctx, lang, level, dayStr)
@@ -62,30 +110,46 @@ func (b *Builder) EnsureDay(ctx context.Context, lang, level string, day time.Ti
 		return nil, nil, err
 	}
 
-	items, title, err := b.build(ctx, lang, level, dayStr)
-	if err != nil {
-		return nil, nil, err
-	}
 	status := store.ChallengeStatusDraft
 	if publish {
 		status = store.ChallengeStatusPublished
 	}
-	created, wasCreated, err := b.st.CreateChallenge(ctx, store.DailyChallenge{
-		Lang:   lang,
-		Level:  level,
-		Day:    dayStr,
-		Title:  title,
-		Status: status,
-	}, items)
-	if err != nil {
-		return nil, nil, err
+
+	start := 0
+	for i, t := range challengeCycle {
+		if t == challengeTypeForDay(day) {
+			start = i
+			break
+		}
 	}
-	if !wasCreated {
-		// 并发请求下另一个协程先写入了，读取已有内容即可。
-		items, err = b.st.ListChallengeItems(ctx, created.ID)
-		return created, items, err
+	for offset := 0; offset < len(challengeCycle); offset++ {
+		challengeType := challengeCycle[(start+offset)%len(challengeCycle)]
+		items, title, buildErr := b.build(ctx, lang, level, dayStr, challengeType)
+		if errors.Is(buildErr, ErrNoContent) {
+			continue
+		}
+		if buildErr != nil {
+			return nil, nil, buildErr
+		}
+		created, wasCreated, err := b.st.CreateChallenge(ctx, store.DailyChallenge{
+			Lang:          lang,
+			Level:         level,
+			Day:           dayStr,
+			ChallengeType: challengeType,
+			Title:         title,
+			Status:        status,
+		}, items)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !wasCreated {
+			// 并发请求下另一个协程先写入了，读取已有内容即可。
+			items, err = b.st.ListChallengeItems(ctx, created.ID)
+			return created, items, err
+		}
+		return created, items, nil
 	}
-	return created, items, nil
+	return nil, nil, ErrNoContent
 }
 
 // Regenerate 重新生成草稿关卡内容；已发布关卡返回 store.ErrChallengeLocked。
@@ -101,7 +165,11 @@ func (b *Builder) Regenerate(ctx context.Context, lang, level string, day time.T
 	if existing.Status == store.ChallengeStatusPublished {
 		return nil, nil, store.ErrChallengeLocked
 	}
-	items, title, err := b.build(ctx, lang, level, dayStr)
+	challengeType := existing.ChallengeType
+	if challengeType == "" {
+		challengeType = challengeTypeForDay(day)
+	}
+	items, title, err := b.build(ctx, lang, level, dayStr, challengeType)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -134,38 +202,52 @@ func (b *Builder) GenerateDay(ctx context.Context, day time.Time) []error {
 	return errs
 }
 
-func (b *Builder) build(ctx context.Context, lang, level, dayStr string) ([]store.DailyChallengeItem, string, error) {
+// build 按题型生成题目；素材不足返回 ErrNoContent。
+func (b *Builder) build(ctx context.Context, lang, level, dayStr, challengeType string) ([]store.DailyChallengeItem, string, error) {
 	seed := dayStr + "|" + lang + "|" + level
-	items := make([]store.DailyChallengeItem, 0, totalItems)
 
-	wordItems, err := b.buildWordItems(ctx, lang, level, seed, dayStr)
+	var (
+		items []store.DailyChallengeItem
+		err   error
+	)
+	switch challengeType {
+	case store.ChallengeTypeGrammar:
+		items, err = b.buildGrammarItems(ctx, lang, level, seed)
+	case store.ChallengeTypeListening:
+		items, err = b.buildListeningItems(ctx, lang, level, seed)
+	default:
+		items, err = b.buildVocabItems(ctx, lang, level, seed, dayStr)
+	}
 	if err != nil {
 		return nil, "", err
 	}
-	items = append(items, wordItems...)
-
-	collocationItems, err := b.buildCollocationItems(ctx, lang, level, seed)
-	if err != nil {
-		return nil, "", err
-	}
-	items = append(items, collocationItems...)
-
-	grammarItem, err := b.buildGrammarItem(ctx, lang, level, seed)
-	if err != nil && !errors.Is(err, ErrNoContent) {
-		return nil, "", err
-	}
-	if grammarItem != nil {
-		items = append(items, *grammarItem)
-	}
-
 	if len(items) < 3 {
 		return nil, "", ErrNoContent
+	}
+	if len(items) > itemsPerChallenge {
+		items = items[:itemsPerChallenge]
 	}
 	for i := range items {
 		items[i].Seq = i + 1
 	}
-	title := fmt.Sprintf("%s %s 每日关卡", dayStr[5:], level)
+	title := fmt.Sprintf("%s %s %s关卡", dayStr[5:], level, typeLabel(challengeType))
 	return items, title, nil
+}
+
+// buildVocabItems 生成单词 + 固定搭配共 6 题。
+func (b *Builder) buildVocabItems(ctx context.Context, lang, level, seed, dayStr string) ([]store.DailyChallengeItem, error) {
+	wordItems, err := b.buildWordItems(ctx, lang, level, seed, dayStr)
+	if err != nil {
+		return nil, err
+	}
+	collocationItems, err := b.buildCollocationItems(ctx, lang, level, seed)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]store.DailyChallengeItem, 0, itemsPerChallenge)
+	items = append(items, wordItems...)
+	items = append(items, collocationItems...)
+	return items, nil
 }
 
 func (b *Builder) buildWordItems(ctx context.Context, lang, level, seed, dayStr string) ([]store.DailyChallengeItem, error) {
@@ -254,7 +336,62 @@ func (b *Builder) buildCollocationItems(ctx context.Context, lang, level, seed s
 	return items, nil
 }
 
-func (b *Builder) buildGrammarItem(ctx context.Context, lang, level, seed string) (*store.DailyChallengeItem, error) {
+// buildGrammarItems 优先使用结构化语法题库，不足时用 rag_chunks 模板补足。
+func (b *Builder) buildGrammarItems(ctx context.Context, lang, level, seed string) ([]store.DailyChallengeItem, error) {
+	items, err := b.buildGrammarBankItems(ctx, lang, level, seed)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) < itemsPerChallenge {
+		fill, err := b.buildGrammarTemplateItems(ctx, lang, level, seed, itemsPerChallenge-len(items))
+		if err != nil && !errors.Is(err, ErrNoContent) {
+			return nil, err
+		}
+		items = append(items, fill...)
+	}
+	if len(items) == 0 {
+		return nil, ErrNoContent
+	}
+	return items, nil
+}
+
+// buildGrammarBankItems 从 grammar_questions 取结构化题。
+func (b *Builder) buildGrammarBankItems(ctx context.Context, lang, level, seed string) ([]store.DailyChallengeItem, error) {
+	pool, err := b.st.ChallengeGrammarPool(ctx, lang, level, seed, itemsPerChallenge)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]store.DailyChallengeItem, 0, len(pool))
+	for _, q := range pool {
+		var options []string
+		if err := json.Unmarshal(q.Options, &options); err != nil {
+			continue
+		}
+		answer := strings.TrimSpace(q.Answer)
+		if len(options) < 2 || answer == "" {
+			continue
+		}
+		if !containsFold(options, answer) {
+			continue
+		}
+		question := q.Stem
+		if question == "" {
+			question = fmt.Sprintf("下面哪一项符合「%s」？", q.PointLabel)
+		}
+		item, err := newChoiceItem("grammar", fmt.Sprintf("grammar:%d", q.ID), question, options, answer, q.Explanation)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+// buildGrammarTemplateItems 用语法切片里的示例句生成“哪句体现了该语法点”的题。
+func (b *Builder) buildGrammarTemplateItems(ctx context.Context, lang, level, seed string, need int) ([]store.DailyChallengeItem, error) {
+	if need <= 0 {
+		return nil, nil
+	}
 	points, err := b.st.ListGrammarPoints(ctx, lang, level)
 	if err != nil {
 		return nil, err
@@ -271,30 +408,253 @@ func (b *Builder) buildGrammarItem(ctx context.Context, lang, level, seed string
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return hashHex(seed+candidates[i].Key) < hashHex(seed+candidates[j].Key)
 	})
-	if len(candidates) > optionsPerQuestion {
-		candidates = candidates[:optionsPerQuestion]
-	}
 
-	correct := candidates[0]
-	options := make([]string, 0, len(candidates))
-	options = append(options, correct.Prompts[0])
-	for _, p := range candidates[1:] {
-		prompt := p.Prompts[0]
-		if containsFold(options, prompt) {
+	items := make([]store.DailyChallengeItem, 0, need)
+	usedPrompts := make(map[string]bool)
+	for _, point := range candidates {
+		if len(items) >= need {
+			break
+		}
+		correct := pickPrompt(point, seed)
+		if correct == "" || usedPrompts[strings.ToLower(correct)] {
 			continue
 		}
-		options = append(options, prompt)
+		options := []string{correct}
+		for _, other := range candidates {
+			if len(options) >= optionsPerQuestion {
+				break
+			}
+			distractor := pickPrompt(other, seed)
+			if distractor == "" || strings.EqualFold(distractor, correct) || containsFold(options, distractor) {
+				continue
+			}
+			options = append(options, distractor)
+		}
+		if len(options) < 2 {
+			continue
+		}
+		usedPrompts[strings.ToLower(correct)] = true
+		question := fmt.Sprintf("下面哪一句体现了「%s」？", point.Label)
+		explanation := fmt.Sprintf("考点：%s。%s", point.Label, correct)
+		item, err := newChoiceItem("grammar", "grammar:"+point.Key, question, options, correct, explanation)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
 	}
-	if len(options) < 2 {
-		return nil, ErrNoContent
+	return items, nil
+}
+
+func pickPrompt(point store.GrammarPoint, seed string) string {
+	if len(point.Prompts) == 0 {
+		return ""
 	}
-	question := fmt.Sprintf("下面哪一句体现了「%s」？", correct.Label)
-	explanation := fmt.Sprintf("考点：%s。%s", correct.Label, correct.Prompts[0])
-	item, err := newChoiceItem("grammar", "grammar:"+correct.Key, question, options, correct.Prompts[0], explanation)
+	index := len(hashHex(seed+point.Key+"|prompt")) % len(point.Prompts)
+	for offset := 0; offset < len(point.Prompts); offset++ {
+		prompt := strings.TrimSpace(point.Prompts[(index+offset)%len(point.Prompts)])
+		if prompt != "" {
+			return prompt
+		}
+	}
+	return ""
+}
+
+// listeningManifest 是听力任务的 manifest.json 子集。
+type listeningManifest struct {
+	ExamID    string              `json:"exam_id"`
+	Questions []listeningQuestion `json:"questions"`
+}
+
+type listeningQuestion struct {
+	Number     int             `json:"number"`
+	Start      float64         `json:"start"`
+	End        float64         `json:"end"`
+	Audio      string          `json:"audio"`
+	Options    []string        `json:"options"`
+	Answer     json.RawMessage `json:"answer"`
+	Transcript string          `json:"transcript"`
+}
+
+type listeningCandidate struct {
+	ExamID   string
+	Number   int
+	Audio    string
+	Options  []string
+	Answer   string
+	Duration float64
+	Text     string
+}
+
+// buildListeningItems 从已有听力任务的 manifest 中取题；优先同一套听力。
+func (b *Builder) buildListeningItems(ctx context.Context, lang, level, seed string) ([]store.DailyChallengeItem, error) {
+	jobs, err := b.st.ChallengeListeningJobs(ctx, lang, level)
 	if err != nil {
 		return nil, err
 	}
-	return &item, nil
+	byExam := make(map[string][]listeningCandidate, len(jobs))
+	for _, job := range jobs {
+		manifest, err := b.readListeningManifest(job.ExamID)
+		if err != nil {
+			continue
+		}
+		candidates := listeningCandidates(job.ExamID, manifest)
+		if len(candidates) > 0 {
+			byExam[job.ExamID] = candidates
+		}
+	}
+	if len(byExam) == 0 {
+		return nil, ErrNoContent
+	}
+
+	examIDs := make([]string, 0, len(byExam))
+	for examID := range byExam {
+		examIDs = append(examIDs, examID)
+	}
+	sort.SliceStable(examIDs, func(i, j int) bool {
+		return hashHex(seed+examIDs[i]) < hashHex(seed+examIDs[j])
+	})
+
+	// 优先使用单套听力凑满 6 题，保证同一次考试语境连贯。
+	picked := make([]listeningCandidate, 0, itemsPerChallenge)
+	for _, examID := range examIDs {
+		if len(byExam[examID]) >= itemsPerChallenge {
+			picked = append(picked, byExam[examID][:itemsPerChallenge]...)
+			break
+		}
+	}
+	if len(picked) < itemsPerChallenge {
+		picked = picked[:0]
+		for _, examID := range examIDs {
+			candidates := append([]listeningCandidate(nil), byExam[examID]...)
+			sort.SliceStable(candidates, func(i, j int) bool {
+				return hashHex(fmt.Sprintf("%s|%s|%d", seed, examID, candidates[i].Number)) <
+					hashHex(fmt.Sprintf("%s|%s|%d", seed, examID, candidates[j].Number))
+			})
+			for _, candidate := range candidates {
+				if len(picked) >= itemsPerChallenge {
+					break
+				}
+				picked = append(picked, candidate)
+			}
+			if len(picked) >= itemsPerChallenge {
+				break
+			}
+		}
+	}
+	if len(picked) == 0 {
+		return nil, ErrNoContent
+	}
+
+	items := make([]store.DailyChallengeItem, 0, len(picked))
+	for _, candidate := range picked {
+		refID := fmt.Sprintf("listening:%s:%d", candidate.ExamID, candidate.Number)
+		question := fmt.Sprintf("听力第 %d 题", candidate.Number)
+		item, err := newAudioItem(refID, question, candidate.Options, candidate.Answer, candidate.Audio, candidate.Duration, candidate.Text)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (b *Builder) readListeningManifest(examID string) (*listeningManifest, error) {
+	if examID == "" {
+		return nil, ErrNoContent
+	}
+	path := filepath.Join(b.workDir, "listening", examID, "manifest.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var manifest listeningManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+// listeningCandidates 把 manifest 题目转成可出题的候选；丢弃无答案或无选项的题。
+func listeningCandidates(examID string, manifest *listeningManifest) []listeningCandidate {
+	if manifest == nil {
+		return nil
+	}
+	out := make([]listeningCandidate, 0, len(manifest.Questions))
+	for _, q := range manifest.Questions {
+		audio := strings.TrimSpace(q.Audio)
+		if q.Number <= 0 || audio == "" || strings.Contains(audio, "..") {
+			continue
+		}
+		answerRaw := strings.TrimSpace(string(q.Answer))
+		var answer string
+		if err := json.Unmarshal(q.Answer, &answer); err != nil {
+			answer = strings.Trim(answerRaw, `"`)
+		}
+		answer = strings.TrimSpace(answer)
+		if answer == "" || answer == "null" {
+			continue
+		}
+
+		options := make([]string, 0, len(q.Options))
+		for _, opt := range q.Options {
+			opt = strings.TrimSpace(opt)
+			if opt != "" {
+				options = append(options, opt)
+			}
+		}
+		answer = normalizeListeningAnswer(answer, options)
+		if answer == "" {
+			continue
+		}
+		// 判断题固定用 Richtig/Falsch 两个选项，不采用 OCR 文本。
+		if isTrueFalseAnswer(answer) {
+			options = []string{"Richtig", "Falsch"}
+		}
+		if len(options) < 2 {
+			continue
+		}
+		if !containsFold(options, answer) {
+			continue
+		}
+		out = append(out, listeningCandidate{
+			ExamID:   examID,
+			Number:   q.Number,
+			Audio:    filepath.ToSlash(filepath.Join("listening", examID, filepath.FromSlash(audio))),
+			Options:  options,
+			Answer:   answer,
+			Duration: math.Round((q.End-q.Start)*10) / 10,
+			Text:     strings.TrimSpace(q.Transcript),
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Number < out[j].Number })
+	return out
+}
+
+// normalizeListeningAnswer 把 A/B/C/D 映射为选项文本，判断题归一为 Richtig/Falsch。
+func normalizeListeningAnswer(answer string, options []string) string {
+	upper := strings.ToUpper(answer)
+	switch upper {
+	case "R", "RICHTIG", "TRUE", "T":
+		return "Richtig"
+	case "F", "FALSCH", "FALSE":
+		return "Falsch"
+	}
+	if len(upper) == 1 && upper[0] >= 'A' && upper[0] <= 'D' {
+		index := int(upper[0] - 'A')
+		if index < len(options) {
+			return options[index]
+		}
+	}
+	for _, opt := range options {
+		if strings.EqualFold(strings.TrimSpace(opt), answer) {
+			return opt
+		}
+	}
+	return ""
+}
+
+func isTrueFalseAnswer(answer string) bool {
+	return answer == "Richtig" || answer == "Falsch"
 }
 
 func newChoiceItem(kind, refID, question string, options []string, correct, explanation string) (store.DailyChallengeItem, error) {
@@ -309,6 +669,31 @@ func newChoiceItem(kind, refID, question string, options []string, correct, expl
 	}
 	return store.DailyChallengeItem{
 		Kind:        kind,
+		RefID:       refID,
+		Prompt:      prompt,
+		Answer:      answer,
+		Explanation: explanation,
+	}, nil
+}
+
+func newAudioItem(refID, question string, options []string, correct, audio string, duration float64, explanation string) (store.DailyChallengeItem, error) {
+	options = shuffleOptions(options, refID)
+	prompt, err := json.Marshal(audioChoicePrompt{
+		Type:     "audio_choice",
+		Question: question,
+		Options:  options,
+		Audio:    audio,
+		Duration: duration,
+	})
+	if err != nil {
+		return store.DailyChallengeItem{}, err
+	}
+	answer, err := json.Marshal(choiceAnswer{Value: correct})
+	if err != nil {
+		return store.DailyChallengeItem{}, err
+	}
+	return store.DailyChallengeItem{
+		Kind:        "listening",
 		RefID:       refID,
 		Prompt:      prompt,
 		Answer:      answer,

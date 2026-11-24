@@ -2,10 +2,15 @@ package handler
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -104,6 +109,96 @@ type challengeItemView struct {
 	Seq    int             `json:"seq"`
 	Kind   string          `json:"kind"`
 	Prompt json.RawMessage `json:"prompt"`
+	Audio  *challengeAudio `json:"audio,omitempty"`
+}
+
+// challengeAudio 是听力题的短期签名播放地址。
+type challengeAudio struct {
+	URL      string  `json:"url"`
+	Duration float64 `json:"duration"`
+}
+
+// audioSecret 复用微信登录密钥签发短期音频链接。
+func (h *Handler) audioSecret() string {
+	if secret := strings.TrimSpace(h.wx.TokenSecret); secret != "" {
+		return secret
+	}
+	return strings.TrimSpace(h.wx.AppSecret)
+}
+
+func (h *Handler) signChallengeAudio(itemID, exp int64) string {
+	mac := hmac.New(sha256.New, []byte(h.audioSecret()))
+	fmt.Fprintf(mac, "%d:%d", itemID, exp)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// challengeAudioURL 生成 10 分钟有效的音频地址；未配置密钥时返回空串。
+func (h *Handler) challengeAudioURL(itemID int64) string {
+	if h.audioSecret() == "" || itemID <= 0 {
+		return ""
+	}
+	exp := time.Now().Add(10 * time.Minute).Unix()
+	return fmt.Sprintf("/api/levels/audio/%d?exp=%d&sig=%s", itemID, exp, h.signChallengeAudio(itemID, exp))
+}
+
+// challengeAudioFile 校验签名后按 Range 返回听力切片。
+func (h *Handler) challengeAudioFile(c *gin.Context) {
+	if h.audioSecret() == "" {
+		writeError(c, http.StatusServiceUnavailable, "音频服务未配置")
+		return
+	}
+	itemID, err := strconv.ParseInt(c.Param("itemId"), 10, 64)
+	if err != nil || itemID <= 0 {
+		writeError(c, http.StatusBadRequest, "invalid item id")
+		return
+	}
+	exp, err := strconv.ParseInt(c.Query("exp"), 10, 64)
+	if err != nil || exp < time.Now().Unix() {
+		writeError(c, http.StatusForbidden, "audio link expired")
+		return
+	}
+	expected := h.signChallengeAudio(itemID, exp)
+	if !hmac.Equal([]byte(c.Query("sig")), []byte(expected)) {
+		writeError(c, http.StatusForbidden, "invalid audio signature")
+		return
+	}
+	item, err := h.store.GetChallengeItem(c.Request.Context(), itemID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "item not found")
+			return
+		}
+		h.logger.Printf("challenge audio item=%d: %v", itemID, err)
+		writeError(c, http.StatusInternalServerError, "load item failed")
+		return
+	}
+	if item.Kind != "listening" {
+		writeError(c, http.StatusNotFound, "item has no audio")
+		return
+	}
+	var prompt struct {
+		Audio string `json:"audio"`
+	}
+	if err := json.Unmarshal(item.Prompt, &prompt); err != nil || strings.TrimSpace(prompt.Audio) == "" {
+		writeError(c, http.StatusNotFound, "audio not found")
+		return
+	}
+	workRoot := os.Getenv("WORK_DIR")
+	if workRoot == "" {
+		workRoot = "work"
+	}
+	target, err := safeJoin(workRoot, prompt.Audio)
+	if err != nil {
+		writeError(c, http.StatusNotFound, "audio not found")
+		return
+	}
+	if info, err := os.Stat(target); err != nil || info.IsDir() {
+		writeError(c, http.StatusNotFound, "audio not found")
+		return
+	}
+	c.Header("Content-Type", "audio/mp4")
+	c.Header("Cache-Control", "private, max-age=600")
+	http.ServeFile(c.Writer, c.Request, target)
 }
 
 // dailyChallengeToday 返回当天关卡、当前用户的作答与连续打卡。
@@ -150,13 +245,26 @@ func (h *Handler) dailyChallengeToday(c *gin.Context) {
 
 	views := make([]challengeItemView, 0, len(items))
 	for _, item := range items {
-		views = append(views, challengeItemView{Seq: item.Seq, Kind: item.Kind, Prompt: item.Prompt})
+		view := challengeItemView{Seq: item.Seq, Kind: item.Kind, Prompt: item.Prompt}
+		if item.Kind == "listening" {
+			var prompt struct {
+				Audio    string  `json:"audio"`
+				Duration float64 `json:"duration"`
+			}
+			if json.Unmarshal(item.Prompt, &prompt) == nil && prompt.Audio != "" {
+				if url := h.challengeAudioURL(item.ID); url != "" {
+					view.Audio = &challengeAudio{URL: url, Duration: prompt.Duration}
+				}
+			}
+		}
+		views = append(views, view)
 	}
 	resp["challenge"] = map[string]any{
-		"id":    ch.ID,
-		"day":   ch.Day,
-		"title": ch.Title,
-		"items": views,
+		"id":             ch.ID,
+		"day":            ch.Day,
+		"challenge_type": ch.ChallengeType,
+		"title":          ch.Title,
+		"items":          views,
 	}
 	if attempt, err := h.store.GetAttempt(c.Request.Context(), openid, ch.ID); err == nil {
 		resp["attempt"] = map[string]any{

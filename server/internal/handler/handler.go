@@ -209,6 +209,7 @@ func (h *Handler) Routes() http.Handler {
 	levels := api.Group("/levels")
 	{
 		levels.GET("/today", h.dailyChallengeToday)
+		levels.GET("/audio/:itemId", h.challengeAudioFile)
 		levels.POST("/:id/submit", h.submitDailyChallenge)
 		levels.GET("/calendar", h.dailyChallengeCalendar)
 		levels.GET("/streak", h.dailyChallengeStreak)

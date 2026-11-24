@@ -15,15 +15,16 @@ import (
 
 // DailyChallenge 对应 daily_challenges 一行；day 为 YYYY-MM-DD。
 type DailyChallenge struct {
-	ID        int64     `gorm:"column:id" json:"id"`
-	Lang      string    `gorm:"column:lang" json:"lang"`
-	Level     string    `gorm:"column:level" json:"level"`
-	Day       string    `gorm:"column:day" json:"day"`
-	Title     string    `gorm:"column:title" json:"title"`
-	Status    string    `gorm:"column:status" json:"status"`
-	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
-	UpdatedAt time.Time `gorm:"column:updated_at" json:"updated_at"`
-	ItemCount int       `gorm:"column:item_count" json:"item_count"`
+	ID            int64     `gorm:"column:id" json:"id"`
+	Lang          string    `gorm:"column:lang" json:"lang"`
+	Level         string    `gorm:"column:level" json:"level"`
+	Day           string    `gorm:"column:day" json:"day"`
+	ChallengeType string    `gorm:"column:challenge_type" json:"challenge_type"`
+	Title         string    `gorm:"column:title" json:"title"`
+	Status        string    `gorm:"column:status" json:"status"`
+	CreatedAt     time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt     time.Time `gorm:"column:updated_at" json:"updated_at"`
+	ItemCount     int       `gorm:"column:item_count" json:"item_count"`
 }
 
 // DailyChallengeItem 对应 daily_challenge_items 一行，prompt/answer 为 JSONB。
@@ -118,7 +119,7 @@ var ErrChallengeLocked = errors.New("challenge locked")
 func (s *Store) GetChallengeByDay(ctx context.Context, lang, level, day string) (*DailyChallenge, error) {
 	var ch DailyChallenge
 	err := s.db.WithContext(ctx).Raw(
-		`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, title, status,
+		`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, challenge_type, title, status,
 		        created_at, updated_at,
 		        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = daily_challenges.id) AS item_count
 		 FROM daily_challenges
@@ -138,7 +139,7 @@ func (s *Store) GetChallengeByDay(ctx context.Context, lang, level, day string) 
 func (s *Store) GetChallengeByID(ctx context.Context, id int64) (*DailyChallenge, error) {
 	var ch DailyChallenge
 	err := s.db.WithContext(ctx).Raw(
-		`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, title, status,
+		`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, challenge_type, title, status,
 		        created_at, updated_at,
 		        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = daily_challenges.id) AS item_count
 		 FROM daily_challenges WHERE id = ?`,
@@ -170,21 +171,24 @@ func (s *Store) ListChallengeItems(ctx context.Context, challengeID int64) ([]Da
 func (s *Store) CreateChallenge(ctx context.Context, ch DailyChallenge, items []DailyChallengeItem) (*DailyChallenge, bool, error) {
 	var out *DailyChallenge
 	created := false
+	if ch.ChallengeType == "" {
+		ch.ChallengeType = ChallengeTypeVocab
+	}
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var id int64
 		if err := tx.Raw(
-			`INSERT INTO daily_challenges (lang, level, day, title, status)
-			 VALUES (?, ?, ?::date, ?, ?)
+			`INSERT INTO daily_challenges (lang, level, day, challenge_type, title, status)
+			 VALUES (?, ?, ?::date, ?, ?, ?)
 			 ON CONFLICT (lang, level, day) DO NOTHING
 			 RETURNING id`,
-			ch.Lang, ch.Level, ch.Day, ch.Title, ch.Status,
+			ch.Lang, ch.Level, ch.Day, ch.ChallengeType, ch.Title, ch.Status,
 		).Scan(&id).Error; err != nil {
 			return err
 		}
 		if id == 0 {
 			var existing DailyChallenge
 			if err := tx.Raw(
-				`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, title, status,
+				`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, challenge_type, title, status,
 				        created_at, updated_at,
 				        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = daily_challenges.id) AS item_count
 				 FROM daily_challenges WHERE lang = ? AND level = ? AND day = ?::date`,
@@ -208,7 +212,7 @@ func (s *Store) CreateChallenge(ctx context.Context, ch DailyChallenge, items []
 		}
 		var saved DailyChallenge
 		if err := tx.Raw(
-			`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, title, status,
+			`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, challenge_type, title, status,
 			        created_at, updated_at,
 			        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = daily_challenges.id) AS item_count
 			 FROM daily_challenges WHERE id = ?`, id,
@@ -628,4 +632,105 @@ func (s *Store) ChallengeCollocationPool(ctx context.Context, lang, level, seed 
 		list = append(list, c)
 	}
 	return list, nil
+}
+
+const (
+	// ChallengeTypeVocab 单词 + 固定搭配。
+	ChallengeTypeVocab = "vocab"
+	// ChallengeTypeGrammar 纯语法题。
+	ChallengeTypeGrammar = "grammar"
+	// ChallengeTypeListening 纯听力题。
+	ChallengeTypeListening = "listening"
+)
+
+// GrammarQuestion 是结构化语法题库的一行。
+type GrammarQuestion struct {
+	ID          int64           `gorm:"column:id"`
+	Lang        string          `gorm:"column:lang"`
+	Level       string          `gorm:"column:level"`
+	PointKey    string          `gorm:"column:point_key"`
+	PointLabel  string          `gorm:"column:point_label"`
+	Stem        string          `gorm:"column:stem"`
+	Options     json.RawMessage `gorm:"column:options"`
+	Answer      string          `gorm:"column:answer"`
+	Explanation string          `gorm:"column:explanation"`
+	SourcePath  string          `gorm:"column:source_path"`
+}
+
+// ChallengeGrammarPool 返回结构化语法题候选；优先当前等级，不足时补同语种。
+func (s *Store) ChallengeGrammarPool(ctx context.Context, lang, level, seed string, limit int) ([]GrammarQuestion, error) {
+	out := make([]GrammarQuestion, 0, limit)
+	err := s.db.WithContext(ctx).Raw(
+		`SELECT id, lang, level, point_key, point_label, stem, options,
+		        answer, explanation, source_path
+		 FROM grammar_questions
+		 WHERE lang = ? AND active AND (level = ? OR level = '')
+		 ORDER BY md5(stem || ?) ASC, id ASC
+		 LIMIT ?`,
+		lang, level, seed, limit,
+	).Scan(&out).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(out) >= limit {
+		return out, nil
+	}
+	seen := make(map[int64]bool, len(out))
+	for _, q := range out {
+		seen[q.ID] = true
+	}
+	extra := make([]GrammarQuestion, 0, limit-len(out))
+	err = s.db.WithContext(ctx).Raw(
+		`SELECT id, lang, level, point_key, point_label, stem, options,
+		        answer, explanation, source_path
+		 FROM grammar_questions
+		 WHERE lang = ? AND active
+		 ORDER BY md5(stem || ?) ASC, id ASC
+		 LIMIT ?`,
+		lang, seed, limit*2,
+	).Scan(&extra).Error
+	if err != nil {
+		return out, err
+	}
+	for _, q := range extra {
+		if len(out) >= limit {
+			break
+		}
+		if seen[q.ID] {
+			continue
+		}
+		seen[q.ID] = true
+		out = append(out, q)
+	}
+	return out, nil
+}
+
+// ChallengeListeningJobs 返回可作为听力题源的活跃任务；优先同等级。
+func (s *Store) ChallengeListeningJobs(ctx context.Context, lang, level string) ([]ListeningJob, error) {
+	jobs := make([]ListeningJob, 0, 16)
+	err := s.db.WithContext(ctx).Raw(
+		`SELECT job_id, exam_id, name, lang, level, source_url, status, manifest_path,
+		        log_path, error_msg, last_log_at, deleted_at, has_answers, created_at, updated_at
+		 FROM listening_jobs
+		 WHERE lang = ? AND deleted_at IS NULL AND status = 'built'
+		 ORDER BY (level = ?) DESC, exam_id ASC`,
+		lang, level,
+	).Scan(&jobs).Error
+	return jobs, err
+}
+
+// GetChallengeItem 按主键读取单道题，供音频下发校验路径。
+func (s *Store) GetChallengeItem(ctx context.Context, id int64) (*DailyChallengeItem, error) {
+	var item DailyChallengeItem
+	err := s.db.WithContext(ctx).Raw(
+		`SELECT id, challenge_id, seq, kind, ref_id, prompt, answer, explanation
+		 FROM daily_challenge_items WHERE id = ?`, id,
+	).Scan(&item).Error
+	if err != nil {
+		return nil, err
+	}
+	if item.ID == 0 {
+		return nil, ErrNotFound
+	}
+	return &item, nil
 }
