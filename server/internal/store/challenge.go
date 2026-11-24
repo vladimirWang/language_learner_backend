@@ -645,17 +645,29 @@ const (
 
 // GrammarQuestion 是结构化语法题库的一行。
 type GrammarQuestion struct {
-	ID          int64           `gorm:"column:id"`
-	Lang        string          `gorm:"column:lang"`
-	Level       string          `gorm:"column:level"`
-	PointKey    string          `gorm:"column:point_key"`
-	PointLabel  string          `gorm:"column:point_label"`
-	Stem        string          `gorm:"column:stem"`
-	Options     json.RawMessage `gorm:"column:options"`
-	Answer      string          `gorm:"column:answer"`
-	Explanation string          `gorm:"column:explanation"`
-	SourcePath  string          `gorm:"column:source_path"`
+	ID          int64           `gorm:"column:id" json:"id"`
+	Lang        string          `gorm:"column:lang" json:"lang"`
+	Level       string          `gorm:"column:level" json:"level"`
+	PointKey    string          `gorm:"column:point_key" json:"point_key"`
+	PointLabel  string          `gorm:"column:point_label" json:"point_label"`
+	Stem        string          `gorm:"column:stem" json:"stem"`
+	Options     json.RawMessage `gorm:"column:options" json:"options"`
+	Answer      string          `gorm:"column:answer" json:"answer"`
+	Explanation string          `gorm:"column:explanation" json:"explanation"`
+	SourcePath  string          `gorm:"column:source_path" json:"source_path"`
+	SourceSHA   string          `gorm:"column:source_sha" json:"source_sha"`
+	GeneratedBy string          `gorm:"column:generated_by" json:"generated_by"`
+	Status      string          `gorm:"column:status" json:"status"`
+	ReviewNote  string          `gorm:"column:review_note" json:"review_note"`
+	ReviewedAt  *time.Time      `gorm:"column:reviewed_at" json:"reviewed_at"`
 }
+
+// 语法题审核状态。
+const (
+	GrammarStatusDraft    = "draft"
+	GrammarStatusApproved = "approved"
+	GrammarStatusRejected = "rejected"
+)
 
 // ChallengeGrammarPool 返回结构化语法题候选；优先当前等级，不足时补同语种。
 func (s *Store) ChallengeGrammarPool(ctx context.Context, lang, level, seed string, limit int) ([]GrammarQuestion, error) {
@@ -664,7 +676,7 @@ func (s *Store) ChallengeGrammarPool(ctx context.Context, lang, level, seed stri
 		`SELECT id, lang, level, point_key, point_label, stem, options,
 		        answer, explanation, source_path
 		 FROM grammar_questions
-		 WHERE lang = ? AND active AND (level = ? OR level = '')
+		 WHERE lang = ? AND active AND status = 'approved' AND (level = ? OR level = '')
 		 ORDER BY md5(stem || ?) ASC, id ASC
 		 LIMIT ?`,
 		lang, level, seed, limit,
@@ -684,7 +696,7 @@ func (s *Store) ChallengeGrammarPool(ctx context.Context, lang, level, seed stri
 		`SELECT id, lang, level, point_key, point_label, stem, options,
 		        answer, explanation, source_path
 		 FROM grammar_questions
-		 WHERE lang = ? AND active
+		 WHERE lang = ? AND active AND status = 'approved'
 		 ORDER BY md5(stem || ?) ASC, id ASC
 		 LIMIT ?`,
 		lang, seed, limit*2,

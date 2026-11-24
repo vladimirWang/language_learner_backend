@@ -224,6 +224,15 @@ func (h *Handler) Routes() http.Handler {
 		adminLevels.PATCH("/:day", h.adminUpdateChallenge)
 	}
 
+	// 语法题库审核：agent 导入草稿、导出 CSV、回传审核结果。
+	adminGrammar := api.Group("/admin/grammar")
+	{
+		adminGrammar.GET("/questions", h.adminListGrammarQuestions)
+		adminGrammar.POST("/questions", h.adminImportGrammarDrafts)
+		adminGrammar.GET("/questions.csv", h.adminExportGrammarCSV)
+		adminGrammar.POST("/questions/review", h.adminImportGrammarCSV)
+	}
+
 	// 口语题库与兜底话术
 	speaking := api.Group("/speaking")
 	{
