@@ -3,6 +3,8 @@ package storage
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/url"
 	"strings"
 	"time"
@@ -11,7 +13,10 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-// Presigner 基于 S3 兼容存储（MinIO / 阿里云 OSS）签发临时下载地址。
+// ErrNotConfigured 表示未配置对象存储。
+var ErrNotConfigured = errors.New("object storage not configured")
+
+// Presigner 基于 S3 兼容存储（MinIO / 阿里云 OSS）上传私有对象并签发临时下载地址。
 type Presigner struct {
 	client *minio.Client
 	bucket string
@@ -31,6 +36,15 @@ func NewPresigner(endpoint, bucket, accessKey, secretKey string, useSSL bool) (*
 		return nil, err
 	}
 	return &Presigner{client: client, bucket: bucket}, nil
+}
+
+// Upload 上传私有对象并显式设置内容类型。
+func (p *Presigner) Upload(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
+	if p == nil {
+		return ErrNotConfigured
+	}
+	_, err := p.client.PutObject(ctx, p.bucket, key, r, size, minio.PutObjectOptions{ContentType: contentType})
+	return err
 }
 
 // URL 把对象 key 转为 7 天有效的下载链接；已是完整 URL / 本地路径时原样返回。

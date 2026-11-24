@@ -632,16 +632,21 @@ func (s *Store) UpdateSpeakingItem(ctx context.Context, item SpeakingItem) error
 	return nil
 }
 
-// DeleteSpeakingItem 按 item_key 删除口语题目。
+// DeleteSpeakingItem 按 item_key 删除口语题目，并显式清理方案映射。
 func (s *Store) DeleteSpeakingItem(ctx context.Context, key string) error {
-	res := s.db.WithContext(ctx).Where("item_key = ?", key).Delete(&SpeakingItem{})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("DELETE FROM speaking_exam_plan_items WHERE item_key = ?", key).Error; err != nil {
+			return err
+		}
+		res := tx.Where("item_key = ?", key).Delete(&SpeakingItem{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 // LevelExamInfo 是关卡关联的 exam 附带 exam 基本信息的视图。
@@ -711,9 +716,14 @@ func (s *Store) SetLevelActive(ctx context.Context, id int64, active bool) error
 	})
 }
 
-// DeleteLevel 删除测试（级联删除 test_items）。
+// DeleteLevel 删除测试，并在同一事务中显式清理 test_items。
 func (s *Store) DeleteLevel(ctx context.Context, id int64) error {
-	return s.db.WithContext(ctx).Delete(&Level{}, id).Error
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("DELETE FROM test_items WHERE level_id = ?", id).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&Level{}, id).Error
+	})
 }
 
 // GetLevel 返回单个关卡。
@@ -840,8 +850,28 @@ func (s *Store) CountSoloSpeakingItems(ctx context.Context, lang, level string, 
 	return count, err
 }
 
-// replacePlanItems 覆盖方案题目映射。
+// replacePlanItems 覆盖方案题目映射，并在事务内校验方案与口语题目父记录。
 func replacePlanItems(tx *gorm.DB, planID int64, keys []string) error {
+	var parentID int64
+	if err := tx.Raw("SELECT id FROM speaking_exam_plans WHERE id = ? FOR KEY SHARE", planID).Scan(&parentID).Error; err != nil {
+		return err
+	}
+	if parentID == 0 {
+		return ErrNotFound
+	}
+	uniqueKeys := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		uniqueKeys[key] = struct{}{}
+	}
+	if len(uniqueKeys) > 0 {
+		existing := make([]string, 0, len(uniqueKeys))
+		if err := tx.Raw("SELECT item_key FROM speaking_items WHERE item_key IN ? FOR KEY SHARE", keys).Scan(&existing).Error; err != nil {
+			return err
+		}
+		if len(existing) != len(uniqueKeys) {
+			return ErrNotFound
+		}
+	}
 	if err := tx.Exec("DELETE FROM speaking_exam_plan_items WHERE plan_id = ?", planID).Error; err != nil {
 		return err
 	}
@@ -933,16 +963,21 @@ func (s *Store) UpdateSpeakingPlan(ctx context.Context, id int64, plan SpeakingP
 	})
 }
 
-// DeleteSpeakingPlan 删除方案；题目映射随外键级联删除。
+// DeleteSpeakingPlan 删除方案，并在同一事务中显式清理题目映射。
 func (s *Store) DeleteSpeakingPlan(ctx context.Context, id int64) error {
-	res := s.db.WithContext(ctx).Where("id = ?", id).Delete(&SpeakingPlan{})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("DELETE FROM speaking_exam_plan_items WHERE plan_id = ?", id).Error; err != nil {
+			return err
+		}
+		res := tx.Where("id = ?", id).Delete(&SpeakingPlan{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 // ListLevelExams 返回关卡关联的内容，按 sort_order 排序。
@@ -988,13 +1023,22 @@ func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamI
 	return rows, nil
 }
 
-// AddLevelExam 给关卡添加一个题目（听力或口语）；已存在则更新 sort_order。
+// AddLevelExam 给关卡添加一个题目（听力或口语）；写入前校验逻辑外键父记录。
 func (s *Store) AddLevelExam(ctx context.Context, levelID int64, itemType, examID string, sortOrder int) error {
-	row := LevelExam{LevelID: levelID, ExamID: examID, ItemType: itemType, SortOrder: sortOrder}
-	return s.db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "level_id"}, {Name: "item_type"}, {Name: "exam_id"}},
-		DoUpdates: clause.Assignments(map[string]any{"sort_order": sortOrder}),
-	}).Create(&row).Error
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var parentID int64
+		if err := tx.Raw("SELECT id FROM tests WHERE id = ? FOR KEY SHARE", levelID).Scan(&parentID).Error; err != nil {
+			return err
+		}
+		if parentID == 0 {
+			return ErrNotFound
+		}
+		row := LevelExam{LevelID: levelID, ExamID: examID, ItemType: itemType, SortOrder: sortOrder}
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "level_id"}, {Name: "item_type"}, {Name: "exam_id"}},
+			DoUpdates: clause.Assignments(map[string]any{"sort_order": sortOrder}),
+		}).Create(&row).Error
+	})
 }
 
 // RemoveLevelExam 从关卡移除一个题目。
@@ -1148,14 +1192,23 @@ func (s *Store) ListPDFUploadChunks(ctx context.Context, uploadID string) ([]int
 	return indexes, err
 }
 
-// UpsertPDFUploadChunk 记录一个已上传分片（重复上传按覆盖处理）。
+// UpsertPDFUploadChunk 校验上传会话后记录分片（重复上传按覆盖处理）。
 func (s *Store) UpsertPDFUploadChunk(ctx context.Context, uploadID string, index int, size int64) error {
-	return s.db.WithContext(ctx).Exec(
-		`INSERT INTO pdf_upload_chunks (upload_id, chunk_index, size_bytes)
-		 VALUES (?, ?, ?)
-		 ON CONFLICT (upload_id, chunk_index) DO UPDATE SET size_bytes = EXCLUDED.size_bytes`,
-		uploadID, index, size,
-	).Error
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var parentID string
+		if err := tx.Raw("SELECT upload_id FROM pdf_upload_sessions WHERE upload_id = ? FOR KEY SHARE", uploadID).Scan(&parentID).Error; err != nil {
+			return err
+		}
+		if parentID == "" {
+			return ErrNotFound
+		}
+		return tx.Exec(
+			`INSERT INTO pdf_upload_chunks (upload_id, chunk_index, size_bytes)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT (upload_id, chunk_index) DO UPDATE SET size_bytes = EXCLUDED.size_bytes`,
+			uploadID, index, size,
+		).Error
+	})
 }
 
 // CompletePDFUploadSession 标记会话完成并关联导入任务。
@@ -1252,13 +1305,22 @@ func (s *Store) ListPDFImportLogs(ctx context.Context, jobID string, afterLogID 
 	return logs, err
 }
 
-// AppendPDFImportLog 追加一行解析日志。
+// AppendPDFImportLog 校验任务父记录后追加一行解析日志。
 func (s *Store) AppendPDFImportLog(ctx context.Context, jobID, level, message string) error {
-	return s.db.WithContext(ctx).Model(&PDFImportLog{}).Create(map[string]any{
-		"job_id":  jobID,
-		"level":   level,
-		"message": message,
-	}).Error
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var parentID string
+		if err := tx.Raw("SELECT job_id FROM pdf_import_jobs WHERE job_id = ? FOR KEY SHARE", jobID).Scan(&parentID).Error; err != nil {
+			return err
+		}
+		if parentID == "" {
+			return ErrNotFound
+		}
+		return tx.Model(&PDFImportLog{}).Create(map[string]any{
+			"job_id":  jobID,
+			"level":   level,
+			"message": message,
+		}).Error
+	})
 }
 
 // MarkPDFImportQueued 标记消息已成功投递。

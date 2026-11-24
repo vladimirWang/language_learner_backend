@@ -127,6 +127,8 @@ func (h *Handler) Routes() http.Handler {
 			// 微信小程序一键登录：code 换登录态，token 校验会话。
 			auth.POST("/wx-login", h.wxLogin)
 			auth.GET("/wx-me", h.wxMe)
+			auth.PUT("/wx-profile", h.wxUpdateProfile)
+			auth.POST("/wx-avatar", h.wxUploadAvatar)
 		}
 
 		// PDF 试卷导入：分片上传支持断点续传，合并后再投递解析队列

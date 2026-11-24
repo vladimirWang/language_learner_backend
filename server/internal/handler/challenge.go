@@ -18,31 +18,54 @@ import (
 
 var challengeLevelPattern = regexp.MustCompile(`^(A[12]|B[12]|C[12]|N[1-5])$`)
 
-// passRatio 打卡及格线：答对率 ≥ 80%。
-const passRatioNum, passRatioDen = 4, 5
+// challengeStars 标准 6 题每 2 题 1 星；不足 6 题按正确率折算并执行 60% 向下取整兜底。
+func challengeStars(score, total int) int {
+	if total <= 0 || score <= 0 {
+		return 0
+	}
+	stars := 0
+	if total >= 6 {
+		stars = score / 2
+	} else {
+		stars = score * 3 / total
+		if score >= total*3/5 && stars < 1 {
+			stars = 1
+		}
+	}
+	if stars > 3 {
+		return 3
+	}
+	return stars
+}
 
-// requireWXOpenID 从 Bearer token 解析微信用户 openid；未登录返回 401。
-func (h *Handler) requireWXOpenID(c *gin.Context) (string, bool) {
+// requireWXUser 从 Bearer token 解析并读取微信用户。
+func (h *Handler) requireWXUser(c *gin.Context) (store.WXUser, bool) {
 	if !h.wx.Enabled() {
 		writeError(c, http.StatusServiceUnavailable, "微信登录未配置")
-		return "", false
+		return store.WXUser{}, false
 	}
 	token := bearerToken(c)
 	if token == "" {
 		writeError(c, http.StatusUnauthorized, "unauthorized")
-		return "", false
+		return store.WXUser{}, false
 	}
 	uid, err := h.wx.VerifyToken(token, time.Now())
 	if err != nil {
 		writeError(c, http.StatusUnauthorized, "login expired")
-		return "", false
+		return store.WXUser{}, false
 	}
 	u, err := h.store.GetWXUserByID(c.Request.Context(), uid)
 	if err != nil {
 		writeError(c, http.StatusUnauthorized, "user not found")
-		return "", false
+		return store.WXUser{}, false
 	}
-	return u.OpenID, true
+	return u, true
+}
+
+// requireWXOpenID 从 Bearer token 解析微信用户 openid；未登录返回 401。
+func (h *Handler) requireWXOpenID(c *gin.Context) (string, bool) {
+	u, ok := h.requireWXUser(c)
+	return u.OpenID, ok
 }
 
 // parseChallengeLangLevel 校验关卡的语种与等级参数。
@@ -93,15 +116,24 @@ func (h *Handler) dailyChallengeToday(c *gin.Context) {
 	if !ok {
 		return
 	}
+	user, err := h.store.GetWXUserByOpenID(c.Request.Context(), openid)
+	if err != nil {
+		h.logger.Printf("daily challenge user openid=%s: %v", openid, err)
+		writeError(c, http.StatusInternalServerError, "load user failed")
+		return
+	}
 	day := h.todayDay()
+	resp := map[string]any{
+		"date":        day.Format("2006-01-02"),
+		"streak":      h.currentStreak(c.Request.Context(), openid, lang),
+		"total_stars": user.TotalStars,
+	}
 	ch, items, err := h.challenge.EnsureDay(c.Request.Context(), lang, level, day, true)
 	if err != nil {
 		if errors.Is(err, challenge.ErrNoContent) {
-			writeJSON(c, http.StatusOK, map[string]any{
-				"date":      day.Format("2006-01-02"),
-				"challenge": nil,
-				"reason":    "content_not_ready",
-			})
+			resp["challenge"] = nil
+			resp["reason"] = "content_not_ready"
+			writeJSON(c, http.StatusOK, resp)
 			return
 		}
 		h.logger.Printf("daily challenge today lang=%s level=%s: %v", lang, level, err)
@@ -109,11 +141,6 @@ func (h *Handler) dailyChallengeToday(c *gin.Context) {
 		return
 	}
 
-	streak := h.currentStreak(c.Request.Context(), openid, lang)
-	resp := map[string]any{
-		"date":   day.Format("2006-01-02"),
-		"streak": streak,
-	}
 	if ch.Status != store.ChallengeStatusPublished {
 		resp["challenge"] = nil
 		resp["reason"] = "not_published"
@@ -133,9 +160,13 @@ func (h *Handler) dailyChallengeToday(c *gin.Context) {
 	}
 	if attempt, err := h.store.GetAttempt(c.Request.Context(), openid, ch.ID); err == nil {
 		resp["attempt"] = map[string]any{
-			"score":  attempt.Score,
-			"total":  attempt.Total,
-			"passed": attempt.Passed,
+			"answers":    attempt.Answers,
+			"score":      attempt.Score,
+			"total":      attempt.Total,
+			"stars":      attempt.Stars,
+			"best_stars": attempt.BestStars,
+			"passed":     attempt.Passed,
+			"checked_in": attempt.Passed,
 		}
 	} else if !errors.Is(err, store.ErrNotFound) {
 		h.logger.Printf("daily challenge attempt openid=%s: %v", openid, err)
@@ -153,7 +184,7 @@ type submitChallengeReq struct {
 	Answers []submitAnswer `json:"answers"`
 }
 
-// submitDailyChallenge 判分并记录作答；重复提交返回首次结果。
+// submitDailyChallenge 判分并保存最新作答；重复提交按历史最高星补差。
 func (h *Handler) submitDailyChallenge(c *gin.Context) {
 	openid, ok := h.requireWXOpenID(c)
 	if !ok {
@@ -184,6 +215,10 @@ func (h *Handler) submitDailyChallenge(c *gin.Context) {
 		writeError(c, http.StatusForbidden, "challenge not published")
 		return
 	}
+	if ch.Day > h.todayDay().Format("2006-01-02") {
+		writeError(c, http.StatusForbidden, "challenge not yet available")
+		return
+	}
 	items, err := h.store.ListChallengeItems(c.Request.Context(), id)
 	if err != nil {
 		h.logger.Printf("submit challenge items id=%d: %v", id, err)
@@ -198,47 +233,39 @@ func (h *Handler) submitDailyChallenge(c *gin.Context) {
 	}
 	score, itemResults := gradeChallenge(items, req.Answers)
 	total := len(items)
-	passed := total > 0 && score*passRatioDen >= total*passRatioNum
+	stars := challengeStars(score, total)
 
-	attempt, saved, err := h.store.SaveAttempt(c.Request.Context(), store.ChallengeAttempt{
+	submission, err := h.store.SubmitChallengeAttempt(c.Request.Context(), store.ChallengeAttempt{
 		OpenID:      openid,
 		ChallengeID: id,
 		Answers:     rawAnswers,
 		Score:       score,
 		Total:       total,
-		Passed:      passed,
-	})
+		Stars:       stars,
+	}, ch.Lang, ch.Day)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "challenge not found")
+			return
+		}
 		h.logger.Printf("submit challenge save id=%d openid=%s: %v", id, openid, err)
 		writeError(c, http.StatusInternalServerError, "save attempt failed")
 		return
 	}
-
+	attempt := submission.Attempt
+	streak := store.NormalizeStreak(submission.Streak, h.todayDay().Format("2006-01-02"))
 	resp := map[string]any{
-		"score":            attempt.Score,
-		"total":            attempt.Total,
-		"passed":           attempt.Passed,
-		"already_submitted": !saved,
-		"items":            itemResults,
-	}
-	if saved {
-		if attempt.Passed {
-			streak, err := h.store.UpdateStreakOnPass(c.Request.Context(), openid, ch.Lang, ch.Day)
-			if err != nil {
-				h.logger.Printf("submit challenge streak openid=%s: %v", openid, err)
-			} else {
-				resp["streak"] = streak
-			}
-		}
-	} else {
-		// 重复提交：按首次答案重新计算逐题结果，保证响应一致。
-		var stored []submitAnswer
-		if err := json.Unmarshal(attempt.Answers, &stored); err == nil {
-			_, resp["items"] = gradeChallenge(items, stored)
-		}
-	}
-	if _, exists := resp["streak"]; !exists {
-		resp["streak"] = h.currentStreak(c.Request.Context(), openid, ch.Lang)
+		"score":             attempt.Score,
+		"total":             attempt.Total,
+		"stars":             attempt.Stars,
+		"best_stars":        attempt.BestStars,
+		"stars_added":       submission.StarsAdded,
+		"total_stars":       submission.TotalStars,
+		"passed":            attempt.Passed,
+		"checked_in":        attempt.Passed,
+		"already_submitted": submission.AlreadySubmitted,
+		"items":             itemResults,
+		"streak":            streak,
 	}
 	writeJSON(c, http.StatusOK, resp)
 }
@@ -297,6 +324,14 @@ func (h *Handler) dailyChallengeCalendar(c *gin.Context) {
 	from, to, month, ok := h.parseChallengeMonth(c)
 	if !ok {
 		return
+	}
+	today := h.todayDay().Format("2006-01-02")
+	if from > today {
+		writeJSON(c, http.StatusOK, map[string]any{"month": month, "entries": []store.ChallengeCalendarEntry{}})
+		return
+	}
+	if to > today {
+		to = today
 	}
 	entries, err := h.store.ChallengeCalendar(c.Request.Context(), openid, lang, level, from, to)
 	if err != nil {

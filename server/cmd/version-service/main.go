@@ -88,8 +88,12 @@ func main() {
 		RateLimit: cfg.DailyWordsRateLimit,
 		Location:  loc,
 	}
-	// 每日关卡：启动时补当天内容，之后每天 00:05（APP_TZ）生成。
-	challenge.NewScheduler(challenge.NewBuilder(st), loc, logger).Start(ctx)
+	// 每日关卡：启动时补当天和次日；之后在配置时刻生成次日，学员仍须到当天 00:00 才可见。
+	generateAt, err := time.Parse("15:04", cfg.DailyChallengeGenerateAt)
+	if err != nil || generateAt.Format("15:04") != cfg.DailyChallengeGenerateAt {
+		logger.Fatalf("invalid DAILY_CHALLENGE_GENERATE_AT %q, want HH:mm", cfg.DailyChallengeGenerateAt)
+	}
+	challenge.NewScheduler(challenge.NewBuilder(st), loc, logger, generateAt.Hour(), generateAt.Minute()).Start(ctx)
 	ssoCfg := handler.SSOConfig{
 		BaseURL:       cfg.SSOBaseURL,
 		PublicBaseURL: cfg.SSOPublicBaseURL,

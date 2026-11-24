@@ -14,6 +14,7 @@ type WXUser struct {
 	UnionID     *string   `gorm:"column:unionid" json:"unionid"`
 	Nickname    string    `gorm:"column:nickname" json:"nickname"`
 	AvatarURL   string    `gorm:"column:avatar_url" json:"avatar_url"`
+	TotalStars  int64     `gorm:"column:total_stars" json:"total_stars"`
 	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
 	LastLoginAt time.Time `gorm:"column:last_login_at" json:"last_login_at"`
 }
@@ -62,6 +63,22 @@ func (s *Store) GetWXUserByID(ctx context.Context, id int64) (WXUser, error) {
 	var u WXUser
 	err := s.db.WithContext(ctx).Where("id = ?", id).First(&u).Error
 	return u, err
+}
+
+// UpdateWXUserNickname 定向更新昵称，不覆盖其他用户资料。
+func (s *Store) UpdateWXUserNickname(ctx context.Context, id int64, nickname string) (WXUser, error) {
+	if err := s.db.WithContext(ctx).Model(&WXUser{}).Where("id = ?", id).Update("nickname", nickname).Error; err != nil {
+		return WXUser{}, err
+	}
+	return s.GetWXUserByID(ctx, id)
+}
+
+// UpdateWXUserAvatar 定向更新头像对象 key，不覆盖其他用户资料。
+func (s *Store) UpdateWXUserAvatar(ctx context.Context, id int64, avatarKey string) (WXUser, error) {
+	if err := s.db.WithContext(ctx).Model(&WXUser{}).Where("id = ?", id).Update("avatar_url", avatarKey).Error; err != nil {
+		return WXUser{}, err
+	}
+	return s.GetWXUserByID(ctx, id)
 }
 
 // GetWXUserByOpenID 按 openid 读取用户，用于判断是否为首次登录。

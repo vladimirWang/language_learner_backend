@@ -46,17 +46,28 @@ type ChallengeAttempt struct {
 	Answers     json.RawMessage `gorm:"column:answers" json:"answers"`
 	Score       int             `gorm:"column:score" json:"score"`
 	Total       int             `gorm:"column:total" json:"total"`
+	Stars       int             `gorm:"column:stars" json:"stars"`
+	BestStars   int             `gorm:"column:best_stars" json:"best_stars"`
 	Passed      bool            `gorm:"column:passed" json:"passed"`
 	CreatedAt   time.Time       `gorm:"column:created_at" json:"created_at"`
 }
 
+// ChallengeSubmission 是一次完整提交事务的结果。
+type ChallengeSubmission struct {
+	Attempt          ChallengeAttempt
+	StarsAdded       int
+	TotalStars       int64
+	AlreadySubmitted bool
+	Streak           UserStreak
+}
+
 // UserStreak 对应 user_streaks 一行。
 type UserStreak struct {
-	OpenID    string  `gorm:"column:openid" json:"-"`
-	Lang      string  `gorm:"column:lang" json:"lang"`
-	Current   int     `gorm:"column:current" json:"current"`
-	Longest   int     `gorm:"column:longest" json:"longest"`
-	LastDay   *string `gorm:"column:last_day" json:"last_day"`
+	OpenID    string    `gorm:"column:openid" json:"-"`
+	Lang      string    `gorm:"column:lang" json:"lang"`
+	Current   int       `gorm:"column:current" json:"current"`
+	Longest   int       `gorm:"column:longest" json:"longest"`
+	LastDay   *string   `gorm:"column:last_day" json:"last_day"`
 	UpdatedAt time.Time `gorm:"column:updated_at" json:"-"`
 }
 
@@ -68,7 +79,10 @@ type ChallengeCalendarEntry struct {
 	Status      string `gorm:"column:status" json:"status"`
 	Score       *int   `gorm:"column:score" json:"score"`
 	Total       *int   `gorm:"column:total" json:"total"`
+	Stars       *int   `gorm:"column:stars" json:"stars"`
+	BestStars   *int   `gorm:"column:best_stars" json:"best_stars"`
 	Passed      *bool  `gorm:"column:passed" json:"passed"`
+	CheckedIn   *bool  `gorm:"column:checked_in" json:"checked_in"`
 }
 
 // ChallengeWord 是出题用的词条候选。
@@ -152,49 +166,60 @@ func (s *Store) ListChallengeItems(ctx context.Context, challengeID int64) ([]Da
 	return items, err
 }
 
-// CreateChallenge 创建关卡与题目；若 (lang, level, day) 已存在则返回已有记录且 created=false。
+// CreateChallenge 在一个事务内创建关卡与题目；若 (lang, level, day) 已存在则返回已有记录且 created=false。
 func (s *Store) CreateChallenge(ctx context.Context, ch DailyChallenge, items []DailyChallengeItem) (*DailyChallenge, bool, error) {
-	var id int64
-	err := s.db.WithContext(ctx).Raw(
-		`INSERT INTO daily_challenges (lang, level, day, title, status)
-		 VALUES (?, ?, ?::date, ?, ?)
-		 ON CONFLICT (lang, level, day) DO NOTHING
-		 RETURNING id`,
-		ch.Lang, ch.Level, ch.Day, ch.Title, ch.Status,
-	).Scan(&id).Error
-	if err != nil {
-		return nil, false, err
-	}
-	if id == 0 {
-		existing, err := s.GetChallengeByDay(ctx, ch.Lang, ch.Level, ch.Day)
-		return existing, false, err
-	}
-	ch.ID = id
-	if err := s.insertChallengeItems(ctx, id, items); err != nil {
-		return nil, false, err
-	}
-	created, err := s.GetChallengeByID(ctx, id)
-	if err != nil {
-		return nil, false, err
-	}
-	return created, true, nil
-}
-
-func (s *Store) insertChallengeItems(ctx context.Context, challengeID int64, items []DailyChallengeItem) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	var out *DailyChallenge
+	created := false
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var id int64
+		if err := tx.Raw(
+			`INSERT INTO daily_challenges (lang, level, day, title, status)
+			 VALUES (?, ?, ?::date, ?, ?)
+			 ON CONFLICT (lang, level, day) DO NOTHING
+			 RETURNING id`,
+			ch.Lang, ch.Level, ch.Day, ch.Title, ch.Status,
+		).Scan(&id).Error; err != nil {
+			return err
+		}
+		if id == 0 {
+			var existing DailyChallenge
+			if err := tx.Raw(
+				`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, title, status,
+				        created_at, updated_at,
+				        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = daily_challenges.id) AS item_count
+				 FROM daily_challenges WHERE lang = ? AND level = ? AND day = ?::date`,
+				ch.Lang, ch.Level, ch.Day,
+			).Scan(&existing).Error; err != nil {
+				return err
+			}
+			out = &existing
+			return nil
+		}
 		for _, item := range items {
 			if err := tx.Exec(
 				`INSERT INTO daily_challenge_items
 				     (challenge_id, seq, kind, ref_id, prompt, answer, explanation)
 				 VALUES (?, ?, ?, ?, ?::jsonb, ?::jsonb, ?)`,
-				challengeID, item.Seq, item.Kind, item.RefID,
+				id, item.Seq, item.Kind, item.RefID,
 				string(item.Prompt), string(item.Answer), item.Explanation,
 			).Error; err != nil {
 				return err
 			}
 		}
+		var saved DailyChallenge
+		if err := tx.Raw(
+			`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, title, status,
+			        created_at, updated_at,
+			        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = daily_challenges.id) AS item_count
+			 FROM daily_challenges WHERE id = ?`, id,
+		).Scan(&saved).Error; err != nil {
+			return err
+		}
+		out = &saved
+		created = true
 		return nil
 	})
+	return out, created, err
 }
 
 // ReplaceChallengeItems 用新题目替换草稿关卡内容；已发布关卡返回 ErrChallengeLocked。
@@ -275,7 +300,7 @@ func (s *Store) ChallengeHasAttempts(ctx context.Context, challengeID int64) (bo
 func (s *Store) GetAttempt(ctx context.Context, openid string, challengeID int64) (*ChallengeAttempt, error) {
 	var a ChallengeAttempt
 	err := s.db.WithContext(ctx).Raw(
-		`SELECT id, openid, challenge_id, answers, score, total, passed, created_at
+		`SELECT id, openid, challenge_id, answers, score, total, stars, best_stars, passed, created_at
 		 FROM challenge_attempts WHERE openid = ? AND challenge_id = ?`,
 		openid, challengeID,
 	).Scan(&a).Error
@@ -288,35 +313,103 @@ func (s *Store) GetAttempt(ctx context.Context, openid string, challengeID int64
 	return &a, nil
 }
 
-// SaveAttempt 写入作答记录；重复提交不覆盖，返回已有记录且 saved=false。
-func (s *Store) SaveAttempt(ctx context.Context, a ChallengeAttempt) (*ChallengeAttempt, bool, error) {
-	var id int64
-	err := s.db.WithContext(ctx).Raw(
-		`INSERT INTO challenge_attempts (openid, challenge_id, answers, score, total, passed)
-		 VALUES (?, ?, ?::jsonb, ?, ?, ?)
-		 ON CONFLICT (openid, challenge_id) DO NOTHING
-		 RETURNING id`,
-		a.OpenID, a.ChallengeID, string(a.Answers), a.Score, a.Total, a.Passed,
-	).Scan(&id).Error
-	if err != nil {
-		return nil, false, err
-	}
-	if id == 0 {
-		existing, err := s.GetAttempt(ctx, a.OpenID, a.ChallengeID)
-		return existing, false, err
-	}
-	saved, err := s.GetAttempt(ctx, a.OpenID, a.ChallengeID)
-	return saved, true, err
+// SubmitChallengeAttempt 保存最新作答，并在同一事务内维护最高星、累计星和自动签到。
+// 对微信用户行加锁可串行化同一用户的提交，避免并发重复补差或丢失累计更新。
+func (s *Store) SubmitChallengeAttempt(ctx context.Context, a ChallengeAttempt, lang, day string) (ChallengeSubmission, error) {
+	var out ChallengeSubmission
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var user struct {
+			ID         int64 `gorm:"column:id"`
+			TotalStars int64 `gorm:"column:total_stars"`
+		}
+		if err := tx.Raw(`SELECT id, total_stars FROM wx_users WHERE openid = ? FOR UPDATE`, a.OpenID).Scan(&user).Error; err != nil {
+			return err
+		}
+		if user.ID == 0 {
+			return ErrNotFound
+		}
+		var challengeID int64
+		if err := tx.Raw(`SELECT id FROM daily_challenges WHERE id = ? FOR KEY SHARE`, a.ChallengeID).Scan(&challengeID).Error; err != nil {
+			return err
+		}
+		if challengeID == 0 {
+			return ErrNotFound
+		}
+
+		var previous ChallengeAttempt
+		if err := tx.Raw(
+			`SELECT id, openid, challenge_id, answers, score, total, stars, best_stars, passed, created_at
+			 FROM challenge_attempts WHERE openid = ? AND challenge_id = ? FOR UPDATE`,
+			a.OpenID, a.ChallengeID,
+		).Scan(&previous).Error; err != nil {
+			return err
+		}
+		out.AlreadySubmitted = previous.ID != 0
+		oldBest := previous.BestStars
+		out.StarsAdded = a.Stars - oldBest
+		if out.StarsAdded < 0 {
+			out.StarsAdded = 0
+		}
+
+		if err := tx.Raw(
+			`INSERT INTO challenge_attempts
+			     (openid, challenge_id, answers, score, total, stars, best_stars, passed)
+			 VALUES (?, ?, ?::jsonb, ?, ?, ?, ?, ?)
+			 ON CONFLICT (openid, challenge_id) DO UPDATE SET
+			     answers = EXCLUDED.answers,
+			     score = EXCLUDED.score,
+			     total = EXCLUDED.total,
+			     stars = EXCLUDED.stars,
+			     best_stars = GREATEST(challenge_attempts.best_stars, EXCLUDED.stars),
+			     passed = challenge_attempts.passed OR EXCLUDED.passed
+			 RETURNING id, openid, challenge_id, answers, score, total, stars, best_stars, passed, created_at`,
+			a.OpenID, a.ChallengeID, string(a.Answers), a.Score, a.Total,
+			a.Stars, a.Stars, a.Stars >= 2,
+		).Scan(&out.Attempt).Error; err != nil {
+			return err
+		}
+
+		out.TotalStars = user.TotalStars
+		if out.StarsAdded > 0 {
+			if err := tx.Raw(
+				`UPDATE wx_users SET total_stars = total_stars + ? WHERE id = ? RETURNING total_stars`,
+				out.StarsAdded, user.ID,
+			).Scan(&out.TotalStars).Error; err != nil {
+				return err
+			}
+		}
+
+		var err error
+		if out.Attempt.Stars >= 2 {
+			out.Streak, err = updateStreakTx(tx, a.OpenID, lang, day)
+		} else {
+			out.Streak, err = getStreakTx(tx, a.OpenID, lang)
+		}
+		return err
+	})
+	return out, err
 }
 
-// UpdateStreakOnPass 在用户当天通关后更新连续打卡天数。
+// UpdateStreakOnPass 在用户达到签到条件后更新连续天数；较早日期不倒退 last_day。
 func (s *Store) UpdateStreakOnPass(ctx context.Context, openid, lang, day string) (UserStreak, error) {
 	var out UserStreak
-	err := s.db.WithContext(ctx).Raw(
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		out, err = updateStreakTx(tx, openid, lang, day)
+		return err
+	})
+	return out, err
+}
+
+func updateStreakTx(tx *gorm.DB, openid, lang, day string) (UserStreak, error) {
+	var out UserStreak
+	err := tx.Raw(
 		`INSERT INTO user_streaks (openid, lang, current, longest, last_day, updated_at)
 		 VALUES (?, ?, 1, 1, ?::date, now())
 		 ON CONFLICT (openid, lang) DO UPDATE SET
 		     current = CASE
+		         WHEN user_streaks.last_day IS NULL THEN 1
+		         WHEN EXCLUDED.last_day < user_streaks.last_day THEN user_streaks.current
 		         WHEN user_streaks.last_day = EXCLUDED.last_day THEN user_streaks.current
 		         WHEN user_streaks.last_day = EXCLUDED.last_day - 1 THEN user_streaks.current + 1
 		         ELSE 1
@@ -324,18 +417,31 @@ func (s *Store) UpdateStreakOnPass(ctx context.Context, openid, lang, day string
 		     longest = GREATEST(
 		         user_streaks.longest,
 		         CASE
+		             WHEN user_streaks.last_day IS NULL THEN 1
+		             WHEN EXCLUDED.last_day < user_streaks.last_day THEN user_streaks.current
 		             WHEN user_streaks.last_day = EXCLUDED.last_day THEN user_streaks.current
 		             WHEN user_streaks.last_day = EXCLUDED.last_day - 1 THEN user_streaks.current + 1
 		             ELSE 1
 		         END
 		     ),
 		     last_day = CASE
-		         WHEN user_streaks.last_day = EXCLUDED.last_day THEN user_streaks.last_day
-		         ELSE EXCLUDED.last_day
+		         WHEN user_streaks.last_day IS NULL OR EXCLUDED.last_day >= user_streaks.last_day
+		             THEN EXCLUDED.last_day
+		         ELSE user_streaks.last_day
 		     END,
 		     updated_at = now()
 		 RETURNING openid, lang, current, longest, to_char(last_day, 'YYYY-MM-DD') AS last_day`,
 		openid, lang, day,
+	).Scan(&out).Error
+	return out, err
+}
+
+func getStreakTx(tx *gorm.DB, openid, lang string) (UserStreak, error) {
+	out := UserStreak{OpenID: openid, Lang: lang}
+	err := tx.Raw(
+		`SELECT openid, lang, current, longest, to_char(last_day, 'YYYY-MM-DD') AS last_day, updated_at
+		 FROM user_streaks WHERE openid = ? AND lang = ?`,
+		openid, lang,
 	).Scan(&out).Error
 	return out, err
 }
@@ -378,7 +484,7 @@ func (s *Store) ChallengeCalendar(ctx context.Context, openid, lang, level, from
 	entries := make([]ChallengeCalendarEntry, 0, 31)
 	err := s.db.WithContext(ctx).Raw(
 		`SELECT to_char(c.day, 'YYYY-MM-DD') AS day, c.id AS challenge_id, c.title, c.status,
-		        a.score, a.total, a.passed
+		        a.score, a.total, a.stars, a.best_stars, a.passed, a.passed AS checked_in
 		 FROM daily_challenges c
 		 LEFT JOIN challenge_attempts a ON a.challenge_id = c.id AND a.openid = ?
 		 WHERE c.lang = ? AND c.level = ? AND c.status = 'published'

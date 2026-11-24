@@ -6,19 +6,21 @@ import (
 	"time"
 )
 
-// Scheduler 每天 00:05（APP_TZ）生成本日关卡，并在启动时补生成当天内容。
+// Scheduler 启动时补当天和次日关卡，之后每天按配置时分（APP_TZ）生成次日关卡。
 type Scheduler struct {
-	builder *Builder
-	loc     *time.Location
-	logger  *log.Logger
+	builder      *Builder
+	loc          *time.Location
+	logger       *log.Logger
+	generateHour int
+	generateMin  int
 }
 
 // NewScheduler 创建每日关卡定时任务。
-func NewScheduler(builder *Builder, loc *time.Location, logger *log.Logger) *Scheduler {
+func NewScheduler(builder *Builder, loc *time.Location, logger *log.Logger, hour, minute int) *Scheduler {
 	if loc == nil {
 		loc = time.Local
 	}
-	return &Scheduler{builder: builder, loc: loc, logger: logger}
+	return &Scheduler{builder: builder, loc: loc, logger: logger, generateHour: hour, generateMin: minute}
 }
 
 // Start 在后台运行定时任务；ctx 取消后退出。
@@ -27,8 +29,10 @@ func (s *Scheduler) Start(ctx context.Context) {
 }
 
 func (s *Scheduler) loop(ctx context.Context) {
-	// 启动时先补一次当天内容，避免服务在 00:05 之后才启动时当天没有关卡。
-	s.generate(ctx, time.Now().In(s.loc))
+	now := time.Now().In(s.loc)
+	// 启动时补齐当天与次日；生成成功不代表未来关卡已提前对学员开放。
+	s.generate(ctx, now)
+	s.generate(ctx, now.AddDate(0, 0, 1))
 	for {
 		next := s.nextRun(time.Now().In(s.loc))
 		timer := time.NewTimer(time.Until(next))
@@ -37,14 +41,14 @@ func (s *Scheduler) loop(ctx context.Context) {
 			timer.Stop()
 			return
 		case <-timer.C:
-			s.generate(ctx, time.Now().In(s.loc))
+			s.generate(ctx, time.Now().In(s.loc).AddDate(0, 0, 1))
 		}
 	}
 }
 
-// nextRun 返回下一个 00:05。
+// nextRun 返回下一个配置时分。
 func (s *Scheduler) nextRun(now time.Time) time.Time {
-	next := time.Date(now.Year(), now.Month(), now.Day(), 0, 5, 0, 0, s.loc)
+	next := time.Date(now.Year(), now.Month(), now.Day(), s.generateHour, s.generateMin, 0, 0, s.loc)
 	if !next.After(now) {
 		next = next.AddDate(0, 0, 1)
 	}

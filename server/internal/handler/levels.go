@@ -2,11 +2,13 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/wangfernando/language-learner/server/internal/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -208,6 +210,10 @@ func (h *Handler) addLevelExam(c *gin.Context) {
 		return
 	}
 	if err := h.store.AddLevelExam(c.Request.Context(), id, req.ItemType, req.ExamID, req.SortOrder); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "level not found")
+			return
+		}
 		h.logger.Printf("add level exam: %v", err)
 		writeError(c, http.StatusInternalServerError, "add level exam failed")
 		return

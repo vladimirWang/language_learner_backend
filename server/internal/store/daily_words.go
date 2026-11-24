@@ -205,36 +205,41 @@ func (s *Store) MarkWordsLearned(ctx context.Context, deviceID string, ids []int
 // MarkWordsLearnedAt 记录设备已学词，learned_at 由调用方显式指定。
 // learnedAt 为零值时等同于 MarkWordsLearned（写入 now()），用于兼容。
 // 未知 ID 会被忽略，返回 (accepted, ignored)。
-func (s *Store) MarkWordsLearnedAt(ctx context.Context, deviceID string, ids []int64, learnedAt time.Time) (int, int, error) {
+func (s *Store) MarkWordsLearnedAt(ctx context.Context, deviceID string, ids []int64, learnedAt time.Time) (accepted, ignored int, err error) {
 	if deviceID == "" {
 		return 0, len(ids), nil
 	}
-	existing := make([]int64, 0, len(ids))
-	if err := s.db.WithContext(ctx).Table("vocab_words").Where("id IN ?", ids).Pluck("id", &existing).Error; err != nil {
-		return 0, 0, err
-	}
-	for _, id := range existing {
-		var err error
-		if learnedAt.IsZero() {
-			err = s.db.WithContext(ctx).Exec(
-				`INSERT INTO user_word_learning (device_id, word_id, learned_at)
-				 VALUES (?, ?, now())
-				 ON CONFLICT (device_id, word_id) DO UPDATE SET learned_at = now()`,
-				deviceID, id,
-			).Error
-		} else {
-			err = s.db.WithContext(ctx).Exec(
-				`INSERT INTO user_word_learning (device_id, word_id, learned_at)
-				 VALUES (?, ?, ?)
-				 ON CONFLICT (device_id, word_id) DO UPDATE SET learned_at = EXCLUDED.learned_at`,
-				deviceID, id, learnedAt,
-			).Error
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		existing := make([]int64, 0, len(ids))
+		if err := tx.Raw("SELECT id FROM vocab_words WHERE id IN ? FOR KEY SHARE", ids).Scan(&existing).Error; err != nil {
+			return err
 		}
-		if err != nil {
-			return 0, 0, err
+		for _, id := range existing {
+			var err error
+			if learnedAt.IsZero() {
+				err = tx.Exec(
+					`INSERT INTO user_word_learning (device_id, word_id, learned_at)
+					 VALUES (?, ?, now())
+					 ON CONFLICT (device_id, word_id) DO UPDATE SET learned_at = now()`,
+					deviceID, id,
+				).Error
+			} else {
+				err = tx.Exec(
+					`INSERT INTO user_word_learning (device_id, word_id, learned_at)
+					 VALUES (?, ?, ?)
+					 ON CONFLICT (device_id, word_id) DO UPDATE SET learned_at = EXCLUDED.learned_at`,
+					deviceID, id, learnedAt,
+				).Error
+			}
+			if err != nil {
+				return err
+			}
 		}
-	}
-	return len(existing), len(ids) - len(existing), nil
+		accepted = len(existing)
+		ignored = len(ids) - len(existing)
+		return nil
+	})
+	return accepted, ignored, err
 }
 
 // RecentWords 返回设备最近五天内学过的词，按学习时间倒序、lemma 去重，最多 20 条。

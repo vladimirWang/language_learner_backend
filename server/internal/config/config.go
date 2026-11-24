@@ -37,9 +37,10 @@ type Config struct {
 	WorkDir     string
 
 	// 每日新词接口：无 key 时接口返回 503，避免匿名暴露。
-	DailyWordsAPIKey    string
-	DailyWordsRateLimit int
-	AppTZ               string
+	DailyWordsAPIKey         string
+	DailyWordsRateLimit      int
+	AppTZ                    string
+	DailyChallengeGenerateAt string
 
 	// 管理台 SSO 登录：BaseURL 供服务端换 token / 校验会话，PublicBaseURL 供浏览器跳转授权页。
 	SSOBaseURL       string
@@ -73,9 +74,10 @@ func Load() Config {
 		PDFQueue:    envOr("PDF_IMPORT_QUEUE", "pdf.import"),
 		WorkDir:     envOr("WORK_DIR", "work"),
 
-		DailyWordsAPIKey:    os.Getenv("DAILY_WORDS_API_KEY"),
-		DailyWordsRateLimit: envInt("DAILY_WORDS_RATE_LIMIT", 60),
-		AppTZ:               envOr("APP_TZ", "Asia/Shanghai"),
+		DailyWordsAPIKey:         os.Getenv("DAILY_WORDS_API_KEY"),
+		DailyWordsRateLimit:      envInt("DAILY_WORDS_RATE_LIMIT", 60),
+		AppTZ:                    envOr("APP_TZ", "Asia/Shanghai"),
+		DailyChallengeGenerateAt: envOr("DAILY_CHALLENGE_GENERATE_AT", "00:05"),
 
 		SSOBaseURL:      os.Getenv("SSO_BASE_URL"),
 		SSOClientID:     os.Getenv("SSO_CLIENT_ID"),

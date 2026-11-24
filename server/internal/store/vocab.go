@@ -144,13 +144,24 @@ func (s *Store) UpdateVocabWord(ctx context.Context, id int64, in VocabWordInput
 	return res.RowsAffected > 0, nil
 }
 
-// DeleteVocabWord 按 ID 删除词条；学习记录由外键级联清理。
+// DeleteVocabWord 按 ID 删除词条，并在同一事务中清理逻辑外键关联的学习记录。
 func (s *Store) DeleteVocabWord(ctx context.Context, id int64) (bool, error) {
-	res := s.db.WithContext(ctx).Exec("DELETE FROM vocab_words WHERE id = ?", id)
-	if res.Error != nil {
-		return false, res.Error
-	}
-	return res.RowsAffected > 0, nil
+	deleted := false
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var parentID int64
+		if err := tx.Raw("SELECT id FROM vocab_words WHERE id = ? FOR UPDATE", id).Scan(&parentID).Error; err != nil {
+			return err
+		}
+		if parentID == 0 {
+			return nil
+		}
+		if err := tx.Exec("DELETE FROM user_word_learning WHERE word_id = ?", id).Error; err != nil {
+			return err
+		}
+		deleted = true
+		return tx.Exec("DELETE FROM vocab_words WHERE id = ?", id).Error
+	})
+	return deleted, err
 }
 
 // VocabWordIDsByLemmas 按 (lang, lemma 列表) 精确查找 word_id，顺序与输入一致，
