@@ -676,7 +676,7 @@ func (s *Store) ChallengeGrammarPool(ctx context.Context, lang, level, seed stri
 		`SELECT id, lang, level, point_key, point_label, stem, options,
 		        answer, explanation, source_path
 		 FROM grammar_questions
-		 WHERE lang = ? AND active AND status = 'approved' AND (level = ? OR level = '')
+		 WHERE lang = ? AND deleted_at IS NULL AND active AND status = 'approved' AND (level = ? OR level = '')
 		 ORDER BY md5(stem || ?) ASC, id ASC
 		 LIMIT ?`,
 		lang, level, seed, limit,
@@ -696,7 +696,7 @@ func (s *Store) ChallengeGrammarPool(ctx context.Context, lang, level, seed stri
 		`SELECT id, lang, level, point_key, point_label, stem, options,
 		        answer, explanation, source_path
 		 FROM grammar_questions
-		 WHERE lang = ? AND active AND status = 'approved'
+		 WHERE lang = ? AND deleted_at IS NULL AND active AND status = 'approved'
 		 ORDER BY md5(stem || ?) ASC, id ASC
 		 LIMIT ?`,
 		lang, seed, limit*2,

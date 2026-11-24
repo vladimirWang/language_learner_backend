@@ -178,6 +178,7 @@ func (h *Handler) Routes() http.Handler {
 		listening.POST("/job/:jobId/answers", h.listeningUpdateAnswers)
 		listening.PATCH("/job/:jobId", h.updateListeningJobMeta)
 		listening.DELETE("/job/:jobId", h.deleteListeningJob)
+		listening.POST("/jobs/batch-delete", h.adminBatchDeleteListeningJobs)
 		listening.POST("/job/:jobId/restore", h.restoreListeningJob)
 	}
 
@@ -231,6 +232,8 @@ func (h *Handler) Routes() http.Handler {
 		adminGrammar.POST("/questions", h.adminImportGrammarDrafts)
 		adminGrammar.GET("/questions.csv", h.adminExportGrammarCSV)
 		adminGrammar.POST("/questions/review", h.adminImportGrammarCSV)
+		adminGrammar.POST("/questions/batch-delete", h.adminBatchDeleteGrammarQuestions)
+		adminGrammar.POST("/generate", h.adminGenerateGrammar)
 	}
 
 	// 口语题库与兜底话术
@@ -247,10 +250,12 @@ func (h *Handler) Routes() http.Handler {
 		speaking.POST("/plans/generate", h.generateSpeakingPlan)
 		speaking.PUT("/plans/:id", h.updateSpeakingPlan)
 		speaking.DELETE("/plans/:id", h.deleteSpeakingPlan)
+		speaking.POST("/plans/batch-delete", h.adminBatchDeleteSpeakingPlans)
 		speaking.GET("/items/:key", h.getSpeakingItem)
 		speaking.POST("/items", h.createSpeakingItem)
 		speaking.PUT("/items/:key", h.updateSpeakingItem)
 		speaking.DELETE("/items/:key", h.deleteSpeakingItem)
+		speaking.POST("/items/batch-delete", h.adminBatchDeleteSpeakingItems)
 		speaking.POST("/reply", h.speakingReply)
 		speaking.POST("/check", h.speakingCheck)
 		speaking.POST("/tts", h.speakingTTS)

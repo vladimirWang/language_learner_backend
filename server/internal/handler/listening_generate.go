@@ -20,12 +20,12 @@ import (
 
 // aiGenerateDialogue 是 LLM 返回的对话 + 选择题结构化输出。
 type aiGenerateDialogue struct {
-	Title          string      `json:"title"`
-	Topic          string      `json:"topic"`
-	Speakers       []aiSpeaker `json:"speakers"`
-	Dialogue       []aiTurn    `json:"dialogue"`
+	Title          string       `json:"title"`
+	Topic          string       `json:"topic"`
+	Speakers       []aiSpeaker  `json:"speakers"`
+	Dialogue       []aiTurn     `json:"dialogue"`
 	Questions      []aiQuestion `json:"questions"`
-	VocabularyUsed []string    `json:"vocabulary_used"`
+	VocabularyUsed []string     `json:"vocabulary_used"`
 }
 
 type aiSpeaker struct {
@@ -109,11 +109,11 @@ func (h *Handler) listeningGenerate(c *gin.Context) {
 
 	// 立即返回 202 accepted —— 任务在 goroutine 里异步跑
 	c.JSON(http.StatusAccepted, map[string]any{
-		"job_id":         jobID,
-		"exam_id":        examID,
-		"status":         "pending",
-		"message":        "任务已提交，通过 SSE /api/events?job_id=" + jobID + " 订阅进度",
-		"sse_endpoint":   "/api/events?job_id=" + jobID,
+		"job_id":          jobID,
+		"exam_id":         examID,
+		"status":          "pending",
+		"message":         "任务已提交，通过 SSE /api/events?job_id=" + jobID + " 订阅进度",
+		"sse_endpoint":    "/api/events?job_id=" + jobID,
 		"detail_endpoint": "/api/listening/job/" + jobID,
 	})
 
@@ -232,15 +232,15 @@ func (h *Handler) runListeningGenerate(jobID, examID string, req struct {
 	// questionManifest 字段完全对齐 builder/listening.py 的产物结构，
 	// 保证 client ListeningExamView 能无缝消费。
 	type questionManifest struct {
-		Number    int      `json:"number"`
-		Start     float64  `json:"start"`
-		End       float64  `json:"end"`
-		Audio     string   `json:"audio,omitempty"`
-		Transcript string  `json:"transcript"`
-		Speakers  []string `json:"speakers"`
-		Answer    *string  `json:"answer"`    // "A"/"B"/"C" 或 null（builder 里没答案时是 null）
-		Options   []string `json:"options"`
-		Question  string   `json:"question"`
+		Number     int      `json:"number"`
+		Start      float64  `json:"start"`
+		End        float64  `json:"end"`
+		Audio      string   `json:"audio,omitempty"`
+		Transcript string   `json:"transcript"`
+		Speakers   []string `json:"speakers"`
+		Answer     *string  `json:"answer"` // "A"/"B"/"C" 或 null（builder 里没答案时是 null）
+		Options    []string `json:"options"`
+		Question   string   `json:"question"`
 	}
 
 	// 把 LLM 返回的 questions 按 index 建 map，后续每轮对话按 index 查找
@@ -903,8 +903,8 @@ func (h *Handler) listNotifications(c *gin.Context) {
 
 func (h *Handler) markNotificationRead(c *gin.Context) {
 	var req struct {
-		ID    *int64 `json:"id"`
-		All   bool   `json:"all"`
+		ID  *int64 `json:"id"`
+		All bool   `json:"all"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "invalid json")

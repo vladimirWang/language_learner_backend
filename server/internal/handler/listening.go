@@ -753,6 +753,32 @@ func (h *Handler) deleteListeningJob(c *gin.Context) {
 	writeJSON(c, http.StatusOK, map[string]any{"ok": true, "deleted": "hard"})
 }
 
+// adminBatchDeleteListeningJobs 批量软删除听力任务。
+func (h *Handler) adminBatchDeleteListeningJobs(c *gin.Context) {
+	var body struct {
+		JobIDs []string `json:"job_ids"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if len(body.JobIDs) == 0 {
+		writeError(c, http.StatusBadRequest, "job_ids 不能为空")
+		return
+	}
+	if len(body.JobIDs) > 500 {
+		writeError(c, http.StatusBadRequest, "单次最多删除 500 条")
+		return
+	}
+	n, err := h.store.BatchSoftDeleteListeningJobs(c.Request.Context(), body.JobIDs)
+	if err != nil {
+		h.logger.Printf("batch delete listening jobs: %v", err)
+		writeError(c, http.StatusInternalServerError, "批量删除失败")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"deleted": n})
+}
+
 // restoreListeningJob 恢复已软删除的听力任务。
 func (h *Handler) restoreListeningJob(c *gin.Context) {
 	jobID := c.Param("jobId")

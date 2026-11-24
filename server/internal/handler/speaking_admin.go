@@ -575,6 +575,32 @@ func (h *Handler) deleteSpeakingPlan(c *gin.Context) {
 	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
+// adminBatchDeleteSpeakingPlans 批量软删除口语方案。
+func (h *Handler) adminBatchDeleteSpeakingPlans(c *gin.Context) {
+	var body struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if len(body.IDs) == 0 {
+		writeError(c, http.StatusBadRequest, "ids 不能为空")
+		return
+	}
+	if len(body.IDs) > 500 {
+		writeError(c, http.StatusBadRequest, "单次最多删除 500 条")
+		return
+	}
+	n, err := h.store.BatchSoftDeleteSpeakingPlans(c.Request.Context(), body.IDs)
+	if err != nil {
+		h.logger.Printf("batch delete speaking plans: %v", err)
+		writeError(c, http.StatusInternalServerError, "批量删除失败")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"deleted": n})
+}
+
 // speakingItemUpsert 是口语题目的创建/更新请求体。
 type speakingItemUpsert struct {
 	ItemKey        string   `json:"item_key"`
@@ -758,5 +784,32 @@ func (h *Handler) deleteSpeakingItem(c *gin.Context) {
 		return
 	}
 	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
+	h.invalidateTopicPlanCache()
+}
+
+// adminBatchDeleteSpeakingItems 批量软删除口语题目。
+func (h *Handler) adminBatchDeleteSpeakingItems(c *gin.Context) {
+	var body struct {
+		Keys []string `json:"keys"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if len(body.Keys) == 0 {
+		writeError(c, http.StatusBadRequest, "keys 不能为空")
+		return
+	}
+	if len(body.Keys) > 500 {
+		writeError(c, http.StatusBadRequest, "单次最多删除 500 条")
+		return
+	}
+	n, err := h.store.BatchSoftDeleteSpeakingItems(c.Request.Context(), body.Keys)
+	if err != nil {
+		h.logger.Printf("batch delete speaking items: %v", err)
+		writeError(c, http.StatusInternalServerError, "批量删除失败")
+		return
+	}
+	writeJSON(c, http.StatusOK, map[string]any{"deleted": n})
 	h.invalidateTopicPlanCache()
 }

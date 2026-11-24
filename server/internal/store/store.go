@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
@@ -160,7 +161,7 @@ func (SpeakingItem) TableName() string { return "speaking_items" }
 // ListSpeakingItems 返回口语题库，可按语种与等级过滤，按等级与 sort_order 排序。
 func (s *Store) ListSpeakingItems(ctx context.Context, lang, level string, activeOnly bool) ([]SpeakingItem, error) {
 	items := make([]SpeakingItem, 0)
-	q := s.db.WithContext(ctx)
+	q := s.db.WithContext(ctx).Where("deleted_at IS NULL")
 	if lang != "" {
 		q = q.Where("lang = ?", lang)
 	}
@@ -419,7 +420,7 @@ func (s *Store) DeleteSpeakingReplyTemplate(ctx context.Context, id int64) error
 func (s *Store) ListSpeakingTopics(ctx context.Context, lang string) ([]string, error) {
 	topics := make([]string, 0)
 	q := s.db.WithContext(ctx).Table("speaking_items").
-		Where("topic <> ''").
+		Where("topic <> '' AND deleted_at IS NULL").
 		Distinct("topic").
 		Order("topic ASC")
 	if lang != "" {
@@ -436,7 +437,7 @@ func (s *Store) MissingSpeakingTopics(ctx context.Context, topics []string) ([]s
 	}
 	found := make([]string, 0, len(topics))
 	if err := s.db.WithContext(ctx).Table("speaking_items").
-		Where("topic IN ?", topics).
+		Where("topic IN ? AND deleted_at IS NULL", topics).
 		Distinct("topic").
 		Pluck("topic", &found).Error; err != nil {
 		return nil, err
@@ -588,7 +589,7 @@ func (s *Store) GrammarChunks(ctx context.Context, lang, level string, keywords 
 // GetSpeakingItem 返回单条口语题目。
 func (s *Store) GetSpeakingItem(ctx context.Context, key string) (*SpeakingItem, error) {
 	var item SpeakingItem
-	err := s.db.WithContext(ctx).Where("item_key = ?", key).Take(&item).Error
+	err := s.db.WithContext(ctx).Where("item_key = ? AND deleted_at IS NULL", key).Take(&item).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
@@ -606,7 +607,7 @@ func (s *Store) CreateSpeakingItem(ctx context.Context, item SpeakingItem) error
 // UpdateSpeakingItem 按 item_key 更新口语题目；记录不存在时返回 ErrRecordNotFound。
 func (s *Store) UpdateSpeakingItem(ctx context.Context, item SpeakingItem) error {
 	res := s.db.WithContext(ctx).Model(&SpeakingItem{}).
-		Where("item_key = ?", item.ItemKey).
+		Where("item_key = ? AND deleted_at IS NULL", item.ItemKey).
 		Updates(map[string]any{
 			"lang":            item.Lang,
 			"level":           item.Level,
@@ -632,13 +633,15 @@ func (s *Store) UpdateSpeakingItem(ctx context.Context, item SpeakingItem) error
 	return nil
 }
 
-// DeleteSpeakingItem 按 item_key 删除口语题目，并显式清理方案映射。
+// DeleteSpeakingItem 按 item_key 软删除口语题目，并显式清理方案映射。
 func (s *Store) DeleteSpeakingItem(ctx context.Context, key string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Exec("DELETE FROM speaking_exam_plan_items WHERE item_key = ?", key).Error; err != nil {
 			return err
 		}
-		res := tx.Where("item_key = ?", key).Delete(&SpeakingItem{})
+		res := tx.Model(&SpeakingItem{}).
+			Where("item_key = ? AND deleted_at IS NULL", key).
+			Updates(map[string]any{"deleted_at": gorm.Expr("now()"), "updated_at": gorm.Expr("now()")})
 		if res.Error != nil {
 			return res.Error
 		}
@@ -647,6 +650,25 @@ func (s *Store) DeleteSpeakingItem(ctx context.Context, key string) error {
 		}
 		return nil
 	})
+}
+
+// BatchSoftDeleteSpeakingItems 批量软删除口语题目，并在同一事务中清理方案映射。
+func (s *Store) BatchSoftDeleteSpeakingItems(ctx context.Context, keys []string) (int64, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	var deleted int64
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("DELETE FROM speaking_exam_plan_items WHERE item_key IN ?", keys).Error; err != nil {
+			return err
+		}
+		res := tx.Model(&SpeakingItem{}).
+			Where("item_key IN ? AND deleted_at IS NULL", keys).
+			Updates(map[string]any{"deleted_at": gorm.Expr("now()"), "updated_at": gorm.Expr("now()")})
+		deleted = res.RowsAffected
+		return res.Error
+	})
+	return deleted, err
 }
 
 // LevelExamInfo 是关卡关联的 exam 附带 exam 基本信息的视图。
@@ -755,7 +777,7 @@ func (s *Store) ListLevels(ctx context.Context, activeOnly bool) ([]Level, error
 func (s *Store) ListSpeakingItemsByTopic(ctx context.Context, lang, level, topic string) ([]SpeakingItem, error) {
 	items := make([]SpeakingItem, 0)
 	err := s.db.WithContext(ctx).
-		Where("lang = ? AND level = ? AND topic = ? AND active = ?", lang, level, topic, true).
+		Where("lang = ? AND level = ? AND topic = ? AND active = ? AND deleted_at IS NULL", lang, level, topic, true).
 		Order("exam_part ASC, sort_order ASC, item_key ASC").
 		Find(&items).Error
 	return items, err
@@ -794,7 +816,8 @@ func (s *Store) ListSpeakingPlans(ctx context.Context, lang, level string, activ
 		Table("speaking_exam_plans p").
 		Select(`p.id, p.lang, p.level, p.name, p.description, p.active, p.sort_order,
 			p.grammar_requirements, p.created_at, p.updated_at,
-			(SELECT COUNT(*) FROM speaking_exam_plan_items i WHERE i.plan_id = p.id) AS item_count`)
+			(SELECT COUNT(*) FROM speaking_exam_plan_items i WHERE i.plan_id = p.id) AS item_count`).
+		Where("p.deleted_at IS NULL")
 	if activeOnly {
 		q = q.Where("p.active = ?", true)
 	}
@@ -816,7 +839,7 @@ func (s *Store) GetSpeakingPlan(ctx context.Context, id int64) (*SpeakingPlan, [
 		Select(`p.id, p.lang, p.level, p.name, p.description, p.active, p.sort_order,
 			p.grammar_requirements, p.created_at, p.updated_at,
 			(SELECT COUNT(*) FROM speaking_exam_plan_items i WHERE i.plan_id = p.id) AS item_count`).
-		Where("p.id = ?", id).
+		Where("p.id = ? AND p.deleted_at IS NULL", id).
 		Take(&plan).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -829,7 +852,7 @@ func (s *Store) GetSpeakingPlan(ctx context.Context, id int64) (*SpeakingPlan, [
 		Table("speaking_items si").
 		Select("si.*").
 		Joins("JOIN speaking_exam_plan_items i ON i.item_key = si.item_key").
-		Where("i.plan_id = ?", id).
+		Where("i.plan_id = ? AND si.deleted_at IS NULL", id).
 		Order("i.sort_order ASC, si.item_key ASC").
 		Scan(&items).Error
 	return &plan, items, err
@@ -842,7 +865,7 @@ func (s *Store) CountSoloSpeakingItems(ctx context.Context, lang, level string, 
 	}
 	var count int64
 	q := s.db.WithContext(ctx).Model(&SpeakingItem{}).
-		Where("level = ? AND item_key IN ?", level, keys)
+		Where("level = ? AND item_key IN ? AND deleted_at IS NULL", level, keys)
 	if activeOnly {
 		q = q.Where("lang = ? AND active = ?", lang, true)
 	}
@@ -853,7 +876,7 @@ func (s *Store) CountSoloSpeakingItems(ctx context.Context, lang, level string, 
 // replacePlanItems 覆盖方案题目映射，并在事务内校验方案与口语题目父记录。
 func replacePlanItems(tx *gorm.DB, planID int64, keys []string) error {
 	var parentID int64
-	if err := tx.Raw("SELECT id FROM speaking_exam_plans WHERE id = ? FOR KEY SHARE", planID).Scan(&parentID).Error; err != nil {
+	if err := tx.Raw("SELECT id FROM speaking_exam_plans WHERE id = ? AND deleted_at IS NULL FOR KEY SHARE", planID).Scan(&parentID).Error; err != nil {
 		return err
 	}
 	if parentID == 0 {
@@ -865,7 +888,7 @@ func replacePlanItems(tx *gorm.DB, planID int64, keys []string) error {
 	}
 	if len(uniqueKeys) > 0 {
 		existing := make([]string, 0, len(uniqueKeys))
-		if err := tx.Raw("SELECT item_key FROM speaking_items WHERE item_key IN ? FOR KEY SHARE", keys).Scan(&existing).Error; err != nil {
+		if err := tx.Raw("SELECT item_key FROM speaking_items WHERE item_key IN ? AND deleted_at IS NULL FOR KEY SHARE", keys).Scan(&existing).Error; err != nil {
 			return err
 		}
 		if len(existing) != len(uniqueKeys) {
@@ -943,7 +966,7 @@ func (s *Store) CreateGeneratedSpeakingPlan(ctx context.Context, plan SpeakingPl
 // UpdateSpeakingPlan 全量更新方案与题目。
 func (s *Store) UpdateSpeakingPlan(ctx context.Context, id int64, plan SpeakingPlan, itemKeys []string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		res := tx.Model(&SpeakingPlan{}).Where("id = ?", id).Updates(map[string]any{
+		res := tx.Model(&SpeakingPlan{}).Where("id = ? AND deleted_at IS NULL", id).Updates(map[string]any{
 			"lang":                 plan.Lang,
 			"level":                plan.Level,
 			"name":                 plan.Name,
@@ -963,13 +986,15 @@ func (s *Store) UpdateSpeakingPlan(ctx context.Context, id int64, plan SpeakingP
 	})
 }
 
-// DeleteSpeakingPlan 删除方案，并在同一事务中显式清理题目映射。
+// DeleteSpeakingPlan 软删除方案，并在同一事务中显式清理题目映射。
 func (s *Store) DeleteSpeakingPlan(ctx context.Context, id int64) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Exec("DELETE FROM speaking_exam_plan_items WHERE plan_id = ?", id).Error; err != nil {
 			return err
 		}
-		res := tx.Where("id = ?", id).Delete(&SpeakingPlan{})
+		res := tx.Model(&SpeakingPlan{}).
+			Where("id = ? AND deleted_at IS NULL", id).
+			Updates(map[string]any{"deleted_at": gorm.Expr("now()"), "updated_at": gorm.Expr("now()")})
 		if res.Error != nil {
 			return res.Error
 		}
@@ -978,6 +1003,25 @@ func (s *Store) DeleteSpeakingPlan(ctx context.Context, id int64) error {
 		}
 		return nil
 	})
+}
+
+// BatchSoftDeleteSpeakingPlans 批量软删除口语方案，并在同一事务中清理题目映射。
+func (s *Store) BatchSoftDeleteSpeakingPlans(ctx context.Context, ids []int64) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	var deleted int64
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("DELETE FROM speaking_exam_plan_items WHERE plan_id IN ?", ids).Error; err != nil {
+			return err
+		}
+		res := tx.Model(&SpeakingPlan{}).
+			Where("id IN ? AND deleted_at IS NULL", ids).
+			Updates(map[string]any{"deleted_at": gorm.Expr("now()"), "updated_at": gorm.Expr("now()")})
+		deleted = res.RowsAffected
+		return res.Error
+	})
+	return deleted, err
 }
 
 // ListLevelExams 返回关卡关联的内容，按 sort_order 排序。
@@ -993,7 +1037,7 @@ func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamI
 			COALESCE(j.source_url, '') AS source_url,
 			COALESCE(NULLIF(j.name, ''), si.prompt_de, '') AS name`).
 		Joins("LEFT JOIN listening_jobs j ON le.item_type = 'listening' AND j.exam_id = le.exam_id AND j.deleted_at IS NULL").
-		Joins("LEFT JOIN speaking_items si ON le.item_type = 'speaking' AND si.item_key = le.exam_id AND si.active = true").
+		Joins("LEFT JOIN speaking_items si ON le.item_type = 'speaking' AND si.item_key = le.exam_id AND si.active = true AND si.deleted_at IS NULL").
 		Where("le.level_id = ?", levelID).
 		Where("(le.item_type = 'listening' AND j.exam_id IS NOT NULL) OR (le.item_type = 'speaking' AND si.item_key IS NOT NULL)").
 		Order("le.sort_order ASC, le.id ASC").
@@ -1008,8 +1052,8 @@ func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamI
 			COALESCE(p.lang, l.lang, '') AS lang, '' AS source_url,
 			COALESCE(NULLIF(p.name, ''), le.exam_id) AS name`).
 		Joins("LEFT JOIN tests l ON l.id = le.level_id").
-		Joins("LEFT JOIN speaking_exam_plans p ON le.item_type = 'speaking_plan' AND p.id::text = le.exam_id AND p.active = true").
-		Joins("LEFT JOIN speaking_items si_topic ON le.item_type = 'speaking_topic' AND si_topic.item_key = le.exam_id AND si_topic.active = true").
+		Joins("LEFT JOIN speaking_exam_plans p ON le.item_type = 'speaking_plan' AND p.id::text = le.exam_id AND p.active = true AND p.deleted_at IS NULL").
+		Joins("LEFT JOIN speaking_items si_topic ON le.item_type = 'speaking_topic' AND si_topic.item_key = le.exam_id AND si_topic.active = true AND si_topic.deleted_at IS NULL").
 		Where(`le.level_id = ? AND
 			(le.item_type = 'speaking_topic' AND si_topic.item_key IS NOT NULL)
 			OR (le.item_type = 'speaking_plan' AND p.id IS NOT NULL)`, levelID).
@@ -1082,7 +1126,7 @@ func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]Availa
 		       p.name || '（' || (SELECT COUNT(*) FROM speaking_exam_plan_items i WHERE i.plan_id = p.id)::text || ' 题）' AS name,
 		       p.lang, '' AS source_url, p.created_at
 		FROM speaking_exam_plans p
-		WHERE p.active = true AND p.lang = ? AND p.level = ?
+		WHERE p.active = true AND p.deleted_at IS NULL AND p.lang = ? AND p.level = ?
 		  AND EXISTS (SELECT 1 FROM speaking_exam_plan_items i WHERE i.plan_id = p.id)
 		  AND p.id::text NOT IN (
 		      SELECT exam_id FROM test_items WHERE level_id = ? AND item_type = 'speaking_plan'
@@ -1433,6 +1477,9 @@ func (s *Store) Close() {
 	}
 }
 
+// SQLDB 暴露底层 *sql.DB 给集成测试或需要直接发 SQL 的内部调用方使用。
+func (s *Store) SQLDB() (*sql.DB, error) { return s.db.DB() }
+
 // Ping 用于健康检查。
 func (s *Store) Ping(ctx context.Context) error {
 	sqlDB, err := s.db.DB()
@@ -1526,6 +1573,17 @@ func (s *Store) SoftDeleteListeningJob(ctx context.Context, jobID string) error 
 			"deleted_at": gorm.Expr("now()"),
 			"updated_at": gorm.Expr("now()"),
 		}).Error
+}
+
+// BatchSoftDeleteListeningJobs 批量软删除听力任务，返回实际删除条数。
+func (s *Store) BatchSoftDeleteListeningJobs(ctx context.Context, jobIDs []string) (int64, error) {
+	if len(jobIDs) == 0 {
+		return 0, nil
+	}
+	res := s.db.WithContext(ctx).Model(&ListeningJob{}).
+		Where("job_id IN ? AND deleted_at IS NULL", jobIDs).
+		Updates(map[string]any{"deleted_at": gorm.Expr("now()"), "updated_at": gorm.Expr("now()")})
+	return res.RowsAffected, res.Error
 }
 
 // ErrListeningExamIDActiveConflict 表示同 exam_id 已存在一条活跃（未删除）记录，
@@ -1630,31 +1688,27 @@ func (s *Store) RestoreListeningJob(ctx context.Context, jobID string) error {
 
 // --- Listening Job Notifications ---
 
-// InsertNotification 新增一条系统通知；payload 为 nil 时不写入 JSONB 字段。
+// InsertNotification 新增一条系统通知；payload 为 nil 时写入 JSONB NULL。
 func (s *Store) InsertNotification(ctx context.Context, jobID, eventType, title, message string, payload map[string]any) (int64, error) {
-	var payloadExpr any
-	if payload == nil {
-		payloadExpr = gorm.Expr("NULL::jsonb")
-	} else {
+	var payloadJSON any
+	if payload != nil {
 		raw, err := json.Marshal(payload)
 		if err != nil {
 			return 0, err
 		}
-		payloadExpr = gorm.Expr("?::jsonb", string(raw))
+		payloadJSON = string(raw)
 	}
-	n := &ListeningJobNotification{
-		JobID:     jobID,
-		EventType: eventType,
-		Title:     title,
-		Message:   message,
-	}
-	if err := s.db.WithContext(ctx).Create(&struct {
-		ListeningJobNotification
-		Payload any `gorm:"column:payload"`
-	}{ListeningJobNotification: *n, Payload: payloadExpr}).Error; err != nil {
+	var id int64
+	err := s.db.WithContext(ctx).Raw(
+		`INSERT INTO listening_job_notifications (job_id, event_type, title, message, payload)
+		 VALUES (?, ?, ?, ?, ?::jsonb)
+		 RETURNING id`,
+		jobID, eventType, title, message, payloadJSON,
+	).Scan(&id).Error
+	if err != nil {
 		return 0, err
 	}
-	return n.ID, nil
+	return id, nil
 }
 
 // UpsertNotificationByJob 为同一个听力任务维护一条状态通知：

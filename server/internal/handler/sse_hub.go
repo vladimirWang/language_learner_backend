@@ -8,7 +8,7 @@ import (
 
 // sseEvent 是推送给前端 SSE 的一个事件。
 type sseEvent struct {
-	Type    string         `json:"type"`    // progress / success / error / keepalive
+	Type    string         `json:"type"` // progress / success / error / keepalive
 	JobID   string         `json:"job_id,omitempty"`
 	Stage   string         `json:"stage,omitempty"`
 	Level   string         `json:"level,omitempty"`
@@ -20,8 +20,8 @@ type sseEvent struct {
 // key 是 jobID，value 是订阅该 job 的 channel 集合。
 // 每次 Publish 会向所有订阅者的 channel 推送事件；channel 满时丢弃（非阻塞）。
 type sseHub struct {
-	mu    sync.RWMutex
-	subs  map[string]map[chan sseEvent]struct{}
+	mu   sync.RWMutex
+	subs map[string]map[chan sseEvent]struct{}
 	// 独立的全局订阅者扇出——用来推送管理台消息中心的任务状态通知
 	all map[chan sseEvent]struct{}
 }

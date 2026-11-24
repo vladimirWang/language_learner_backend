@@ -369,7 +369,7 @@ func (s *Store) GetGrammarRequirements(ctx context.Context, planID int64) ([]Gra
 	err := s.db.WithContext(ctx).
 		Table("speaking_exam_plans").
 		Select("grammar_requirements").
-		Where("id = ?", planID).
+		Where("id = ? AND deleted_at IS NULL", planID).
 		Take(&row).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
