@@ -11,6 +11,7 @@ import (
 type WXUser struct {
 	ID          int64     `gorm:"primaryKey;column:id" json:"id"`
 	OpenID      string    `gorm:"column:openid" json:"openid"`
+	Level       string    `gorm:"column:level" json:"level"`
 	UnionID     *string   `gorm:"column:unionid" json:"unionid"`
 	Nickname    string    `gorm:"column:nickname" json:"nickname"`
 	AvatarURL   string    `gorm:"column:avatar_url" json:"avatar_url"`
@@ -33,6 +34,7 @@ func (s *Store) UpsertWXUser(ctx context.Context, openid string, unionID, nickna
 	now := time.Now().UTC()
 	u := WXUser{
 		OpenID:      openid,
+		Level:       "A1",
 		UnionID:     unionPtr,
 		Nickname:    nickname,
 		AvatarURL:   avatar,
@@ -65,9 +67,16 @@ func (s *Store) GetWXUserByID(ctx context.Context, id int64) (WXUser, error) {
 	return u, err
 }
 
-// UpdateWXUserNickname 定向更新昵称，不覆盖其他用户资料。
-func (s *Store) UpdateWXUserNickname(ctx context.Context, id int64, nickname string) (WXUser, error) {
-	if err := s.db.WithContext(ctx).Model(&WXUser{}).Where("id = ?", id).Update("nickname", nickname).Error; err != nil {
+// UpdateWXUserProfile 定向更新昵称或语言等级，不覆盖未提交的资料字段。
+func (s *Store) UpdateWXUserProfile(ctx context.Context, id int64, nickname, level *string) (WXUser, error) {
+	updates := make(map[string]any, 2)
+	if nickname != nil {
+		updates["nickname"] = *nickname
+	}
+	if level != nil {
+		updates["level"] = *level
+	}
+	if err := s.db.WithContext(ctx).Model(&WXUser{}).Where("id = ?", id).Updates(updates).Error; err != nil {
 		return WXUser{}, err
 	}
 	return s.GetWXUserByID(ctx, id)

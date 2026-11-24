@@ -84,6 +84,8 @@ func TestBuildItemCountsIntegration(t *testing.T) {
 	lang := fmt.Sprintf("generator-%d", time.Now().UnixNano())
 	const level = "A1"
 	cleanup := func() {
+		_, _ = sqlDB.ExecContext(ctx, "DELETE FROM daily_challenge_items WHERE challenge_id IN (SELECT id FROM daily_challenges WHERE lang = $1)", lang)
+		_, _ = sqlDB.ExecContext(ctx, "DELETE FROM daily_challenges WHERE lang = $1", lang)
 		_, _ = sqlDB.ExecContext(ctx, "DELETE FROM listening_jobs WHERE lang = $1", lang)
 		_, _ = sqlDB.ExecContext(ctx, "DELETE FROM vocab_words WHERE lang = $1", lang)
 		_, _ = sqlDB.ExecContext(ctx, "DELETE FROM collocations WHERE lang = $1", lang)
@@ -168,6 +170,41 @@ func TestBuildItemCountsIntegration(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("手动指定题型并修改草稿", func(t *testing.T) {
+		seed(3, 3, 6)
+		day := time.Date(2026, 11, 24, 0, 0, 0, 0, time.UTC)
+		created, items, err := builder.Regenerate(ctx, lang, level, day, store.ChallengeTypeGrammar)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if created.ChallengeType != store.ChallengeTypeGrammar || created.Status != store.ChallengeStatusDraft {
+			t.Fatalf("手动生成结果错误：%+v", created)
+		}
+		for _, item := range items {
+			if item.Kind != "grammar" {
+				t.Fatalf("指定语法关却生成 %s 题", item.Kind)
+			}
+		}
+
+		updated, items, err := builder.Regenerate(ctx, lang, level, day, store.ChallengeTypeVocab)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.ID != created.ID || updated.ChallengeType != store.ChallengeTypeVocab {
+			t.Fatalf("草稿题型修改失败：%+v", updated)
+		}
+		if len(items) != 6 {
+			t.Fatalf("修改后题数 = %d，期望 6", len(items))
+		}
+		monthRows, err := st.ListChallengesForMonth(ctx, lang, level, "2026-11-01", "2026-11-30")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(monthRows) != 1 || monthRows[0].ChallengeType != store.ChallengeTypeVocab {
+			t.Fatalf("月历列表未返回关卡类型：%+v", monthRows)
+		}
+	})
 
 	t.Run("不足三题不生成", func(t *testing.T) {
 		seed(2, 0, 0)

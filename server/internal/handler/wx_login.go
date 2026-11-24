@@ -28,9 +28,12 @@ type wxLoginReq struct {
 	Avatar   string `json:"avatar"`
 }
 
-// wxUserView 是返回给小程序的用户信息（不含 openid 等敏感标识）。
+// wxUserView 是返回给小程序的当前用户会话信息。
 type wxUserView struct {
 	ID         int64  `json:"id"`
+	OpenID     string `json:"openid"`
+	Lang       string `json:"lang"`
+	Level      string `json:"level"`
 	Nickname   string `json:"nickname"`
 	Avatar     string `json:"avatar"`
 	IsNewUser  bool   `json:"is_new_user"`
@@ -53,7 +56,8 @@ func (h *Handler) newWXUserView(ctx context.Context, u store.WXUser, isNew bool)
 		}
 	}
 	return wxUserView{
-		ID: u.ID, Nickname: u.Nickname, Avatar: avatar, IsNewUser: isNew, TotalStars: u.TotalStars,
+		ID: u.ID, OpenID: u.OpenID, Lang: "de", Level: u.Level,
+		Nickname: u.Nickname, Avatar: avatar, IsNewUser: isNew, TotalStars: u.TotalStars,
 	}
 }
 
@@ -113,10 +117,11 @@ func (h *Handler) wxMe(c *gin.Context) {
 }
 
 type wxProfileReq struct {
-	Nickname string `json:"nickname"`
+	Nickname *string `json:"nickname"`
+	Level    *string `json:"level"`
 }
 
-// wxUpdateProfile 更新当前用户的微信昵称。
+// wxUpdateProfile 更新当前用户的微信昵称或语言等级。
 func (h *Handler) wxUpdateProfile(c *gin.Context) {
 	u, ok := h.requireWXUser(c)
 	if !ok {
@@ -127,12 +132,27 @@ func (h *Handler) wxUpdateProfile(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid json body")
 		return
 	}
-	nickname := strings.TrimSpace(req.Nickname)
-	if nickname == "" || utf8.RuneCountInString(nickname) > 64 {
-		writeError(c, http.StatusBadRequest, "nickname must contain 1 to 64 characters")
+	if req.Nickname == nil && req.Level == nil {
+		writeError(c, http.StatusBadRequest, "nickname or level is required")
 		return
 	}
-	updated, err := h.store.UpdateWXUserNickname(c.Request.Context(), u.ID, nickname)
+	if req.Nickname != nil {
+		nickname := strings.TrimSpace(*req.Nickname)
+		if nickname == "" || utf8.RuneCountInString(nickname) > 64 {
+			writeError(c, http.StatusBadRequest, "nickname must contain 1 to 64 characters")
+			return
+		}
+		*req.Nickname = nickname
+	}
+	if req.Level != nil {
+		level := strings.ToUpper(strings.TrimSpace(*req.Level))
+		if !challengeLevelPattern.MatchString(level) {
+			writeError(c, http.StatusBadRequest, "invalid level")
+			return
+		}
+		*req.Level = level
+	}
+	updated, err := h.store.UpdateWXUserProfile(c.Request.Context(), u.ID, req.Nickname, req.Level)
 	if err != nil {
 		h.logger.Printf("wx-profile user=%d: %v", u.ID, err)
 		writeError(c, http.StatusInternalServerError, "update profile failed")

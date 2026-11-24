@@ -2,10 +2,33 @@ package handler
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/wangfernando/language-learner/server/internal/store"
 )
+
+func TestParseChallengeLang(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name, target, want string
+		ok                 bool
+	}{
+		{name: "缺省德语", target: "/api/levels/today", want: "de", ok: true},
+		{name: "显式德语", target: "/api/levels/today?lang=de", want: "de", ok: true},
+		{name: "非法语种", target: "/api/levels/today?lang=DE!", ok: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("GET", tc.target, nil)
+			got, ok := parseChallengeLang(c)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("parseChallengeLang() = (%q, %v)，期望 (%q, %v)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
 
 func TestGradeChallenge(t *testing.T) {
 	items := []store.DailyChallengeItem{

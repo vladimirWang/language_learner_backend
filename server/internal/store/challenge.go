@@ -226,8 +226,8 @@ func (s *Store) CreateChallenge(ctx context.Context, ch DailyChallenge, items []
 	return out, created, err
 }
 
-// ReplaceChallengeItems 用新题目替换草稿关卡内容；已发布关卡返回 ErrChallengeLocked。
-func (s *Store) ReplaceChallengeItems(ctx context.Context, challengeID int64, items []DailyChallengeItem) error {
+// ReplaceChallengeContent 原子替换草稿的题型、标题与题目；已发布关卡返回 ErrChallengeLocked。
+func (s *Store) ReplaceChallengeContent(ctx context.Context, challengeID int64, challengeType, title string, items []DailyChallengeItem) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var status string
 		if err := tx.Raw(`SELECT status FROM daily_challenges WHERE id = ?`, challengeID).Scan(&status).Error; err != nil {
@@ -253,7 +253,10 @@ func (s *Store) ReplaceChallengeItems(ctx context.Context, challengeID int64, it
 				return err
 			}
 		}
-		return tx.Exec(`UPDATE daily_challenges SET updated_at = now() WHERE id = ?`, challengeID).Error
+		return tx.Exec(
+			`UPDATE daily_challenges SET challenge_type = ?, title = ?, updated_at = now() WHERE id = ?`,
+			challengeType, title, challengeID,
+		).Error
 	})
 }
 
@@ -503,7 +506,7 @@ func (s *Store) ChallengeCalendar(ctx context.Context, openid, lang, level, from
 func (s *Store) ListChallengesForMonth(ctx context.Context, lang, level, from, to string) ([]DailyChallenge, error) {
 	rows := make([]DailyChallenge, 0, 31)
 	q := s.db.WithContext(ctx).Raw(
-		`SELECT c.id, c.lang, c.level, to_char(c.day, 'YYYY-MM-DD') AS day, c.title, c.status,
+		`SELECT c.id, c.lang, c.level, to_char(c.day, 'YYYY-MM-DD') AS day, c.challenge_type, c.title, c.status,
 		        c.created_at, c.updated_at,
 		        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = c.id) AS item_count
 		 FROM daily_challenges c

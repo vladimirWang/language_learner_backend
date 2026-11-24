@@ -100,6 +100,11 @@ type choiceAnswer struct {
 // EnsureDay 返回指定日期的关卡；不存在时生成。publish=true 时直接发布。
 // 当轮到的题型素材不足时，按轮转顺序降级到下一可用题型。
 func (b *Builder) EnsureDay(ctx context.Context, lang, level string, day time.Time, publish bool) (*store.DailyChallenge, []store.DailyChallengeItem, error) {
+	return b.ensureDay(ctx, lang, level, day, publish, "")
+}
+
+// ensureDay 在 requestedType 非空时只尝试指定题型，否则按日期轮转并允许素材不足时降级。
+func (b *Builder) ensureDay(ctx context.Context, lang, level string, day time.Time, publish bool, requestedType string) (*store.DailyChallenge, []store.DailyChallengeItem, error) {
 	dayStr := day.Format("2006-01-02")
 	existing, err := b.st.GetChallengeByDay(ctx, lang, level, dayStr)
 	if err == nil {
@@ -115,15 +120,22 @@ func (b *Builder) EnsureDay(ctx context.Context, lang, level string, day time.Ti
 		status = store.ChallengeStatusPublished
 	}
 
-	start := 0
-	for i, t := range challengeCycle {
-		if t == challengeTypeForDay(day) {
-			start = i
-			break
+	candidateTypes := make([]string, 0, len(challengeCycle))
+	if requestedType != "" {
+		candidateTypes = append(candidateTypes, requestedType)
+	} else {
+		start := 0
+		for i, t := range challengeCycle {
+			if t == challengeTypeForDay(day) {
+				start = i
+				break
+			}
+		}
+		for offset := 0; offset < len(challengeCycle); offset++ {
+			candidateTypes = append(candidateTypes, challengeCycle[(start+offset)%len(challengeCycle)])
 		}
 	}
-	for offset := 0; offset < len(challengeCycle); offset++ {
-		challengeType := challengeCycle[(start+offset)%len(challengeCycle)]
+	for _, challengeType := range candidateTypes {
 		items, title, buildErr := b.build(ctx, lang, level, dayStr, challengeType)
 		if errors.Is(buildErr, ErrNoContent) {
 			continue
@@ -152,12 +164,12 @@ func (b *Builder) EnsureDay(ctx context.Context, lang, level string, day time.Ti
 	return nil, nil, ErrNoContent
 }
 
-// Regenerate 重新生成草稿关卡内容；已发布关卡返回 store.ErrChallengeLocked。
-func (b *Builder) Regenerate(ctx context.Context, lang, level string, day time.Time) (*store.DailyChallenge, []store.DailyChallengeItem, error) {
+// Regenerate 生成或重新生成草稿；requestedType 为空时使用已有题型或日期默认题型。
+func (b *Builder) Regenerate(ctx context.Context, lang, level string, day time.Time, requestedType string) (*store.DailyChallenge, []store.DailyChallengeItem, error) {
 	dayStr := day.Format("2006-01-02")
 	existing, err := b.st.GetChallengeByDay(ctx, lang, level, dayStr)
 	if errors.Is(err, store.ErrNotFound) {
-		return b.EnsureDay(ctx, lang, level, day, false)
+		return b.ensureDay(ctx, lang, level, day, false, requestedType)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -165,7 +177,10 @@ func (b *Builder) Regenerate(ctx context.Context, lang, level string, day time.T
 	if existing.Status == store.ChallengeStatusPublished {
 		return nil, nil, store.ErrChallengeLocked
 	}
-	challengeType := existing.ChallengeType
+	challengeType := requestedType
+	if challengeType == "" {
+		challengeType = existing.ChallengeType
+	}
 	if challengeType == "" {
 		challengeType = challengeTypeForDay(day)
 	}
@@ -173,10 +188,7 @@ func (b *Builder) Regenerate(ctx context.Context, lang, level string, day time.T
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := b.st.ReplaceChallengeItems(ctx, existing.ID, items); err != nil {
-		return nil, nil, err
-	}
-	if _, err := b.st.UpdateChallenge(ctx, existing.ID, &title, nil); err != nil {
+	if err := b.st.ReplaceChallengeContent(ctx, existing.ID, challengeType, title, items); err != nil {
 		return nil, nil, err
 	}
 	updated, err := b.st.GetChallengeByID(ctx, existing.ID)

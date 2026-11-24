@@ -70,6 +70,26 @@ func TestChallengeSubmissionIntegration(t *testing.T) {
 		_, _ = sqlDB.Exec("DELETE FROM wx_users WHERE id = $1", user.ID)
 	})
 
+	if user.Level != "A1" {
+		t.Fatalf("新用户默认等级 = %q，期望 A1", user.Level)
+	}
+	nickname, level := "等级测试用户", "B1"
+	user, err = st.UpdateWXUserProfile(ctx, user.ID, &nickname, &level)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.Nickname != nickname || user.Level != "B1" || user.OpenID != openid {
+		t.Fatalf("用户资料更新结果错误：%+v", user)
+	}
+	level = "A1"
+	user, err = st.UpdateWXUserProfile(ctx, user.ID, nil, &level)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.Nickname != nickname || user.Level != "A1" {
+		t.Fatalf("单独更新等级覆盖了其他资料：%+v", user)
+	}
+
 	createChallenge := func(day string) int64 {
 		t.Helper()
 		ch, created, err := st.CreateChallenge(ctx, DailyChallenge{

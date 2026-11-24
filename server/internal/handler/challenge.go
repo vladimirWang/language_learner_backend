@@ -73,19 +73,17 @@ func (h *Handler) requireWXOpenID(c *gin.Context) (string, bool) {
 	return u.OpenID, ok
 }
 
-// parseChallengeLangLevel 校验关卡的语种与等级参数。
-func parseChallengeLangLevel(c *gin.Context) (string, string, bool) {
+// parseChallengeLang 校验学员端语种；当前缺省为德语。
+func parseChallengeLang(c *gin.Context) (string, bool) {
 	lang := strings.TrimSpace(c.Query("lang"))
+	if lang == "" {
+		lang = "de"
+	}
 	if !langPattern.MatchString(lang) {
-		writeError(c, http.StatusBadRequest, "invalid or missing lang")
-		return "", "", false
+		writeError(c, http.StatusBadRequest, "invalid lang")
+		return "", false
 	}
-	level := strings.ToUpper(strings.TrimSpace(c.Query("level")))
-	if !challengeLevelPattern.MatchString(level) {
-		writeError(c, http.StatusBadRequest, "invalid or missing level")
-		return "", "", false
-	}
-	return lang, level, true
+	return lang, true
 }
 
 // todayDay 返回 APP_TZ 下的今天（只保留日期）。
@@ -203,23 +201,20 @@ func (h *Handler) challengeAudioFile(c *gin.Context) {
 
 // dailyChallengeToday 返回当天关卡、当前用户的作答与连续打卡。
 func (h *Handler) dailyChallengeToday(c *gin.Context) {
-	openid, ok := h.requireWXOpenID(c)
+	user, ok := h.requireWXUser(c)
 	if !ok {
 		return
 	}
-	lang, level, ok := parseChallengeLangLevel(c)
+	lang, ok := parseChallengeLang(c)
 	if !ok {
 		return
 	}
-	user, err := h.store.GetWXUserByOpenID(c.Request.Context(), openid)
-	if err != nil {
-		h.logger.Printf("daily challenge user openid=%s: %v", openid, err)
-		writeError(c, http.StatusInternalServerError, "load user failed")
-		return
-	}
+	openid, level := user.OpenID, user.Level
 	day := h.todayDay()
 	resp := map[string]any{
 		"date":        day.Format("2006-01-02"),
+		"lang":        lang,
+		"level":       level,
 		"streak":      h.currentStreak(c.Request.Context(), openid, lang),
 		"total_stars": user.TotalStars,
 	}
@@ -294,10 +289,11 @@ type submitChallengeReq struct {
 
 // submitDailyChallenge 判分并保存最新作答；重复提交按历史最高星补差。
 func (h *Handler) submitDailyChallenge(c *gin.Context) {
-	openid, ok := h.requireWXOpenID(c)
+	user, ok := h.requireWXUser(c)
 	if !ok {
 		return
 	}
+	openid := user.OpenID
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
 		writeError(c, http.StatusBadRequest, "invalid challenge id")
@@ -325,6 +321,10 @@ func (h *Handler) submitDailyChallenge(c *gin.Context) {
 	}
 	if ch.Day > h.todayDay().Format("2006-01-02") {
 		writeError(c, http.StatusForbidden, "challenge not yet available")
+		return
+	}
+	if ch.Level != user.Level {
+		writeError(c, http.StatusForbidden, "challenge level does not match current user")
 		return
 	}
 	items, err := h.store.ListChallengeItems(c.Request.Context(), id)
@@ -421,14 +421,15 @@ func normalizeChallengeAnswer(value string) string {
 
 // dailyChallengeCalendar 返回某月已发布关卡与当前用户的完成情况。
 func (h *Handler) dailyChallengeCalendar(c *gin.Context) {
-	openid, ok := h.requireWXOpenID(c)
+	user, ok := h.requireWXUser(c)
 	if !ok {
 		return
 	}
-	lang, level, ok := parseChallengeLangLevel(c)
+	lang, ok := parseChallengeLang(c)
 	if !ok {
 		return
 	}
+	openid, level := user.OpenID, user.Level
 	from, to, month, ok := h.parseChallengeMonth(c)
 	if !ok {
 		return
@@ -456,9 +457,8 @@ func (h *Handler) dailyChallengeStreak(c *gin.Context) {
 	if !ok {
 		return
 	}
-	lang := strings.TrimSpace(c.Query("lang"))
-	if !langPattern.MatchString(lang) {
-		writeError(c, http.StatusBadRequest, "invalid or missing lang")
+	lang, ok := parseChallengeLang(c)
+	if !ok {
 		return
 	}
 	streak := h.currentStreak(c.Request.Context(), openid, lang)

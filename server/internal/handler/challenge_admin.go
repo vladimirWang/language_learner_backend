@@ -86,8 +86,15 @@ func (h *Handler) adminRegenerateChallenge(c *gin.Context) {
 	if !ok {
 		return
 	}
+	requestedType := strings.TrimSpace(c.Query("challenge_type"))
+	switch requestedType {
+	case "", store.ChallengeTypeVocab, store.ChallengeTypeGrammar, store.ChallengeTypeListening:
+	default:
+		writeError(c, http.StatusBadRequest, "challenge_type 只能是 vocab、grammar 或 listening")
+		return
+	}
 	dayTime, _ := time.ParseInLocation("2006-01-02", day, h.now().Location())
-	ch, items, err := h.challenge.Regenerate(c.Request.Context(), lang, level, dayTime)
+	ch, items, err := h.challenge.Regenerate(c.Request.Context(), lang, level, dayTime, requestedType)
 	if err != nil {
 		if errors.Is(err, store.ErrChallengeLocked) {
 			writeError(c, http.StatusConflict, "关卡已发布或已有作答，不能重新生成")
