@@ -230,6 +230,9 @@ func (h *Handler) Routes() http.Handler {
 		tests.POST("/:id/exams", h.addLevelExam)
 		tests.DELETE("/:id/exams/:examId", h.removeLevelExam)
 		tests.GET("/:id/exams/available", h.listAvailableExams)
+		// 学员端任务内容：按关联的 item_type + exam_id 取听力/口语内容与素材。
+		tests.GET("/:id/items/:itemType/:examId", h.testItemContent)
+		tests.GET("/:id/items/:itemType/:examId/asset", h.testItemAsset)
 	}
 
 	// 每日关卡：全局统一关卡，身份取自微信登录 token。
