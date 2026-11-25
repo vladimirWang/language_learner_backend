@@ -6,21 +6,18 @@ import (
 	"time"
 )
 
-// Scheduler 启动时补当天和次日关卡，之后每天按配置时分（APP_TZ）生成次日关卡。
+// challengeBufferSize 是每个 (lang, level) 预生成的已发布关卡数量，保证学员解锁推进时序列不枯竭。
+const challengeBufferSize = 30
+
+// Scheduler 定时维护关卡缓冲：每个 (lang, level) 保持 challengeBufferSize 个已发布关卡。
 type Scheduler struct {
-	builder      *Builder
-	loc          *time.Location
-	logger       *log.Logger
-	generateHour int
-	generateMin  int
+	builder *Builder
+	logger  *log.Logger
 }
 
-// NewScheduler 创建每日关卡定时任务。
-func NewScheduler(builder *Builder, loc *time.Location, logger *log.Logger, hour, minute int) *Scheduler {
-	if loc == nil {
-		loc = time.Local
-	}
-	return &Scheduler{builder: builder, loc: loc, logger: logger, generateHour: hour, generateMin: minute}
+// NewScheduler 创建关卡缓冲维护任务；hour/minute 参数保留以兼容旧调用方，当前不再按天定时。
+func NewScheduler(builder *Builder, _ *time.Location, logger *log.Logger, _, _ int) *Scheduler {
+	return &Scheduler{builder: builder, logger: logger}
 }
 
 // Start 在后台运行定时任务；ctx 取消后退出。
@@ -29,36 +26,23 @@ func (s *Scheduler) Start(ctx context.Context) {
 }
 
 func (s *Scheduler) loop(ctx context.Context) {
-	now := time.Now().In(s.loc)
-	// 启动时补齐当天与次日；生成成功不代表未来关卡已提前对学员开放。
-	s.generate(ctx, now)
-	s.generate(ctx, now.AddDate(0, 0, 1))
+	s.ensureBuffer(ctx)
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
 	for {
-		next := s.nextRun(time.Now().In(s.loc))
-		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return
-		case <-timer.C:
-			s.generate(ctx, time.Now().In(s.loc).AddDate(0, 0, 1))
+		case <-ticker.C:
+			s.ensureBuffer(ctx)
 		}
 	}
 }
 
-// nextRun 返回下一个配置时分。
-func (s *Scheduler) nextRun(now time.Time) time.Time {
-	next := time.Date(now.Year(), now.Month(), now.Day(), s.generateHour, s.generateMin, 0, 0, s.loc)
-	if !next.After(now) {
-		next = next.AddDate(0, 0, 1)
-	}
-	return next
-}
-
-func (s *Scheduler) generate(ctx context.Context, day time.Time) {
-	for _, err := range s.builder.GenerateDay(ctx, day) {
+func (s *Scheduler) ensureBuffer(ctx context.Context) {
+	for _, err := range s.builder.EnsureCountAll(ctx, challengeBufferSize) {
 		if s.logger != nil {
-			s.logger.Printf("daily challenge generate %s: %v", day.Format("2006-01-02"), err)
+			s.logger.Printf("daily challenge ensure buffer: %v", err)
 		}
 	}
 }

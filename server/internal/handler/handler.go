@@ -211,13 +211,15 @@ func (h *Handler) Routes() http.Handler {
 	}
 
 	// 每日关卡：全局统一关卡，身份取自微信登录 token。
+	// 关卡与日期解绑：按 (lang, level) 序列 + 星级解锁；streak 连续打卡与 calendar 保留。
 	levels := api.Group("/levels")
 	{
-		levels.GET("/today", h.dailyChallengeToday)
+		levels.GET("", h.listChallenges)
 		levels.GET("/audio/:itemId", h.challengeAudioFile)
-		levels.POST("/:id/submit", h.submitDailyChallenge)
 		levels.GET("/calendar", h.dailyChallengeCalendar)
 		levels.GET("/streak", h.dailyChallengeStreak)
+		levels.GET("/:id", h.getChallenge)
+		levels.POST("/:id/submit", h.submitDailyChallenge)
 	}
 
 	// 管理台每日关卡维护：列表、预览、重新生成、发布。

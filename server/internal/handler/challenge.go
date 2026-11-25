@@ -17,12 +17,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/wangfernando/language-learner/server/internal/challenge"
 	"github.com/wangfernando/language-learner/server/internal/store"
 	"github.com/wangfernando/language-learner/server/internal/streak"
 )
 
 var challengeLevelPattern = regexp.MustCompile(`^(A[12]|B[12]|C[12]|N[1-5])$`)
+
+// unlockStars 是解锁下一关所需的最低星数。
+const unlockStars = 2
 
 // challengeStars 标准 6 题每 2 题 1 星；不足 6 题按正确率折算并执行 60% 向下取整兜底。
 func challengeStars(score, total int) int {
@@ -103,12 +105,14 @@ func (h *Handler) currentStreak(ctx context.Context, openid, lang string) streak
 	return out
 }
 
-// challengeItemView 是下发给客户端的题目（不含标准答案）。
+// challengeItemView 是下发给客户端的题目，附带标准答案与解析，供客户端本地即时判定。
 type challengeItemView struct {
-	Seq    int             `json:"seq"`
-	Kind   string          `json:"kind"`
-	Prompt json.RawMessage `json:"prompt"`
-	Audio  *challengeAudio `json:"audio,omitempty"`
+	Seq           int             `json:"seq"`
+	Kind          string          `json:"kind"`
+	Prompt        json.RawMessage `json:"prompt"`
+	Audio         *challengeAudio `json:"audio,omitempty"`
+	CorrectAnswer string          `json:"correct_answer"`
+	Explanation   string          `json:"explanation"`
 }
 
 // challengeAudio 是听力题的短期签名播放地址。
@@ -138,6 +142,37 @@ func (h *Handler) challengeAudioURL(itemID int64) string {
 	}
 	exp := time.Now().Add(10 * time.Minute).Unix()
 	return fmt.Sprintf("/api/levels/audio/%d?exp=%d&sig=%s", itemID, exp, h.signChallengeAudio(itemID, exp))
+}
+
+// buildItemViews 把题目转成下发视图（含标准答案与解析；听力题附带短期签名音频地址）。
+func (h *Handler) buildItemViews(items []store.DailyChallengeItem) []challengeItemView {
+	views := make([]challengeItemView, 0, len(items))
+	for _, item := range items {
+		var ans struct {
+			Value string `json:"value"`
+		}
+		_ = json.Unmarshal(item.Answer, &ans)
+		view := challengeItemView{
+			Seq:           item.Seq,
+			Kind:          item.Kind,
+			Prompt:        item.Prompt,
+			CorrectAnswer: ans.Value,
+			Explanation:   item.Explanation,
+		}
+		if item.Kind == "listening" {
+			var prompt struct {
+				Audio    string  `json:"audio"`
+				Duration float64 `json:"duration"`
+			}
+			if json.Unmarshal(item.Prompt, &prompt) == nil && prompt.Audio != "" {
+				if url := h.challengeAudioURL(item.ID); url != "" {
+					view.Audio = &challengeAudio{URL: url, Duration: prompt.Duration}
+				}
+			}
+		}
+		views = append(views, view)
+	}
+	return views
 }
 
 // challengeAudioFile 校验签名后按 Range 返回听力切片。
@@ -200,8 +235,49 @@ func (h *Handler) challengeAudioFile(c *gin.Context) {
 	http.ServeFile(c.Writer, c.Request, target)
 }
 
-// dailyChallengeToday 返回当天关卡、当前用户的作答与连续打卡。
-func (h *Handler) dailyChallengeToday(c *gin.Context) {
+// challengeView 是关卡序列里的单个关卡元数据（不含题目）。
+type challengeView struct {
+	ID            int64  `json:"id"`
+	Position      int    `json:"position"`
+	ChallengeType string `json:"challenge_type"`
+	Title         string `json:"title"`
+	ItemCount     int    `json:"item_count"`
+	BestStars     int    `json:"best_stars"`
+	Stars         int    `json:"stars"`
+	Passed        bool   `json:"passed"`
+	Unlocked      bool   `json:"unlocked"`
+}
+
+// buildChallengeViews 依据序列与用户作答计算每关的解锁状态，返回视图与已解锁关数。
+// 解锁规则：第 0 关恒解锁；第 i 关解锁 ⟺ 第 i-1 关 best_stars>=2。
+func buildChallengeViews(challenges []store.DailyChallenge, attempts map[int64]store.ChallengeAttempt) ([]challengeView, int) {
+	views := make([]challengeView, 0, len(challenges))
+	unlockedCount := 0
+	prevUnlocked := true
+	for i, ch := range challenges {
+		unlocked := prevUnlocked
+		if unlocked {
+			unlockedCount = i + 1
+		}
+		var bestStars, stars int
+		var passed bool
+		if a, ok := attempts[ch.ID]; ok {
+			bestStars = a.BestStars
+			stars = a.Stars
+			passed = a.Passed
+		}
+		views = append(views, challengeView{
+			ID: ch.ID, Position: i + 1, ChallengeType: ch.ChallengeType,
+			Title: ch.Title, ItemCount: ch.ItemCount,
+			BestStars: bestStars, Stars: stars, Passed: passed, Unlocked: unlocked,
+		})
+		prevUnlocked = bestStars >= unlockStars
+	}
+	return views, unlockedCount
+}
+
+// listChallenges 返回当前用户在其等级下的关卡序列及解锁状态、通关进度与 streak。
+func (h *Handler) listChallenges(c *gin.Context) {
 	user, ok := h.requireWXUser(c)
 	if !ok {
 		return
@@ -211,58 +287,168 @@ func (h *Handler) dailyChallengeToday(c *gin.Context) {
 		return
 	}
 	openid, level := user.OpenID, user.Level
-	day := h.todayDay()
-	resp := map[string]any{
-		"date":        day.Format("2006-01-02"),
+	ctx := c.Request.Context()
+
+	loadViews := func() ([]challengeView, int, error) {
+		challenges, err := h.store.ListChallenges(ctx, lang, level)
+		if err != nil {
+			return nil, 0, err
+		}
+		ids := make([]int64, len(challenges))
+		for i, ch := range challenges {
+			ids[i] = ch.ID
+		}
+		attempts, err := h.store.ListAttempts(ctx, openid, ids)
+		if err != nil {
+			return nil, 0, err
+		}
+		am := make(map[int64]store.ChallengeAttempt, len(attempts))
+		for _, a := range attempts {
+			am[a.ChallengeID] = a
+		}
+		views, unlocked := buildChallengeViews(challenges, am)
+		return views, unlocked, nil
+	}
+
+	views, unlockedCount, err := loadViews()
+	if err != nil {
+		h.logger.Printf("list challenges lang=%s level=%s: %v", lang, level, err)
+		writeError(c, http.StatusInternalServerError, "load challenges failed")
+		return
+	}
+
+	// 保证缓冲：至少解锁前沿 + 2 关，让用户能看到下一关（锁定态）与后续缓冲。
+	want := unlockedCount + 2
+	if want < 5 {
+		want = 5
+	}
+	if len(views) < want {
+		if genErr := h.challenge.EnsureCount(ctx, lang, level, want); genErr != nil {
+			h.logger.Printf("ensure challenge buffer lang=%s level=%s: %v", lang, level, genErr)
+		} else if refreshed, _, relErr := loadViews(); relErr == nil {
+			views = refreshed
+		}
+	}
+
+	passedCount := 0
+	currentPos := len(views)
+	for i, v := range views {
+		if v.Passed {
+			passedCount++
+		}
+		if v.Unlocked && !v.Passed && currentPos == len(views) {
+			currentPos = i + 1
+		}
+	}
+
+	writeJSON(c, http.StatusOK, map[string]any{
 		"lang":        lang,
 		"level":       level,
-		"streak":      h.currentStreak(c.Request.Context(), openid, lang),
 		"total_stars": user.TotalStars,
-	}
-	ch, items, err := h.challenge.EnsureDay(c.Request.Context(), lang, level, day, true)
+		"streak":      h.currentStreak(ctx, openid, lang),
+		"challenges":  views,
+		"progress": map[string]any{
+			"total":   len(views),
+			"passed":  passedCount,
+			"current": currentPos,
+		},
+	})
+}
+
+// challengePosition 返回某关卡在其序列中的 1-based 位置；不在已发布序列中返回 0。
+func (h *Handler) challengePosition(ctx context.Context, ch store.DailyChallenge) int {
+	challenges, err := h.store.ListChallenges(ctx, ch.Lang, ch.Level)
 	if err != nil {
-		if errors.Is(err, challenge.ErrNoContent) {
-			resp["challenge"] = nil
-			resp["reason"] = "content_not_ready"
-			writeJSON(c, http.StatusOK, resp)
+		return 0
+	}
+	for i, c := range challenges {
+		if c.ID == ch.ID {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// isChallengeUnlocked 判断某关卡对当前用户是否解锁：序列首关恒解锁，其余需上一关 best_stars>=2。
+func (h *Handler) isChallengeUnlocked(ctx context.Context, openid string, ch store.DailyChallenge) bool {
+	challenges, err := h.store.ListChallenges(ctx, ch.Lang, ch.Level)
+	if err != nil {
+		return false
+	}
+	idx := -1
+	for i, c := range challenges {
+		if c.ID == ch.ID {
+			idx = i
+			break
+		}
+	}
+	if idx <= 0 {
+		return idx == 0 // 不在序列中(idx<0)返回 false；首关(idx==0)返回 true
+	}
+	prev := challenges[idx-1]
+	attempt, err := h.store.GetAttempt(ctx, openid, prev.ID)
+	if err != nil {
+		return false
+	}
+	return attempt.BestStars >= unlockStars
+}
+
+// getChallenge 返回单个关卡的题目（不含答案）、用户已答与逐题判分结果（仅已答题）、解锁态。
+func (h *Handler) getChallenge(c *gin.Context) {
+	user, ok := h.requireWXUser(c)
+	if !ok {
+		return
+	}
+	openid := user.OpenID
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "invalid challenge id")
+		return
+	}
+	ctx := c.Request.Context()
+	ch, err := h.store.GetChallengeByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "challenge not found")
 			return
 		}
-		h.logger.Printf("daily challenge today lang=%s level=%s: %v", lang, level, err)
-		writeError(c, http.StatusInternalServerError, "load daily challenge failed")
+		h.logger.Printf("get challenge id=%d: %v", id, err)
+		writeError(c, http.StatusInternalServerError, "load challenge failed")
 		return
 	}
-
 	if ch.Status != store.ChallengeStatusPublished {
-		resp["challenge"] = nil
-		resp["reason"] = "not_published"
-		writeJSON(c, http.StatusOK, resp)
+		writeError(c, http.StatusForbidden, "challenge not published")
+		return
+	}
+	if ch.Level != user.Level {
+		writeError(c, http.StatusForbidden, "challenge level does not match current user")
+		return
+	}
+	if !h.isChallengeUnlocked(ctx, openid, *ch) {
+		writeError(c, http.StatusForbidden, "challenge not unlocked")
+		return
+	}
+	items, err := h.store.ListChallengeItems(ctx, id)
+	if err != nil {
+		h.logger.Printf("get challenge items id=%d: %v", id, err)
+		writeError(c, http.StatusInternalServerError, "load challenge items failed")
 		return
 	}
 
-	views := make([]challengeItemView, 0, len(items))
-	for _, item := range items {
-		view := challengeItemView{Seq: item.Seq, Kind: item.Kind, Prompt: item.Prompt}
-		if item.Kind == "listening" {
-			var prompt struct {
-				Audio    string  `json:"audio"`
-				Duration float64 `json:"duration"`
-			}
-			if json.Unmarshal(item.Prompt, &prompt) == nil && prompt.Audio != "" {
-				if url := h.challengeAudioURL(item.ID); url != "" {
-					view.Audio = &challengeAudio{URL: url, Duration: prompt.Duration}
-				}
-			}
-		}
-		views = append(views, view)
+	resp := map[string]any{
+		"challenge": map[string]any{
+			"id":             ch.ID,
+			"position":       h.challengePosition(ctx, *ch),
+			"challenge_type": ch.ChallengeType,
+			"title":          ch.Title,
+			"unlocked":       true,
+		},
+		"items":  h.buildItemViews(items),
+		"streak": h.currentStreak(ctx, openid, ch.Lang),
 	}
-	resp["challenge"] = map[string]any{
-		"id":             ch.ID,
-		"day":            ch.Day,
-		"challenge_type": ch.ChallengeType,
-		"title":          ch.Title,
-		"items":          views,
-	}
-	if attempt, err := h.store.GetAttempt(c.Request.Context(), openid, ch.ID); err == nil {
+
+	attempt, err := h.store.GetAttempt(ctx, openid, id)
+	if err == nil {
 		resp["attempt"] = map[string]any{
 			"answers":    attempt.Answers,
 			"score":      attempt.Score,
@@ -273,7 +459,7 @@ func (h *Handler) dailyChallengeToday(c *gin.Context) {
 			"checked_in": attempt.Passed,
 		}
 	} else if !errors.Is(err, store.ErrNotFound) {
-		h.logger.Printf("daily challenge attempt openid=%s: %v", openid, err)
+		h.logger.Printf("get challenge attempt openid=%s id=%d: %v", openid, id, err)
 	}
 	writeJSON(c, http.StatusOK, resp)
 }
@@ -288,7 +474,7 @@ type submitChallengeReq struct {
 	Answers []submitAnswer `json:"answers"`
 }
 
-// submitDailyChallenge 判分并保存最新作答；重复提交按历史最高星补差。
+// submitDailyChallenge 判分并保存最新作答；重复提交按历史最高星补差；达标则标记当日打卡。
 func (h *Handler) submitDailyChallenge(c *gin.Context) {
 	user, ok := h.requireWXUser(c)
 	if !ok {
@@ -305,8 +491,8 @@ func (h *Handler) submitDailyChallenge(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid json body")
 		return
 	}
-
-	ch, err := h.store.GetChallengeByID(c.Request.Context(), id)
+	ctx := c.Request.Context()
+	ch, err := h.store.GetChallengeByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(c, http.StatusNotFound, "challenge not found")
@@ -320,15 +506,16 @@ func (h *Handler) submitDailyChallenge(c *gin.Context) {
 		writeError(c, http.StatusForbidden, "challenge not published")
 		return
 	}
-	if ch.Day > h.todayDay().Format("2006-01-02") {
-		writeError(c, http.StatusForbidden, "challenge not yet available")
-		return
-	}
+	// 关卡与日期解绑：不再校验 ch.Day 与今天的关系。
 	if ch.Level != user.Level {
 		writeError(c, http.StatusForbidden, "challenge level does not match current user")
 		return
 	}
-	items, err := h.store.ListChallengeItems(c.Request.Context(), id)
+	if !h.isChallengeUnlocked(ctx, openid, *ch) {
+		writeError(c, http.StatusForbidden, "challenge not unlocked")
+		return
+	}
+	items, err := h.store.ListChallengeItems(ctx, id)
 	if err != nil {
 		h.logger.Printf("submit challenge items id=%d: %v", id, err)
 		writeError(c, http.StatusInternalServerError, "load challenge items failed")
@@ -344,7 +531,7 @@ func (h *Handler) submitDailyChallenge(c *gin.Context) {
 	total := len(items)
 	stars := challengeStars(score, total)
 
-	submission, err := h.store.SubmitChallengeAttempt(c.Request.Context(), store.ChallengeAttempt{
+	submission, err := h.store.SubmitChallengeAttempt(ctx, store.ChallengeAttempt{
 		OpenID:      openid,
 		ChallengeID: id,
 		Answers:     rawAnswers,
@@ -362,13 +549,13 @@ func (h *Handler) submitDailyChallenge(c *gin.Context) {
 		return
 	}
 	attempt := submission.Attempt
-	// 达到签到条件后写入 Redis bitmap；写入失败不回滚已保存的成绩。
+	// 打卡判定：本次提交后 best_stars>=2 即算当天打卡成功（幂等）；打卡日 = 提交当天，与关卡生成日无关。
 	if attempt.Passed {
-		if err := h.streak.Mark(c.Request.Context(), openid, ch.Lang, ch.Day); err != nil {
-			h.logger.Printf("mark streak openid=%s day=%s: %v", openid, ch.Day, err)
+		day := h.todayDay().Format("2006-01-02")
+		if err := h.streak.Mark(ctx, openid, ch.Lang, day); err != nil {
+			h.logger.Printf("mark streak openid=%s day=%s: %v", openid, day, err)
 		}
 	}
-	streak := h.currentStreak(c.Request.Context(), openid, ch.Lang)
 	resp := map[string]any{
 		"score":             attempt.Score,
 		"total":             attempt.Total,
@@ -380,7 +567,7 @@ func (h *Handler) submitDailyChallenge(c *gin.Context) {
 		"checked_in":        attempt.Passed,
 		"already_submitted": submission.AlreadySubmitted,
 		"items":             itemResults,
-		"streak":            streak,
+		"streak":            h.currentStreak(ctx, openid, ch.Lang),
 	}
 	writeJSON(c, http.StatusOK, resp)
 }
@@ -394,7 +581,7 @@ type challengeItemResult struct {
 	Explanation   string `json:"explanation"`
 }
 
-// gradeChallenge 对比答案，返回得分与逐题结果。
+// gradeChallenge 对比答案，返回得分与逐题结果（含每题正确答案，用于结算页）。
 func gradeChallenge(items []store.DailyChallengeItem, answers []submitAnswer) (int, []challengeItemResult) {
 	selected := make(map[int]string, len(answers))
 	for _, a := range answers {
@@ -426,9 +613,9 @@ func normalizeChallengeAnswer(value string) string {
 	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
 }
 
-// dailyChallengeCalendar 返回某月已发布关卡与当前用户的完成情况。
+// dailyChallengeCalendar 返回某月已打卡的日期列表（仅打卡圆点，不再关联关卡内容）。
 func (h *Handler) dailyChallengeCalendar(c *gin.Context) {
-	user, ok := h.requireWXUser(c)
+	openid, ok := h.requireWXOpenID(c)
 	if !ok {
 		return
 	}
@@ -436,26 +623,24 @@ func (h *Handler) dailyChallengeCalendar(c *gin.Context) {
 	if !ok {
 		return
 	}
-	openid, level := user.OpenID, user.Level
 	from, to, month, ok := h.parseChallengeMonth(c)
 	if !ok {
 		return
 	}
-	today := h.todayDay().Format("2006-01-02")
-	if from > today {
-		writeJSON(c, http.StatusOK, map[string]any{"month": month, "entries": []store.ChallengeCalendarEntry{}})
-		return
-	}
-	if to > today {
-		to = today
-	}
-	entries, err := h.store.ChallengeCalendar(c.Request.Context(), openid, lang, level, from, to)
+	days, err := h.streak.MarkedDays(c.Request.Context(), openid, lang, from, to)
 	if err != nil {
 		h.logger.Printf("daily challenge calendar openid=%s: %v", openid, err)
 		writeError(c, http.StatusInternalServerError, "load calendar failed")
 		return
 	}
-	writeJSON(c, http.StatusOK, map[string]any{"month": month, "entries": entries})
+	if days == nil {
+		days = []string{}
+	}
+	writeJSON(c, http.StatusOK, map[string]any{
+		"month": month,
+		"lang":  lang,
+		"days":  days,
+	})
 }
 
 // dailyChallengeStreak 返回当前用户某语种的连续打卡天数。
@@ -468,8 +653,7 @@ func (h *Handler) dailyChallengeStreak(c *gin.Context) {
 	if !ok {
 		return
 	}
-	streak := h.currentStreak(c.Request.Context(), openid, lang)
-	writeJSON(c, http.StatusOK, map[string]any{"streak": streak})
+	writeJSON(c, http.StatusOK, map[string]any{"streak": h.currentStreak(c.Request.Context(), openid, lang)})
 }
 
 // parseChallengeMonth 解析 ?month=YYYY-MM，缺省为当前月；返回当月首尾日期。

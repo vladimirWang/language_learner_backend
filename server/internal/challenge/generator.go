@@ -136,13 +136,14 @@ func (b *Builder) ensureDay(ctx context.Context, lang, level string, day time.Ti
 		}
 	}
 	for _, challengeType := range candidateTypes {
-		items, title, buildErr := b.build(ctx, lang, level, dayStr, challengeType)
+		items, buildErr := b.build(ctx, lang, level, dayStr, challengeType)
 		if errors.Is(buildErr, ErrNoContent) {
 			continue
 		}
 		if buildErr != nil {
 			return nil, nil, buildErr
 		}
+		title := fmt.Sprintf("%s %s %s关卡", dayStr[5:], level, typeLabel(challengeType))
 		created, wasCreated, err := b.st.CreateChallenge(ctx, store.DailyChallenge{
 			Lang:          lang,
 			Level:         level,
@@ -184,10 +185,11 @@ func (b *Builder) Regenerate(ctx context.Context, lang, level string, day time.T
 	if challengeType == "" {
 		challengeType = challengeTypeForDay(day)
 	}
-	items, title, err := b.build(ctx, lang, level, dayStr, challengeType)
+	items, err := b.build(ctx, lang, level, dayStr, challengeType)
 	if err != nil {
 		return nil, nil, err
 	}
+	title := fmt.Sprintf("%s %s %s关卡", dayStr[5:], level, typeLabel(challengeType))
 	if err := b.st.ReplaceChallengeContent(ctx, existing.ID, challengeType, title, items); err != nil {
 		return nil, nil, err
 	}
@@ -214,10 +216,100 @@ func (b *Builder) GenerateDay(ctx context.Context, day time.Time) []error {
 	return errs
 }
 
-// build 按题型生成题目；素材不足返回 ErrNoContent。
-func (b *Builder) build(ctx context.Context, lang, level, dayStr, challengeType string) ([]store.DailyChallengeItem, string, error) {
-	seed := dayStr + "|" + lang + "|" + level
+// nextChallengeType 返回轮转序列中 last 之后的题型；last 为空或不在序列中时返回首个题型。
+func nextChallengeType(last string) string {
+	for i, t := range challengeCycle {
+		if t == last {
+			return challengeCycle[(i+1)%len(challengeCycle)]
+		}
+	}
+	return challengeCycle[0]
+}
 
+// EnsureCount 保证同一 lang + level 至少有 n 个已发布关卡；不足时按题型轮转继续生成并直接发布。
+// 题型从上一关的题型继续，保证序列沿 单词/搭配 → 语法 → 听力 循环；某题型素材不足时降级到下一可用题型。
+// 用于学员解锁推进时预生成后续关卡，避免序列枯竭。day 写入生成当天，仅作信息字段。
+func (b *Builder) EnsureCount(ctx context.Context, lang, level string, n int) error {
+	existing, err := b.st.ListChallenges(ctx, lang, level)
+	if err != nil {
+		return err
+	}
+	count := len(existing)
+	if count >= n {
+		return nil
+	}
+	lastType := ""
+	if count > 0 {
+		lastType = existing[count-1].ChallengeType
+	}
+	dayStr := time.Now().UTC().Format("2006-01-02")
+	for count < n {
+		nextType := nextChallengeType(lastType)
+		start := 0
+		for i, t := range challengeCycle {
+			if t == nextType {
+				start = i
+				break
+			}
+		}
+		candidateTypes := make([]string, 0, len(challengeCycle))
+		for offset := 0; offset < len(challengeCycle); offset++ {
+			candidateTypes = append(candidateTypes, challengeCycle[(start+offset)%len(challengeCycle)])
+		}
+		var created *store.DailyChallenge
+		built := false
+		for _, ct := range candidateTypes {
+			seed := fmt.Sprintf("%s|%s|%s|%d", dayStr, lang, level, count+1)
+			items, buildErr := b.build(ctx, lang, level, seed, ct)
+			if errors.Is(buildErr, ErrNoContent) {
+				continue
+			}
+			if buildErr != nil {
+				return buildErr
+			}
+			title := fmt.Sprintf("第%d关 %s %s关卡", count+1, level, typeLabel(ct))
+			ch, _, err := b.st.CreateChallenge(ctx, store.DailyChallenge{
+				Lang:          lang,
+				Level:         level,
+				Day:           dayStr,
+				ChallengeType: ct,
+				Title:         title,
+				Status:        store.ChallengeStatusPublished,
+			}, items)
+			if err != nil {
+				return err
+			}
+			created = ch
+			built = true
+			break
+		}
+		if !built {
+			// 所有题型素材都不足，停止预生成，序列就此为止。
+			return nil
+		}
+		lastType = created.ChallengeType
+		count++
+	}
+	return nil
+}
+
+// EnsureCountAll 对所有已配置 (lang, level) 维护已发布关卡缓冲数量。
+func (b *Builder) EnsureCountAll(ctx context.Context, n int) []error {
+	targets, err := b.st.ChallengeTargets(ctx)
+	if err != nil {
+		return []error{err}
+	}
+	errs := make([]error, 0)
+	for _, target := range targets {
+		if err := b.EnsureCount(ctx, target[0], target[1], n); err != nil {
+			errs = append(errs, fmt.Errorf("%s/%s: %w", target[0], target[1], err))
+		}
+	}
+	return errs
+}
+
+// build 按题型生成题目；素材不足返回 ErrNoContent。seed 用于稳定打散，保证同题复现。
+func (b *Builder) build(ctx context.Context, lang, level, seed, challengeType string) ([]store.DailyChallengeItem, error) {
 	var (
 		items []store.DailyChallengeItem
 		err   error
@@ -228,13 +320,13 @@ func (b *Builder) build(ctx context.Context, lang, level, dayStr, challengeType 
 	case store.ChallengeTypeListening:
 		items, err = b.buildListeningItems(ctx, lang, level, seed)
 	default:
-		items, err = b.buildVocabItems(ctx, lang, level, seed, dayStr)
+		items, err = b.buildVocabItems(ctx, lang, level, seed)
 	}
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if len(items) < 3 {
-		return nil, "", ErrNoContent
+		return nil, ErrNoContent
 	}
 	if len(items) > itemsPerChallenge {
 		items = items[:itemsPerChallenge]
@@ -242,13 +334,12 @@ func (b *Builder) build(ctx context.Context, lang, level, dayStr, challengeType 
 	for i := range items {
 		items[i].Seq = i + 1
 	}
-	title := fmt.Sprintf("%s %s %s关卡", dayStr[5:], level, typeLabel(challengeType))
-	return items, title, nil
+	return items, nil
 }
 
 // buildVocabItems 生成单词 + 固定搭配共 6 题。
-func (b *Builder) buildVocabItems(ctx context.Context, lang, level, seed, dayStr string) ([]store.DailyChallengeItem, error) {
-	wordItems, err := b.buildWordItems(ctx, lang, level, seed, dayStr)
+func (b *Builder) buildVocabItems(ctx context.Context, lang, level, seed string) ([]store.DailyChallengeItem, error) {
+	wordItems, err := b.buildWordItems(ctx, lang, level, seed)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +353,7 @@ func (b *Builder) buildVocabItems(ctx context.Context, lang, level, seed, dayStr
 	return items, nil
 }
 
-func (b *Builder) buildWordItems(ctx context.Context, lang, level, seed, dayStr string) ([]store.DailyChallengeItem, error) {
+func (b *Builder) buildWordItems(ctx context.Context, lang, level, seed string) ([]store.DailyChallengeItem, error) {
 	pool, err := b.st.ChallengeWordPool(ctx, lang, level, seed, wordsPerChallenge+8)
 	if err != nil {
 		return nil, err

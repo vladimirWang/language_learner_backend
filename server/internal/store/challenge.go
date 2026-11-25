@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -61,25 +62,13 @@ type ChallengeSubmission struct {
 	AlreadySubmitted bool
 }
 
-// ChallengePassDay 是一条已签到记录，用于回填 Redis bitmap。
+// ChallengePassDay 是一条已打卡记录，用于启动时回填 Redis bitmap。
+// day 取作答提交日（attempt.created_at），而非关卡生成日 ch.Day——打卡与日期解绑后，
+// 用户哪天答成就算哪天打卡。
 type ChallengePassDay struct {
 	OpenID string `gorm:"column:openid"`
 	Lang   string `gorm:"column:lang"`
 	Day    string `gorm:"column:day"`
-}
-
-// ChallengeCalendarEntry 是用户视角的打卡日历一行。
-type ChallengeCalendarEntry struct {
-	Day         string `gorm:"column:day" json:"day"`
-	ChallengeID int64  `gorm:"column:challenge_id" json:"challenge_id"`
-	Title       string `gorm:"column:title" json:"title"`
-	Status      string `gorm:"column:status" json:"status"`
-	Score       *int   `gorm:"column:score" json:"score"`
-	Total       *int   `gorm:"column:total" json:"total"`
-	Stars       *int   `gorm:"column:stars" json:"stars"`
-	BestStars   *int   `gorm:"column:best_stars" json:"best_stars"`
-	Passed      *bool  `gorm:"column:passed" json:"passed"`
-	CheckedIn   *bool  `gorm:"column:checked_in" json:"checked_in"`
 }
 
 // ChallengeWord 是出题用的词条候选。
@@ -111,7 +100,7 @@ const (
 // ErrChallengeLocked 表示关卡已发布或已有作答，不允许再改内容。
 var ErrChallengeLocked = errors.New("challenge locked")
 
-// GetChallengeByDay 按 lang + level + day 读取关卡；不存在返回 ErrNotFound。
+// GetChallengeByDay 按 lang + level + day 读取关卡（取该天最新一条，供管理台）；不存在返回 ErrNotFound。
 func (s *Store) GetChallengeByDay(ctx context.Context, lang, level, day string) (*DailyChallenge, error) {
 	var ch DailyChallenge
 	err := s.db.WithContext(ctx).Raw(
@@ -119,7 +108,9 @@ func (s *Store) GetChallengeByDay(ctx context.Context, lang, level, day string) 
 		        created_at, updated_at,
 		        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = daily_challenges.id) AS item_count
 		 FROM daily_challenges
-		 WHERE lang = ? AND level = ? AND day = ?::date`,
+		 WHERE lang = ? AND level = ? AND day = ?::date
+		 ORDER BY id DESC
+		 LIMIT 1`,
 		lang, level, day,
 	).Scan(&ch).Error
 	if err != nil {
@@ -129,6 +120,49 @@ func (s *Store) GetChallengeByDay(ctx context.Context, lang, level, day string) 
 		return nil, ErrNotFound
 	}
 	return &ch, nil
+}
+
+// ListChallenges 返回同一 lang + level 下所有已发布关卡，按 id 升序构成有序序列（带题目数）。
+func (s *Store) ListChallenges(ctx context.Context, lang, level string) ([]DailyChallenge, error) {
+	rows := make([]DailyChallenge, 0, 64)
+	err := s.db.WithContext(ctx).Raw(
+		`SELECT c.id, c.lang, c.level, to_char(c.day, 'YYYY-MM-DD') AS day, c.challenge_type, c.title, c.status,
+		        c.created_at, c.updated_at,
+		        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = c.id) AS item_count
+		 FROM daily_challenges c
+		 WHERE c.lang = ? AND c.level = ? AND c.status = 'published'
+		 ORDER BY c.id ASC`,
+		lang, level,
+	).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// ListAttempts 批量读取用户在指定关卡上的作答记录，用于计算解锁状态。
+func (s *Store) ListAttempts(ctx context.Context, openid string, challengeIDs []int64) ([]ChallengeAttempt, error) {
+	out := make([]ChallengeAttempt, 0, len(challengeIDs))
+	if len(challengeIDs) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(challengeIDs))
+	args := make([]any, 0, len(challengeIDs)+1)
+	args = append(args, openid)
+	for i, id := range challengeIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	err := s.db.WithContext(ctx).Raw(
+		`SELECT id, openid, challenge_id, answers, score, total, stars, best_stars, passed, created_at
+		 FROM challenge_attempts
+		 WHERE openid = ? AND challenge_id IN (`+strings.Join(placeholders, ",")+`)`,
+		args...,
+	).Scan(&out).Error
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // GetChallengeByID 按主键读取关卡。
@@ -163,37 +197,22 @@ func (s *Store) ListChallengeItems(ctx context.Context, challengeID int64) ([]Da
 	return items, err
 }
 
-// CreateChallenge 在一个事务内创建关卡与题目；若 (lang, level, day) 已存在则返回已有记录且 created=false。
+// CreateChallenge 在一个事务内创建关卡与题目。(lang, level, day) 唯一约束已移除，
+// 调用方需自行保证不重复创建（管理台先 GetChallengeByDay 查重）。
 func (s *Store) CreateChallenge(ctx context.Context, ch DailyChallenge, items []DailyChallengeItem) (*DailyChallenge, bool, error) {
-	var out *DailyChallenge
-	created := false
 	if ch.ChallengeType == "" {
 		ch.ChallengeType = ChallengeTypeVocab
 	}
+	var saved DailyChallenge
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var id int64
 		if err := tx.Raw(
 			`INSERT INTO daily_challenges (lang, level, day, challenge_type, title, status)
 			 VALUES (?, ?, ?::date, ?, ?, ?)
-			 ON CONFLICT (lang, level, day) DO NOTHING
 			 RETURNING id`,
 			ch.Lang, ch.Level, ch.Day, ch.ChallengeType, ch.Title, ch.Status,
 		).Scan(&id).Error; err != nil {
 			return err
-		}
-		if id == 0 {
-			var existing DailyChallenge
-			if err := tx.Raw(
-				`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, challenge_type, title, status,
-				        created_at, updated_at,
-				        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = daily_challenges.id) AS item_count
-				 FROM daily_challenges WHERE lang = ? AND level = ? AND day = ?::date`,
-				ch.Lang, ch.Level, ch.Day,
-			).Scan(&existing).Error; err != nil {
-				return err
-			}
-			out = &existing
-			return nil
 		}
 		for _, item := range items {
 			if err := tx.Exec(
@@ -206,20 +225,17 @@ func (s *Store) CreateChallenge(ctx context.Context, ch DailyChallenge, items []
 				return err
 			}
 		}
-		var saved DailyChallenge
-		if err := tx.Raw(
+		return tx.Raw(
 			`SELECT id, lang, level, to_char(day, 'YYYY-MM-DD') AS day, challenge_type, title, status,
 			        created_at, updated_at,
 			        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = daily_challenges.id) AS item_count
 			 FROM daily_challenges WHERE id = ?`, id,
-		).Scan(&saved).Error; err != nil {
-			return err
-		}
-		out = &saved
-		created = true
-		return nil
+		).Scan(&saved).Error
 	})
-	return out, created, err
+	if err != nil {
+		return nil, false, err
+	}
+	return &saved, true, nil
 }
 
 // ReplaceChallengeContent 原子替换草稿的题型、标题与题目；已发布关卡返回 ErrChallengeLocked。
@@ -387,33 +403,18 @@ func (s *Store) SubmitChallengeAttempt(ctx context.Context, a ChallengeAttempt) 
 	return out, err
 }
 
-// PassedChallengeDays 返回所有已签到的 (openid, lang, day)，供启动时回填 Redis bitmap。
+// PassedChallengeDays 返回所有已打卡的 (openid, lang, day)，供启动时回填 Redis bitmap。
+// day 取作答提交日（attempt.created_at），DISTINCT 去重：同一天通过多关只回填一次。
 func (s *Store) PassedChallengeDays(ctx context.Context) ([]ChallengePassDay, error) {
 	days := make([]ChallengePassDay, 0, 256)
 	err := s.db.WithContext(ctx).Raw(
-		`SELECT a.openid, c.lang, to_char(c.day, 'YYYY-MM-DD') AS day
+		`SELECT DISTINCT a.openid, c.lang, to_char(a.created_at, 'YYYY-MM-DD') AS day
 		 FROM challenge_attempts a
 		 JOIN daily_challenges c ON c.id = a.challenge_id
 		 WHERE a.passed
-		 ORDER BY c.day ASC`,
+		 ORDER BY day ASC`,
 	).Scan(&days).Error
 	return days, err
-}
-
-// ChallengeCalendar 返回某月已发布关卡及当前用户的作答情况。
-func (s *Store) ChallengeCalendar(ctx context.Context, openid, lang, level, from, to string) ([]ChallengeCalendarEntry, error) {
-	entries := make([]ChallengeCalendarEntry, 0, 31)
-	err := s.db.WithContext(ctx).Raw(
-		`SELECT to_char(c.day, 'YYYY-MM-DD') AS day, c.id AS challenge_id, c.title, c.status,
-		        a.score, a.total, a.stars, a.best_stars, a.passed, a.passed AS checked_in
-		 FROM daily_challenges c
-		 LEFT JOIN challenge_attempts a ON a.challenge_id = c.id AND a.openid = ?
-		 WHERE c.lang = ? AND c.level = ? AND c.status = 'published'
-		   AND c.day >= ?::date AND c.day <= ?::date
-		 ORDER BY c.day ASC`,
-		openid, lang, level, from, to,
-	).Scan(&entries).Error
-	return entries, err
 }
 
 // ListChallengesForMonth 返回管理台某月的关卡列表（含草稿与题目数）。

@@ -90,6 +90,36 @@ func (s *Store) Get(ctx context.Context, openid, lang, today string) (Streak, er
 	return Compute(raw, lang, todayBit), nil
 }
 
+// MarkedDays 返回 [from, to] 区间内（含端点）已打卡的日期列表，格式 YYYY-MM-DD，升序。
+// 用于打卡日历渲染；无记录时返回空切片。
+func (s *Store) MarkedDays(ctx context.Context, openid, lang, from, to string) ([]string, error) {
+	fromBit, err := dayOffset(from)
+	if err != nil {
+		return nil, err
+	}
+	toBit, err := dayOffset(to)
+	if err != nil {
+		return nil, err
+	}
+	if toBit < fromBit {
+		return []string{}, nil
+	}
+	raw, err := s.rdb.Get(ctx, streakKey(openid, lang)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	days := make([]string, 0, 31)
+	for bit := fromBit; bit <= toBit; bit++ {
+		if bitAt(raw, bit) {
+			days = append(days, anchor.AddDate(0, 0, int(bit)).Format("2006-01-02"))
+		}
+	}
+	return days, nil
+}
+
 // Backfill 幂等写入历史签到位，避免切换到 bitmap 后丢失已有连续记录。
 func (s *Store) Backfill(ctx context.Context, days []Day) (int, error) {
 	if len(days) == 0 {

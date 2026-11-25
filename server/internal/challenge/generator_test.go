@@ -149,7 +149,7 @@ func TestBuildItemCountsIntegration(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			seed(tc.words, tc.collocations, tc.grammar)
-			items, _, err := builder.build(ctx, lang, level, "2026-11-24", tc.challenge)
+			items, err := builder.build(ctx, lang, level, "2026-11-24", tc.challenge)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -208,7 +208,7 @@ func TestBuildItemCountsIntegration(t *testing.T) {
 
 	t.Run("不足三题不生成", func(t *testing.T) {
 		seed(2, 0, 0)
-		items, _, err := builder.build(ctx, lang, level, "2026-11-24", store.ChallengeTypeVocab)
+		items, err := builder.build(ctx, lang, level, "2026-11-24", store.ChallengeTypeVocab)
 		if !errors.Is(err, ErrNoContent) || items != nil {
 			t.Fatalf("items=%v err=%v，期望 ErrNoContent", items, err)
 		}
@@ -247,7 +247,7 @@ func TestBuildItemCountsIntegration(t *testing.T) {
 		); err != nil {
 			t.Fatal(err)
 		}
-		items, _, err := builder.build(ctx, lang, level, "2026-11-24", store.ChallengeTypeListening)
+		items, err := builder.build(ctx, lang, level, "2026-11-24", store.ChallengeTypeListening)
 		if err != nil {
 			t.Fatal(err)
 		}
