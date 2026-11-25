@@ -101,6 +101,20 @@ make push-all
 ./deploy_all.sh root@your-server-ip /opt/lang-app
 ```
 
+`make push-all` 的镜像分三层，重依赖只在首次或变更时构建：
+
+| 镜像 | 内容 | 何时重建 |
+|---|---|---|
+| `lang-python-base:py312` | apt（ffmpeg/tesseract/git/openssh）+ uv + builder 依赖 | 仅 `Dockerfile.base` / `pyproject.toml` 变化 |
+| `lang-listen-parser:prod` | PyInstaller 听力解析二进制 | 仅 `builder/` 或 `pyproject.toml` 变化 |
+| `lang-service:prod` | Go 二进制 + 业务代码，`FROM` 上面两个 | 每次 `push-all`（通常 1 分钟内） |
+
+- 首次构建 `lang-python-base` 在 Apple Silicon 上走 QEMU 模拟 amd64，apt 安装约 10~15 分钟，属正常；后续命中缓存秒级完成。
+- 本地已有这两个镜像时，`push-base-image` / `push-parser-image` 只执行 `docker push`，不会重建。
+- 如果本地构建缓存被清理导致又要重装 apt，可在服务器上原生构建后推送：
+  `docker buildx build --platform linux/amd64 -t furchtlos/lang-python-base:py312 -f server/Dockerfile.base --push .`
+- 磁盘空间不足会频繁淘汰构建缓存（`docker builder prune` 前后留意 `df -h`）。
+
 `deploy_all.sh` 默认走仓库模式，只同步 `deploy/content/builder` 等挂载文件，
 镜像由服务器 `docker compose pull` 获取，不再上传 tar 包。
 

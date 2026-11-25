@@ -1,0 +1,36 @@
+# 独立听力解析二进制镜像（PyInstaller）。
+#
+# 单独构建推送，避免仅改 Go / Python 业务代码时重复执行
+# pyinstaller 安装（约 96s）与打包。运行镜像通过
+#   COPY --from=docker.io/furchtlos/lang-listen-parser:prod /out/listen-parser ...
+# 取用二进制，不依赖本文件。
+#
+# 构建（在仓库根目录）：
+#   docker buildx build --platform linux/amd64 \
+#     -t docker.io/furchtlos/lang-listen-parser:prod \
+#     -f server/Dockerfile.listen-parser --load .
+FROM python:3.12-slim AS parser-builder
+WORKDIR /builder
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    UV_LINK_MODE=copy
+# libgomp1 供 ctranslate2 使用；binutils 提供 PyInstaller 在 Linux 上必需的 objdump
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgomp1 binutils && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple uv
+COPY builder/pyproject.toml builder/uv.lock ./
+RUN uv sync --locked --no-dev && rm -rf /root/.cache/uv
+COPY builder/builder ./builder
+COPY builder/packaging ./packaging
+RUN uv pip install --python .venv/bin/python "pyinstaller>=6.11" && \
+    .venv/bin/python -m PyInstaller \
+        --noconfirm --clean \
+        --distpath /out \
+        --workpath /tmp/pyi-build \
+        /builder/packaging/listen_parser.spec
+
+# 只留产物，减小推拉体积（二进制运行时复用运行镜像的 glibc，与载体镜像无关）
+FROM scratch
+COPY --from=parser-builder /out/listen-parser /out/listen-parser

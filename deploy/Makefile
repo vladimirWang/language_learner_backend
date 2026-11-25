@@ -30,6 +30,10 @@ IMG_SERVICE_VERSIONED = $(REGISTRY)/$(NAMESPACE)/lang-service:$(TAG_VERSIONED)
 IMG_NGINX             = $(REGISTRY)/$(NAMESPACE)/lang-nginx:$(TAG)
 IMG_PG                = $(REGISTRY)/$(NAMESPACE)/lang-pg:pg17
 IMG_MIGRATE           = $(REGISTRY)/$(NAMESPACE)/lang-migrate:v4.18.3
+# 重依赖镜像：系统依赖 + builder 依赖（python-base）与 PyInstaller 产物（listen-parser）。
+# 两者极少变化，单独构建推送，service 镜像只做 Go 编译与代码拷贝。
+IMG_PY_BASE           = $(REGISTRY)/$(NAMESPACE)/lang-python-base:py312
+IMG_PARSER            = $(REGISTRY)/$(NAMESPACE)/lang-listen-parser:$(TAG)
 
 # 上游基础镜像
 UPSTREAM_NGINX   = nginx:1.27-alpine
@@ -56,14 +60,37 @@ LEGACY_IMG_SERVICE = lang-service:$(TAG)
 LEGACY_IMG_NGINX   = lang-nginx:$(TAG)
 
 # ---------- 构建 ----------
-.PHONY: build-all build-service build-nginx
-build-all: build-service build-nginx
+.PHONY: build-all build-base-image build-parser-image build-service build-nginx
+build-all: build-base-image build-parser-image build-service build-nginx
 	@echo "✅ 全部镜像构建完成（platform=$(PLATFORM)）"
+
+# 基础镜像：apt（ffmpeg/tesseract/git/openssh）+ uv + builder 依赖。
+# 约 870s 的 apt 安装只在首次（或基础镜像变更时）执行。
+build-base-image:
+	@echo "🔨 构建 $(IMG_PY_BASE)（依赖极少变化，有缓存时很快）..."
+	docker buildx build \
+		--platform $(PLATFORM) \
+		-t $(IMG_PY_BASE) \
+		-f $(REPO_ROOT)/server/Dockerfile.base \
+		--load \
+		$(REPO_ROOT)
+
+# 听力解析二进制镜像：PyInstaller 打包独立镜像，仅 builder 变化时重建。
+build-parser-image:
+	@echo "🔨 构建 $(IMG_PARSER) ..."
+	docker buildx build \
+		--platform $(PLATFORM) \
+		-t $(IMG_PARSER) \
+		-f $(REPO_ROOT)/server/Dockerfile.listen-parser \
+		--load \
+		$(REPO_ROOT)
 
 build-service:
 	@echo "🔨 构建 $(IMG_SERVICE) ..."
 	docker buildx build \
 		--platform $(PLATFORM) \
+		--build-arg BASE_IMAGE=$(IMG_PY_BASE) \
+		--build-arg PARSER_IMAGE=$(IMG_PARSER) \
 		-t $(LEGACY_IMG_SERVICE) \
 		-t $(IMG_SERVICE) \
 		-t $(IMG_SERVICE_VERSIONED) \
@@ -78,16 +105,36 @@ build-nginx:
 	docker tag $(UPSTREAM_NGINX) $(IMG_NGINX)
 
 # ---------- 推送镜像仓库 ----------
-.PHONY: push-all push-service push-nginx push-base
-push-all: push-service push-nginx push-base
+# push-all 顺序有依赖：base/parser 必须先到仓库，service 构建时
+# COPY --from 会从仓库拉取这两个镜像。
+.PHONY: push-all push-base-image push-parser-image push-service push-nginx push-base
+push-all: push-base-image push-parser-image push-nginx push-base push-service
 	@echo "✅ 镜像已推送：$(IMG_SERVICE) / $(IMG_SERVICE_VERSIONED)"
 
-push-service:
+# 本地已有镜像就直接推送（避免缓存被清后重复执行 apt/PyInstaller）；
+# 本地没有才构建。基础镜像/解析器镜像很少变化，通常只花几秒。
+push-base-image:
+	@if [ -z "$$(docker image inspect $(IMG_PY_BASE) --format '{{.Id}}' 2>/dev/null)" ]; then \
+		echo "🔨 本地缺少 $(IMG_PY_BASE)，开始构建（首次含 apt 安装，较慢）..."; \
+		$(MAKE) build-base-image; \
+	fi
+	docker push $(IMG_PY_BASE)
+
+push-parser-image:
+	@if [ -z "$$(docker image inspect $(IMG_PARSER) --format '{{.Id}}' 2>/dev/null)" ]; then \
+		echo "🔨 本地缺少 $(IMG_PARSER)，开始构建（含 PyInstaller 打包）..."; \
+		$(MAKE) build-parser-image; \
+	fi
+	docker push $(IMG_PARSER)
+
+push-service: push-base-image push-parser-image
 	@echo "🚀 构建并推送 $(IMG_SERVICE) + $(IMG_SERVICE_VERSIONED) ..."
 	# 注意：buildx --push 会走 daemon 的 registry-mirrors（镜像加速器只允许拉取，
 	# 推送会报 unauthorized）。因此先 --load 到本地，再用 docker push 直连 Docker Hub。
 	docker buildx build \
 		--platform $(PLATFORM) \
+		--build-arg BASE_IMAGE=$(IMG_PY_BASE) \
+		--build-arg PARSER_IMAGE=$(IMG_PARSER) \
 		-t $(IMG_SERVICE) \
 		-t $(IMG_SERVICE_VERSIONED) \
 		-f $(REPO_ROOT)/server/Dockerfile \
