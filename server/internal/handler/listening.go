@@ -120,9 +120,9 @@ func (h *Handler) listeningImport(c *gin.Context) {
 		return
 	}
 
-	// 构造 builder.listen args（Runner.cmd = "uv"，RunCustom 直接用 args）
+	// 构造 builder.listen args。LISTEN_BIN 为空时走 uv + Python；
+	// 配置独立二进制时直接执行 listen-parser，args 不带上 uv 前缀。
 	args := []string{
-		"run", "--no-sync", "python", "-m", "builder.listen",
 		"--url", url,
 		"--exam-id", examID,
 		"--lang", lang,
@@ -141,12 +141,20 @@ func (h *Handler) listeningImport(c *gin.Context) {
 
 	// 触发调度。限制 Python 数值库的线程数：2C 机器上 whisper/OpenBLAS 默认会吃满
 	// 所有核心，导致同容器的 Go API 和 PostgreSQL 被 CPU 饿死、请求卡住。
-	err := h.sched.TriggerListening(jobID, examID, lang, args, map[string]string{
+	env := map[string]string{
 		"OMP_NUM_THREADS":      "1",
 		"MKL_NUM_THREADS":      "1",
 		"OPENBLAS_NUM_THREADS": "1",
 		"NUMEXPR_NUM_THREADS":  "1",
-	})
+	}
+	listenBin := strings.TrimSpace(os.Getenv("LISTEN_BIN"))
+	var err error
+	if listenBin != "" {
+		err = h.sched.TriggerListeningBin(jobID, examID, lang, listenBin, args, env)
+	} else {
+		pythonArgs := append([]string{"run", "--no-sync", "python", "-m", "builder.listen"}, args...)
+		err = h.sched.TriggerListening(jobID, examID, lang, pythonArgs, env)
+	}
 	switch {
 	case errors.Is(err, scheduler.ErrBusy):
 		writeError(c, http.StatusConflict, err.Error())

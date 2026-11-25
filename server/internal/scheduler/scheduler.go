@@ -117,6 +117,16 @@ func (s *Scheduler) Trigger(lang, version string) (string, error) {
 // TriggerListening 校验锁与水位后异步启动听力导入任务，立即返回 job_id。
 // builder.listen 的 CLI args 由 handler 构造好传进来。
 func (s *Scheduler) TriggerListening(jobID, examID, lang string, args []string, extraEnv map[string]string) error {
+	return s.triggerListening(jobID, examID, lang, s.runner, args, extraEnv)
+}
+
+// TriggerListeningBin 使用独立 listen-parser 二进制执行解析（LISTEN_BIN）。
+// 与 Python 入口共用同一 CLI 契约，args 不需要 `run --no-sync python -m builder.listen` 前缀。
+func (s *Scheduler) TriggerListeningBin(jobID, examID, lang, bin string, args []string, extraEnv map[string]string) error {
+	return s.triggerListening(jobID, examID, lang, runner.New(bin, nil, ""), args, extraEnv)
+}
+
+func (s *Scheduler) triggerListening(jobID, examID, lang string, rn *runner.Runner, args []string, extraEnv map[string]string) error {
 	s.mu.Lock()
 	if s.busy {
 		s.mu.Unlock()
@@ -131,11 +141,11 @@ func (s *Scheduler) TriggerListening(jobID, examID, lang string, args []string, 
 	}
 
 	ctx := context.Background()
-	go s.runListening(ctx, jobID, examID, lang, args, extraEnv)
+	go s.runListening(ctx, jobID, examID, lang, rn, args, extraEnv)
 	return nil
 }
 
-func (s *Scheduler) runListening(ctx context.Context, jobID, examID, lang string, args []string, extraEnv map[string]string) {
+func (s *Scheduler) runListening(ctx context.Context, jobID, examID, lang string, rn *runner.Runner, args []string, extraEnv map[string]string) {
 	defer s.setIdle()
 
 	if s.store != nil {
@@ -161,7 +171,7 @@ func (s *Scheduler) runListening(ctx context.Context, jobID, examID, lang string
 		}
 	}
 
-	err := s.runner.RunCustom(ctx, args, extraEnv, onLine)
+	err := rn.RunCustom(ctx, args, extraEnv, onLine)
 	if s.store == nil {
 		return
 	}

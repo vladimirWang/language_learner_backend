@@ -5,6 +5,9 @@
 builder/.venv
 builder/work
 builder/.uv-cache
+# 本地 PyInstaller 产物（镜像内会重新构建）
+builder/dist
+builder/build
 deploy/data
 admin/node_modules
 admin/dist

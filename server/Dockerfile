@@ -14,6 +14,31 @@ RUN go mod download
 COPY server/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/version-service ./cmd/version-service
 
+# ---------- 构建独立听力解析二进制 ----------
+# 与运行镜像同基座（python:3.12-slim），产物可直接在运行阶段执行；
+# ffmpeg / tesseract 仍由运行镜像提供，不打进二进制。
+FROM python:3.12-slim AS listen-parser-builder
+WORKDIR /builder
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    UV_LINK_MODE=copy
+# libgomp1 供 ctranslate2 使用；binutils 提供 PyInstaller 在 Linux 上必需的 objdump
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgomp1 binutils && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple uv
+COPY builder/pyproject.toml builder/uv.lock ./
+RUN uv sync --locked --no-dev && rm -rf /root/.cache/uv
+COPY builder/builder ./builder
+COPY builder/packaging ./packaging
+RUN uv pip install --python .venv/bin/python "pyinstaller>=6.11" && \
+    .venv/bin/python -m PyInstaller \
+        --noconfirm --clean \
+        --distpath /out \
+        --workpath /tmp/pyi-build \
+        /builder/packaging/listen_parser.spec
+
 # ---------- 运行阶段 ----------
 FROM python:3.12-slim
 
@@ -46,6 +71,9 @@ RUN uv sync --locked --no-dev && rm -rf /root/.cache/uv
 COPY builder/builder ./builder
 COPY content ./content
 COPY --from=go-builder /out/version-service /app/version-service
+# 独立听力解析二进制：设置 LISTEN_BIN=/usr/local/bin/listen-parser 即走二进制，
+# 不设置仍保留 Python 通道（uv run --no-sync python -m builder.listen）。
+COPY --from=listen-parser-builder /out/listen-parser /usr/local/bin/listen-parser
 
 # builder 子进程的运行约定：工作目录 /builder，产物写到挂载的 /builder/work
 ENV CONTENT_DIR=/builder/content \

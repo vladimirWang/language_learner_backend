@@ -4,6 +4,8 @@ __pycache__/
 builder/.venv/
 builder/work/
 builder/.uv-cache/
+builder/dist/
+builder/build/
 
 # 本地构建缓存 / 产物
 deploy/data/
