@@ -28,6 +28,11 @@ type Config struct {
 	BuilderArgs []string
 	BuilderDir  string
 
+	// 学员端语种配置：DefaultLang 为请求未带 lang 时的缺省语种，
+	// SupportedLangs 为服务端允许的语种集合（顺序即配置顺序）。
+	DefaultLang    string
+	SupportedLangs []string
+
 	// RepoURLs 各语种素材仓库地址（用于监听变更），如 de -> git@github.com:user/de.git
 	RepoURLs map[string]string
 
@@ -99,8 +104,15 @@ func Load() Config {
 		WXAppSecret:   os.Getenv("WX_APPSECRET"),
 		WXTokenSecret: os.Getenv("WX_TOKEN_SECRET"),
 		WXBaseURL:     os.Getenv("WX_BASE_URL"),
+
+		DefaultLang:    envOr("DEFAULT_LANG", "de"),
+		SupportedLangs: parseSupportedLangs(os.Getenv("SUPPORTED_LANGS")),
 	}
 	cfg.SSOPublicBaseURL = envOr("SSO_PUBLIC_BASE_URL", cfg.SSOBaseURL)
+	cfg.DefaultLang = strings.ToLower(strings.TrimSpace(cfg.DefaultLang))
+	if !validLang(cfg.DefaultLang) {
+		cfg.DefaultLang = "de"
+	}
 	cfg.S3AccessKey = os.Getenv("S3_ACCESS_KEY")
 	cfg.S3SecretKey = os.Getenv("S3_SECRET_KEY")
 	cfg.PGDSN = buildDSN()
@@ -110,14 +122,60 @@ func Load() Config {
 		// 本地开发：在 builder/ 目录用 uv 虚拟环境执行一次性构建任务。
 		cfg.BuilderArgs = []string{"run", "python", "-m", "builder"}
 	}
-	cfg.RepoURLs = parseRepoURLs()
+	cfg.RepoURLs = parseRepoURLs(cfg.SupportedLangs)
+	if !containsLang(cfg.SupportedLangs, cfg.DefaultLang) {
+		cfg.SupportedLangs = append([]string{cfg.DefaultLang}, cfg.SupportedLangs...)
+	}
 	return cfg
 }
 
+func containsLang(langs []string, lang string) bool {
+	for _, item := range langs {
+		if item == lang {
+			return true
+		}
+	}
+	return false
+}
+
+// parseSupportedLangs 解析 SUPPORTED_LANGS（逗号分隔）；未配置时保持原有的 de/en/ja。
+func parseSupportedLangs(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return []string{"de", "en", "ja"}
+	}
+	seen := map[string]bool{}
+	langs := make([]string, 0, 3)
+	for _, part := range strings.Split(raw, ",") {
+		lang := strings.ToLower(strings.TrimSpace(part))
+		if !validLang(lang) || seen[lang] {
+			continue
+		}
+		seen[lang] = true
+		langs = append(langs, lang)
+	}
+	if len(langs) == 0 {
+		return []string{"de", "en", "ja"}
+	}
+	return langs
+}
+
+// validLang 与 handler 的 langPattern 保持一致：2~5 个小写字母。
+func validLang(lang string) bool {
+	if len(lang) < 2 || len(lang) > 5 {
+		return false
+	}
+	for _, r := range lang {
+		if r < 'a' || r > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
 // parseRepoURLs 从 REPO_<LANG>_URL 环境变量解析各语种仓库地址。
-func parseRepoURLs() map[string]string {
+func parseRepoURLs(langs []string) map[string]string {
 	urls := map[string]string{}
-	for _, lang := range []string{"de", "en", "ja"} {
+	for _, lang := range langs {
 		key := "REPO_" + strings.ToUpper(lang) + "_URL"
 		if v := os.Getenv(key); v != "" {
 			urls[lang] = v

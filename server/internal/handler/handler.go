@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,12 @@ type JobPublisher interface {
 	Publish(ctx context.Context, payload any) error
 }
 
+// LangConfig 是学员端语种配置：缺省语种与允许的语种集合。
+type LangConfig struct {
+	Default   string
+	Supported []string
+}
+
 // Handler 聚合依赖并构造路由。
 type Handler struct {
 	store     *store.Store
@@ -40,6 +47,10 @@ type Handler struct {
 	tts       *tts.Client
 	pdfPub    JobPublisher
 	logger    *log.Logger
+
+	// 学员端语种：请求未带 lang 时用 defaultLang，且只接受 supportedLangs 中的值。
+	defaultLang    string
+	supportedLangs map[string]bool
 
 	// 口语兜底话术缓存：启动/读写后按 TTL 重新加载，避免每次追问都查库。
 	tplMu      sync.RWMutex
@@ -72,8 +83,19 @@ type Handler struct {
 }
 
 // New 创建 HTTP 处理器。
-func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, daily DailyWordsConfig, sso SSOConfig, wx wxauth.Config, streakStore *streak.Store, logger *log.Logger) *Handler {
-	h := &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, sso: sso, wx: wx, streak: streakStore, logger: logger}
+func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, daily DailyWordsConfig, sso SSOConfig, wx wxauth.Config, langs LangConfig, streakStore *streak.Store, logger *log.Logger) *Handler {
+	defaultLang := strings.TrimSpace(langs.Default)
+	if defaultLang == "" {
+		defaultLang = "de"
+	}
+	supported := make(map[string]bool, len(langs.Supported)+1)
+	for _, lang := range langs.Supported {
+		if lang = strings.TrimSpace(lang); lang != "" {
+			supported[lang] = true
+		}
+	}
+	supported[defaultLang] = true
+	h := &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, sso: sso, wx: wx, defaultLang: defaultLang, supportedLangs: supported, streak: streakStore, logger: logger}
 	h.challenge = challenge.NewBuilder(st)
 	if sch != nil {
 		// 听力解析任务的状态变更 → 消息中心通知 + 全局 SSE

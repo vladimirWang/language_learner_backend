@@ -11,18 +11,21 @@ import (
 
 func TestParseChallengeLang(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	h := &Handler{defaultLang: "de", supportedLangs: map[string]bool{"de": true, "en": true}}
 	for _, tc := range []struct {
 		name, target, want string
 		ok                 bool
 	}{
 		{name: "缺省德语", target: "/api/levels/today", want: "de", ok: true},
 		{name: "显式德语", target: "/api/levels/today?lang=de", want: "de", ok: true},
+		{name: "已配置英语", target: "/api/levels/today?lang=en", want: "en", ok: true},
+		{name: "未配置语种", target: "/api/levels/today?lang=ja", ok: false},
 		{name: "非法语种", target: "/api/levels/today?lang=DE!", ok: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = httptest.NewRequest("GET", tc.target, nil)
-			got, ok := parseChallengeLang(c)
+			got, ok := h.parseChallengeLang(c)
 			if got != tc.want || ok != tc.ok {
 				t.Fatalf("parseChallengeLang() = (%q, %v)，期望 (%q, %v)", got, ok, tc.want, tc.ok)
 			}

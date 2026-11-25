@@ -151,7 +151,8 @@ func main() {
 	} else {
 		logger.Printf("wechat miniapp login: not configured, /api/auth/wx-* returns 503")
 	}
-	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, dailyCfg, ssoCfg, wxCfg, streakStore, logger)
+	langCfg := handler.LangConfig{Default: cfg.DefaultLang, Supported: cfg.SupportedLangs}
+	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, dailyCfg, ssoCfg, wxCfg, langCfg, streakStore, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

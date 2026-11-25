@@ -29,9 +29,8 @@ type wxLoginReq struct {
 }
 
 // wxUserView 是返回给小程序的当前用户会话信息。
+// 不下发 id / openid / unionid 等身份标识，避免隐私字段出现在小程序端。
 type wxUserView struct {
-	ID         int64  `json:"id"`
-	OpenID     string `json:"openid"`
 	Lang       string `json:"lang"`
 	Level      string `json:"level"`
 	Nickname   string `json:"nickname"`
@@ -56,7 +55,7 @@ func (h *Handler) newWXUserView(ctx context.Context, u store.WXUser, isNew bool)
 		}
 	}
 	return wxUserView{
-		ID: u.ID, OpenID: u.OpenID, Lang: "de", Level: u.Level,
+		Lang: h.defaultLang, Level: u.Level,
 		Nickname: u.Nickname, Avatar: avatar, IsNewUser: isNew, TotalStars: u.TotalStars,
 	}
 }

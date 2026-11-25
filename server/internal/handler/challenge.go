@@ -76,13 +76,13 @@ func (h *Handler) requireWXOpenID(c *gin.Context) (string, bool) {
 	return u.OpenID, ok
 }
 
-// parseChallengeLang 校验学员端语种；当前缺省为德语。
-func parseChallengeLang(c *gin.Context) (string, bool) {
+// parseChallengeLang 校验学员端语种；未指定时使用服务端配置的缺省语种。
+func (h *Handler) parseChallengeLang(c *gin.Context) (string, bool) {
 	lang := strings.TrimSpace(c.Query("lang"))
 	if lang == "" {
-		lang = "de"
+		lang = h.defaultLang
 	}
-	if !langPattern.MatchString(lang) {
+	if !langPattern.MatchString(lang) || !h.supportedLangs[lang] {
 		writeError(c, http.StatusBadRequest, "invalid lang")
 		return "", false
 	}
@@ -282,7 +282,7 @@ func (h *Handler) listChallenges(c *gin.Context) {
 	if !ok {
 		return
 	}
-	lang, ok := parseChallengeLang(c)
+	lang, ok := h.parseChallengeLang(c)
 	if !ok {
 		return
 	}
@@ -619,7 +619,7 @@ func (h *Handler) dailyChallengeCalendar(c *gin.Context) {
 	if !ok {
 		return
 	}
-	lang, ok := parseChallengeLang(c)
+	lang, ok := h.parseChallengeLang(c)
 	if !ok {
 		return
 	}
@@ -649,7 +649,7 @@ func (h *Handler) dailyChallengeStreak(c *gin.Context) {
 	if !ok {
 		return
 	}
-	lang, ok := parseChallengeLang(c)
+	lang, ok := h.parseChallengeLang(c)
 	if !ok {
 		return
 	}
