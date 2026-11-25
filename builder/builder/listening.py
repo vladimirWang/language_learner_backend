@@ -38,6 +38,24 @@ NUMBER_WORDS = {
 }
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+# 题号播报（"Nummer 1"）与开场考试说明不属于题目内容，切片时跳过。
+# 正文起点就是报号结束时刻；再往后加间隔会切进下一句的第一个词。
+INSTRUCTION_LEAD_SECONDS = 0.2
+# 开场说明的识别特征：Teil 页头、答题指令、"Sie hören ..." 等。
+INSTRUCTION_RE = re.compile(
+    r"(h(?:ö|o)ren\s+teil|teil\s+\d|teil\s+(?:eins|zwei|drei)"
+    r"|h(?:ö|o)ren\s+sie|sie\s+h(?:ö|o)ren|was\s+(?:ist|1st)\s+richtig"
+    r"|kreuzen\s+s|nummer|nr\.|frage|aufgabe)",
+    re.IGNORECASE,
+)
+# 图片页头：整帧截图顶部会带 "Hören Teil 1 / Was ist richtig? / Kreuzen Sie an ..."。
+HEADER_LINE_RE = re.compile(
+    r"(h(?:ö|o)ren\s+teil|teil\s+\d|teil\s+(?:eins|zwei|drei)"
+    r"|h(?:ö|o)ren\s+sie|sie\s+h(?:ö|o)ren|was\s+(?:ist|1st)\s+richtig"
+    r"|kreuzen\s+s|goethe|zertifikat|deutsch\s+lernen|transkription)",
+    re.IGNORECASE,
+)
+
 # 考试规则文件目录：按考试类型描述 Teil 划分、题号范围和读法。
 PROFILES_DIR = Path(__file__).with_name("profiles")
 PROFILE_ID_RE = re.compile(r"^[a-z0-9-]{1,40}$")
@@ -302,6 +320,10 @@ def import_from_url(
                 question["ocr_note"] = "tesseract 未安装，跳过 OCR"
             else:
                 question["ocr_text"] = None
+            # 裁掉整帧顶部的考试说明页头，只保留本题题面。
+            if question["image"] and HAS_TESSERACT:
+                if _trim_image_header(frame_path, lang=target_lang):
+                    logger.info("已裁掉第 %d 题图片页头", number)
 
         logger.info("第 %d/%d 题 完成 number=%d clip=%s", idx, len(questions), number, clip.name)
 
@@ -375,6 +397,20 @@ def _time_at(segment: Segment, char_index: int) -> float:
             return word.start + ratio * (word.end - word.start)
     ratio = char_index / max(1, len(text))
     return segment.start + ratio * (segment.end - segment.start)
+
+
+def _cue_bounds(segment: Segment, match: "re.Match[str]") -> tuple[float, float]:
+    """题号提示的起止时间；无词级时间戳时按字符比例估算。
+
+    报号整句只有题号与标点时（"Nummer 3."），直接取整句结束，
+    避免比例估算把句末标点带进下一题。
+    """
+    start = _time_at(segment, match.start())
+    tail = segment.text[match.end():].strip(" .!?,;:-–—")
+    if not tail:
+        return start, segment.end
+    end = min(segment.end, max(start, _time_at(segment, match.end())))
+    return start, end
 
 
 def _text_index_at(segment: Segment, time: float) -> int:
@@ -526,9 +562,15 @@ def _collect_section_anchors(
     section_start: float,
     section_limit: float,
     cue_re: re.Pattern[str],
-) -> list[tuple[int, float]]:
-    """收集一个 Teil 内已识别到的 (题号, 起点)，题号必须递增且落在本 Teil 范围内。"""
-    found: list[tuple[int, float]] = []
+) -> list[tuple[int, float, float]]:
+    """收集一个 Teil 内已识别到的题号。
+
+    返回 (题号, 提示起点, 正文起点)：
+    - 提示起点同时作为上一题的结束边界，保证上一题不包含本题报号；
+    - 正文起点在报号结束之后，作为本题音频起点，去掉 "Nummer N"。
+    题号必须递增且落在本 Teil 范围内。
+    """
+    found: list[tuple[int, float, float]] = []
     for row in _section_anchor_rows(rows, section, section_start, section_limit):
         matches = list(cue_re.finditer(row.text))
         for match in matches:
@@ -536,13 +578,13 @@ def _collect_section_anchors(
             if number is None:
                 continue
             # 题号提示可能与上一题尾句同处一个 segment，取提示本身的词级起点
-            cue_time = _time_at(row, match.start())
+            cue_time, cue_end = _cue_bounds(row, match)
             # 只接受落在本 Teil 题号范围内的锚点，过滤电话号码等假数字
             if not (section.start_number <= number <= section.end_number):
                 continue
             if found and number <= found[-1][0]:
                 continue
-            found.append((number, cue_time))
+            found.append((number, cue_time, cue_end))
         if matches:
             continue
         bare = BARE_NUM_RE.match(row.text.strip())
@@ -554,7 +596,7 @@ def _collect_section_anchors(
                 continue
             if found and number <= found[-1][0]:
                 continue
-            found.append((number, row.start))
+            found.append((number, row.start, row.end))
     return found
 
 
@@ -582,10 +624,27 @@ def _profile_needs_anchor_repair(
         if not found:
             # 整个 Teil 一个题号都没识别到，等分补齐全靠猜，值得补转写
             return True
-        for (number, start), (next_number, next_start) in zip(found, found[1:]):
+        for (number, start, _), (next_number, next_start, _) in zip(found, found[1:]):
             if next_number - number > 1 and next_start - start > 45:
                 return True
     return False
+
+
+def _first_content_after_instructions(
+    rows: Iterable[Segment], section_start: float, section_limit: float
+) -> float:
+    """跳过 Teil 页头与答题指令，返回第一段正文的起点。
+
+    用于整段题号提示缺失、只能从 Teil 起点等分的首题，避免把开场的
+    "Teil 1 / Was ist richtig? / Kreuzen Sie an ..." 当成题目音频。
+    """
+    for row in rows:
+        if row.start < section_start or row.start >= section_limit:
+            continue
+        if INSTRUCTION_RE.search(row.text):
+            continue
+        return max(section_start, row.start - INSTRUCTION_LEAD_SECONDS)
+    return section_start
 
 
 def _split_with_profile(
@@ -613,7 +672,10 @@ def _split_with_profile(
         return _split_with_legacy(rows_all, duration)
 
     cue_re = profile.cue_re()
+    # starts_by_number 是每题的结束边界（下一题的报号起点），
+    # content_starts_by_number 是本题音频起点（报号结束之后）。
     starts_by_number: dict[int, float] = {}
+    content_starts_by_number: dict[int, float] = {}
     last_question_end: dict[int, float] = {}
 
     for index, section in enumerate(profile.sections):
@@ -638,23 +700,33 @@ def _split_with_profile(
         if anchor_rows is not None:
             # 补转写可能时间略有漂移：主转写已找到的题号保持原锚点，
             # 只用补转写填补缺失题号。
-            have = {number for number, _ in found}
+            have = {number for number, _, _ in found}
             extra = _collect_section_anchors(
                 anchors_all, section, section_start, section_limit, cue_re
             )
             found.extend(
-                (number, cue_time) for number, cue_time in extra if number not in have
+                anchor for anchor in extra if anchor[0] not in have
             )
             found.sort(key=lambda item: item[0])
-            deduped: list[tuple[int, float]] = []
-            for number, cue_time in found:
-                if deduped and number <= deduped[-1][0]:
+            deduped: list[tuple[int, float, float]] = []
+            for anchor in found:
+                if deduped and anchor[0] <= deduped[-1][0]:
                     continue
-                deduped.append((number, cue_time))
+                deduped.append(anchor)
             found = deduped
-        starts_by_number.update(
-            _fill_section_positions(section, section_start, content_end, found)
+        positions = _fill_section_positions(
+            section, section_start, content_end, [(n, cue) for n, cue, _ in found]
         )
+        starts_by_number.update(positions)
+        content_starts_by_number.update(positions)
+        # 有真实报号的题，正文起点取报号结束之后；缺失报号的题沿用等分位置。
+        for number, _, content_start in found:
+            content_starts_by_number[number] = content_start
+        # 首题没有报号时，跳过开场说明再确定正文起点。
+        if section.start_number not in {n for n, _, _ in found}:
+            content_starts_by_number[section.start_number] = (
+                _first_content_after_instructions(rows_all, section_start, content_end)
+            )
         last_question_end[section.end_number] = content_end
 
     expected = [
@@ -668,15 +740,9 @@ def _split_with_profile(
             profile.id, len(expected), profile.total_questions,
         )
 
-    # 第 1 题从视频开头起算，保留开头的考试说明
-    if rows_all and expected:
-        intro_start = max(0.0, rows_all[0].start - 0.3)
-        if intro_start < starts_by_number[expected[0]]:
-            starts_by_number[expected[0]] = intro_start
-
     questions: list[dict] = []
     for index, number in enumerate(expected):
-        start = starts_by_number[number]
+        start = content_starts_by_number[number]
         end = starts_by_number[expected[index + 1]] if index + 1 < len(expected) else duration
         # 每个 Teil 的最后一题截止到 "Ende Teil X"，避免把下一部分的说明带进本题
         end = min(end, last_question_end.get(number, end))
@@ -709,57 +775,52 @@ def split_questions(
 
 def _split_with_legacy(rows_all: list[Segment], duration: float) -> list[dict]:
     """通用规则：不依赖考试类型，只按 "Nummer/Nr." 锚点切分。"""
-    anchors: list[tuple[int, float]] = []
+    anchors: list[tuple[int, float, float]] = []
 
-    def accept(number: int | None, start: float) -> None:
+    def accept(number: int | None, cue_start: float, content_start: float) -> None:
         if number is None:
             return
         if anchors and number <= anchors[-1][0]:
             return
         if anchors and number > anchors[-1][0] + MAX_CUE_JUMP:
             return
-        anchors.append((number, start))
+        anchors.append((number, cue_start, content_start))
 
     for row in rows_all:
         matches = list(CUE_RE.finditer(row.text))
         if matches:
             for match in matches:
-                # 与 profile 模式一致：用题号提示自身的词级起点，而不是整段起点
-                accept(_cue_number(match.group(2)), _time_at(row, match.start()))
+                # 与 profile 模式一致：用题号提示自身的词级起止时间
+                cue_start, cue_end = _cue_bounds(row, match)
+                accept(_cue_number(match.group(2)), cue_start, cue_end)
             continue
         # 整句只有一个裸题号（Teil 2 常见）
         bare = BARE_NUM_RE.match(row.text.strip())
         if bare:
-            accept(_cue_number(bare.group(1)), row.start)
+            accept(_cue_number(bare.group(1)), row.start, row.end)
 
     if not anchors:
         return []
 
     # 相邻锚点之间按题号数量等分，补齐漏识别的题号
-    cues: list[tuple[int, float]] = []
-    for index, (number, start) in enumerate(anchors):
+    cues: list[tuple[int, float, float]] = []
+    for index, (number, cue_start, content_start) in enumerate(anchors):
         if index + 1 < len(anchors):
-            next_number, next_start = anchors[index + 1]
+            next_number, next_cue, _ = anchors[index + 1]
             count = next_number - number
-            step = (next_start - start) / count
-            cues.extend((number + k, start + step * k) for k in range(count))
+            cue_step = (next_cue - cue_start) / count
+            for k in range(count):
+                cue = cue_start + cue_step * k
+                # 缺失题号的题目无法判断报号长度，沿用等分位置作为正文起点。
+                cues.append((number + k, cue, content_start if k == 0 else cue))
         else:
-            cues.append((number, start))
-
-    # 第 1 题从视频开头起算，避免把开头的考试说明（"Teil 1 / Was ist richtig? ..."）
-    # 切在第 1 题之外——ASR 已识别，但之前没有归属到任何题目。
-    if cues and rows_all:
-        intro_start = max(0.0, rows_all[0].start - 0.3)
-        if intro_start < cues[0][1]:
-            cues[0] = (cues[0][0], intro_start)
+            cues.append((number, cue_start, content_start))
 
     questions: list[dict] = []
-    for index, (number, start) in enumerate(cues):
+    for index, (number, cue_start, content_start) in enumerate(cues):
+        # 本题音频从报号之后开始，到下一题报号起点结束，报号本身不进入任何一题。
         end = cues[index + 1][1] if index + 1 < len(cues) else duration
-        # 起点直接用本题锚点：第 1 题已在上面扩展到视频开头；
-        # 其余题目不再向前多取 0.3s，否则会把上一题结尾的对话一起截进来。
-        # 终点直接取下一题锚点，保证本题音频完整。
-        questions.append(_make_question(number, start, end, rows_all))
+        questions.append(_make_question(number, content_start, end, rows_all))
     return questions
 
 
@@ -1331,6 +1392,98 @@ def _extract_frame(source: Path, target: Path, at_time: float) -> None:
          "-ss", f"{at_time:.2f}", "-threads", "1", "-i", str(source),
          "-frames:v", "1", "-q:v", "3", str(target)]
     )
+
+
+def _probe_image_size(path: Path) -> tuple[int, int]:
+    """读取图片宽高；失败返回 (0, 0)。"""
+    try:
+        proc = _run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
+            allow_stderr=True,
+        )
+        width, height = proc.stdout.strip().splitlines()[0].split("x")[:2]
+        return int(width), int(height)
+    except (ListeningError, ValueError, IndexError):
+        return 0, 0
+
+
+def _ocr_lines(image: Path, lang: str = "de") -> list[tuple[str, int, int]]:
+    """用 tesseract TSV 输出识别到的文本行：[(文本, top, bottom)]，按 top 升序。"""
+    if not HAS_TESSERACT:
+        return []
+    tess_lang = TESSERACT_LANG_MAP.get(lang, lang)
+    try:
+        proc = subprocess.run(
+            ["tesseract", str(image), "-", "-l", tess_lang, "--psm", "6", "tsv"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return []
+    if proc.returncode != 0:
+        return []
+
+    groups: dict[tuple[str, str, str], dict] = {}
+    for row in csv.DictReader(proc.stdout.splitlines(), delimiter="\t"):
+        text = (row.get("text") or "").strip()
+        if not text:
+            continue
+        key = (row.get("block_num") or "", row.get("par_num") or "", row.get("line_num") or "")
+        group = groups.setdefault(key, {"text": [], "top": 10**9, "bottom": 0})
+        group["text"].append(text)
+        try:
+            top = int(row.get("top") or 0)
+            height = int(row.get("height") or 0)
+        except ValueError:
+            continue
+        group["top"] = min(group["top"], top)
+        group["bottom"] = max(group["bottom"], top + height)
+
+    lines = [(" ".join(g["text"]), g["top"], g["bottom"]) for g in groups.values()]
+    lines.sort(key=lambda item: item[1])
+    return lines
+
+
+def _trim_image_header(image: Path, lang: str = "de") -> bool:
+    """裁掉整帧截图顶部的考试说明（"Hören Teil 1 / Was ist richtig? ..."）。
+
+    题目图片是视频整帧，页头说明与本题无关。按 OCR 行位置找到页头之后
+    第一行正文，裁掉其上方的页头，保留宽度与其余内容；无法可靠定位时不裁剪。
+    """
+    width, height = _probe_image_size(image)
+    if width <= 0 or height <= 0:
+        return False
+
+    header_bottom = 0
+    content_top = 0
+    for text, top, bottom in _ocr_lines(image, lang):
+        if HEADER_LINE_RE.search(text):
+            header_bottom = max(header_bottom, bottom)
+            continue
+        content_top = top
+        break
+
+    if header_bottom <= 0 or content_top <= 0:
+        return False
+    cut = content_top - 8
+    cut = max(cut, header_bottom)
+    cut -= cut % 2
+    # 只裁顶部少量区域，避免误识别把整道题裁掉
+    if cut < 4 or cut > height * 0.5 or height - cut < height * 0.4:
+        return False
+
+    temp = image.with_name(f"{image.stem}.crop{image.suffix}")
+    try:
+        _run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-i", str(image), "-vf", f"crop={width}:{height - cut}:0:{cut}",
+             "-frames:v", "1", "-q:v", "2", str(temp)]
+        )
+    except ListeningError:
+        temp.unlink(missing_ok=True)
+        return False
+    os.replace(temp, image)
+    return True
 
 
 TESSERACT_LANG_MAP = {

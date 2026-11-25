@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/wangfernando/language-learner/server/internal/challenge"
 	"github.com/wangfernando/language-learner/server/internal/store"
 	"github.com/wangfernando/language-learner/server/internal/streak"
 )
@@ -111,6 +112,7 @@ type challengeItemView struct {
 	Kind          string          `json:"kind"`
 	Prompt        json.RawMessage `json:"prompt"`
 	Audio         *challengeAudio `json:"audio,omitempty"`
+	Image         *challengeImage `json:"image,omitempty"`
 	CorrectAnswer string          `json:"correct_answer"`
 	Explanation   string          `json:"explanation"`
 }
@@ -119,6 +121,11 @@ type challengeItemView struct {
 type challengeAudio struct {
 	URL      string  `json:"url"`
 	Duration float64 `json:"duration"`
+}
+
+// challengeImage 是听力题题面图片的短期签名地址。
+type challengeImage struct {
+	URL string `json:"url"`
 }
 
 // audioSecret 复用微信登录密钥签发短期音频链接。
@@ -144,6 +151,30 @@ func (h *Handler) challengeAudioURL(itemID int64) string {
 	return fmt.Sprintf("/api/levels/audio/%d?exp=%d&sig=%s", itemID, exp, h.signChallengeAudio(itemID, exp))
 }
 
+func (h *Handler) signChallengeImage(itemID, exp int64) string {
+	mac := hmac.New(sha256.New, []byte(h.audioSecret()))
+	fmt.Fprintf(mac, "image:%d:%d", itemID, exp)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// challengeImageURL 生成 10 分钟有效的题面图片地址；未配置密钥时返回空串。
+func (h *Handler) challengeImageURL(itemID int64) string {
+	if h.audioSecret() == "" || itemID <= 0 {
+		return ""
+	}
+	exp := time.Now().Add(10 * time.Minute).Unix()
+	return fmt.Sprintf("/api/levels/image/%d?exp=%d&sig=%s", itemID, exp, h.signChallengeImage(itemID, exp))
+}
+
+// challengeWorkRoot 返回听力产物根目录（WORK_DIR）。
+func challengeWorkRoot() string {
+	root := os.Getenv("WORK_DIR")
+	if root == "" {
+		root = "work"
+	}
+	return root
+}
+
 // buildItemViews 把题目转成下发视图（含标准答案与解析；听力题附带短期签名音频地址）。
 func (h *Handler) buildItemViews(items []store.DailyChallengeItem) []challengeItemView {
 	views := make([]challengeItemView, 0, len(items))
@@ -163,10 +194,23 @@ func (h *Handler) buildItemViews(items []store.DailyChallengeItem) []challengeIt
 			var prompt struct {
 				Audio    string  `json:"audio"`
 				Duration float64 `json:"duration"`
+				Image    string  `json:"image"`
 			}
-			if json.Unmarshal(item.Prompt, &prompt) == nil && prompt.Audio != "" {
-				if url := h.challengeAudioURL(item.ID); url != "" {
-					view.Audio = &challengeAudio{URL: url, Duration: prompt.Duration}
+			if json.Unmarshal(item.Prompt, &prompt) == nil {
+				if prompt.Audio != "" {
+					if url := h.challengeAudioURL(item.ID); url != "" {
+						view.Audio = &challengeAudio{URL: url, Duration: prompt.Duration}
+					}
+				}
+				image := strings.TrimSpace(prompt.Image)
+				// 历史关卡落库时没有图片字段，按 ref_id 从 manifest 补图。
+				if image == "" {
+					image = challenge.ListeningImageForRef(challengeWorkRoot(), item.RefID)
+				}
+				if image != "" {
+					if url := h.challengeImageURL(item.ID); url != "" {
+						view.Image = &challengeImage{URL: url}
+					}
 				}
 			}
 		}
@@ -217,10 +261,7 @@ func (h *Handler) challengeAudioFile(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "audio not found")
 		return
 	}
-	workRoot := os.Getenv("WORK_DIR")
-	if workRoot == "" {
-		workRoot = "work"
-	}
+	workRoot := challengeWorkRoot()
 	target, err := safeJoin(workRoot, prompt.Audio)
 	if err != nil {
 		writeError(c, http.StatusNotFound, "audio not found")
@@ -231,6 +272,69 @@ func (h *Handler) challengeAudioFile(c *gin.Context) {
 		return
 	}
 	c.Header("Content-Type", "audio/mp4")
+	c.Header("Cache-Control", "private, max-age=600")
+	http.ServeFile(c.Writer, c.Request, target)
+}
+
+// challengeImageFile 校验签名后返回听力题题面图片。
+func (h *Handler) challengeImageFile(c *gin.Context) {
+	if h.audioSecret() == "" {
+		writeError(c, http.StatusServiceUnavailable, "图片服务未配置")
+		return
+	}
+	itemID, err := strconv.ParseInt(c.Param("itemId"), 10, 64)
+	if err != nil || itemID <= 0 {
+		writeError(c, http.StatusBadRequest, "invalid item id")
+		return
+	}
+	exp, err := strconv.ParseInt(c.Query("exp"), 10, 64)
+	if err != nil || exp < time.Now().Unix() {
+		writeError(c, http.StatusForbidden, "image link expired")
+		return
+	}
+	expected := h.signChallengeImage(itemID, exp)
+	if !hmac.Equal([]byte(c.Query("sig")), []byte(expected)) {
+		writeError(c, http.StatusForbidden, "invalid image signature")
+		return
+	}
+	item, err := h.store.GetChallengeItem(c.Request.Context(), itemID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(c, http.StatusNotFound, "item not found")
+			return
+		}
+		h.logger.Printf("challenge image item=%d: %v", itemID, err)
+		writeError(c, http.StatusInternalServerError, "load item failed")
+		return
+	}
+	if item.Kind != "listening" {
+		writeError(c, http.StatusNotFound, "item has no image")
+		return
+	}
+	var prompt struct {
+		Image string `json:"image"`
+	}
+	if err := json.Unmarshal(item.Prompt, &prompt); err != nil {
+		writeError(c, http.StatusNotFound, "image not found")
+		return
+	}
+	image := strings.TrimSpace(prompt.Image)
+	if image == "" {
+		image = challenge.ListeningImageForRef(challengeWorkRoot(), item.RefID)
+	}
+	if image == "" {
+		writeError(c, http.StatusNotFound, "image not found")
+		return
+	}
+	target, err := safeJoin(challengeWorkRoot(), image)
+	if err != nil {
+		writeError(c, http.StatusNotFound, "image not found")
+		return
+	}
+	if info, err := os.Stat(target); err != nil || info.IsDir() {
+		writeError(c, http.StatusNotFound, "image not found")
+		return
+	}
 	c.Header("Cache-Control", "private, max-age=600")
 	http.ServeFile(c.Writer, c.Request, target)
 }

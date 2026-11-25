@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -83,12 +84,13 @@ type choicePrompt struct {
 	Options  []string `json:"options"`
 }
 
-// audioChoicePrompt 是听力题题面；audio 为相对 workDir 的路径。
+// audioChoicePrompt 是听力题题面；audio、image 为相对 workDir 的路径。
 type audioChoicePrompt struct {
 	Type     string   `json:"type"`
 	Question string   `json:"question"`
 	Options  []string `json:"options"`
 	Audio    string   `json:"audio"`
+	Image    string   `json:"image,omitempty"`
 	Duration float64  `json:"duration"`
 }
 
@@ -199,6 +201,100 @@ func (b *Builder) Regenerate(ctx context.Context, lang, level string, day time.T
 	}
 	items, err = b.st.ListChallengeItems(ctx, existing.ID)
 	return updated, items, err
+}
+
+// RegenerateByID 重新生成指定关卡的草稿内容；已发布关卡返回 ErrChallengeLocked。
+// requestedType 为空时沿用当前题型，否则按指定题型重建题目与标题。
+func (b *Builder) RegenerateByID(ctx context.Context, id int64, requestedType string) (*store.DailyChallenge, []store.DailyChallengeItem, error) {
+	existing, err := b.st.GetChallengeByID(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if existing.Status == store.ChallengeStatusPublished {
+		return nil, nil, store.ErrChallengeLocked
+	}
+	challengeType := requestedType
+	if challengeType == "" {
+		challengeType = existing.ChallengeType
+	}
+	if challengeType == "" {
+		challengeType = challengeCycle[0]
+	}
+	seed := fmt.Sprintf("%s|%s|%s|ch-%d", existing.Day, existing.Lang, existing.Level, existing.ID)
+	items, err := b.build(ctx, existing.Lang, existing.Level, seed, challengeType)
+	if err != nil {
+		return nil, nil, err
+	}
+	seq, err := b.st.ChallengeSequenceNumber(ctx, existing.Lang, existing.Level, existing.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	title := fmt.Sprintf("第%d关 %s %s关卡", seq, existing.Level, typeLabel(challengeType))
+	if err := b.st.ReplaceChallengeContent(ctx, existing.ID, challengeType, title, items); err != nil {
+		return nil, nil, err
+	}
+	updated, err := b.st.GetChallengeByID(ctx, existing.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	items, err = b.st.ListChallengeItems(ctx, existing.ID)
+	return updated, items, err
+}
+
+// CreateDraft 在序列末尾追加一个草稿关卡；requestedType 为空时沿用上一关题型继续轮转。
+func (b *Builder) CreateDraft(ctx context.Context, lang, level, requestedType string) (*store.DailyChallenge, []store.DailyChallengeItem, error) {
+	existing, err := b.st.ListChallengesForAdmin(ctx, lang, level)
+	if err != nil {
+		return nil, nil, err
+	}
+	seq := len(existing) + 1
+	lastType := ""
+	if len(existing) > 0 {
+		lastType = existing[len(existing)-1].ChallengeType
+	}
+
+	candidateTypes := make([]string, 0, len(challengeCycle))
+	if requestedType != "" {
+		candidateTypes = append(candidateTypes, requestedType)
+	} else {
+		start := 0
+		nextType := nextChallengeType(lastType)
+		for i, t := range challengeCycle {
+			if t == nextType {
+				start = i
+				break
+			}
+		}
+		for offset := 0; offset < len(challengeCycle); offset++ {
+			candidateTypes = append(candidateTypes, challengeCycle[(start+offset)%len(challengeCycle)])
+		}
+	}
+
+	dayStr := time.Now().UTC().Format("2006-01-02")
+	for _, challengeType := range candidateTypes {
+		seed := fmt.Sprintf("%s|%s|%s|manual-%d", dayStr, lang, level, seq)
+		items, buildErr := b.build(ctx, lang, level, seed, challengeType)
+		if errors.Is(buildErr, ErrNoContent) {
+			continue
+		}
+		if buildErr != nil {
+			return nil, nil, buildErr
+		}
+		title := fmt.Sprintf("第%d关 %s %s关卡", seq, level, typeLabel(challengeType))
+		created, _, err := b.st.CreateChallenge(ctx, store.DailyChallenge{
+			Lang:          lang,
+			Level:         level,
+			Day:           dayStr,
+			ChallengeType: challengeType,
+			Title:         title,
+			Status:        store.ChallengeStatusDraft,
+		}, items)
+		if err != nil {
+			return nil, nil, err
+		}
+		return created, items, nil
+	}
+	return nil, nil, ErrNoContent
 }
 
 // GenerateDay 为所有已配置的 (lang, level) 生成当天关卡；多用于定时空跑。
@@ -573,6 +669,7 @@ type listeningQuestion struct {
 	Start      float64         `json:"start"`
 	End        float64         `json:"end"`
 	Audio      string          `json:"audio"`
+	Image      string          `json:"image"`
 	Options    []string        `json:"options"`
 	Answer     json.RawMessage `json:"answer"`
 	Transcript string          `json:"transcript"`
@@ -582,6 +679,7 @@ type listeningCandidate struct {
 	ExamID   string
 	Number   int
 	Audio    string
+	Image    string
 	Options  []string
 	Answer   string
 	Duration float64
@@ -652,7 +750,11 @@ func (b *Builder) buildListeningItems(ctx context.Context, lang, level, seed str
 	for _, candidate := range picked {
 		refID := fmt.Sprintf("listening:%s:%d", candidate.ExamID, candidate.Number)
 		question := fmt.Sprintf("听力第 %d 题", candidate.Number)
-		item, err := newAudioItem(refID, question, candidate.Options, candidate.Answer, candidate.Audio, candidate.Duration, candidate.Text)
+		image := candidate.Image
+		if image != "" && !b.hasAsset(image) {
+			image = ""
+		}
+		item, err := newAudioItem(refID, question, candidate.Options, candidate.Answer, candidate.Audio, image, candidate.Duration, candidate.Text)
 		if err != nil {
 			return nil, err
 		}
@@ -661,11 +763,22 @@ func (b *Builder) buildListeningItems(ctx context.Context, lang, level, seed str
 	return items, nil
 }
 
+// hasAsset 判断 workDir 下是否存在该相对路径文件。
+func (b *Builder) hasAsset(rel string) bool {
+	info, err := os.Stat(filepath.Join(b.workDir, filepath.FromSlash(rel)))
+	return err == nil && !info.IsDir()
+}
+
 func (b *Builder) readListeningManifest(examID string) (*listeningManifest, error) {
+	return readListeningManifestAt(b.workDir, examID)
+}
+
+// readListeningManifestAt 读取 workDir 下某套听力的 manifest。
+func readListeningManifestAt(workDir, examID string) (*listeningManifest, error) {
 	if examID == "" {
 		return nil, ErrNoContent
 	}
-	path := filepath.Join(b.workDir, "listening", examID, "manifest.json")
+	path := filepath.Join(workDir, "listening", examID, "manifest.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -675,6 +788,60 @@ func (b *Builder) readListeningManifest(examID string) (*listeningManifest, erro
 		return nil, err
 	}
 	return &manifest, nil
+}
+
+// listeningImagePath 返回题目图片相对 workDir 的路径；无图片或路径越界时返回空串。
+func listeningImagePath(examID, image string) string {
+	image = strings.TrimSpace(image)
+	if image == "" || strings.Contains(image, "..") {
+		return ""
+	}
+	return filepath.ToSlash(filepath.Join("listening", examID, filepath.FromSlash(image)))
+}
+
+// ListeningImageForRef 由 ref_id（listening:{examID}:{number}）反查题目图片路径（相对 workDir）。
+// 用于给已落库的历史听力题补图；无图片或文件不存在时返回空串。
+func ListeningImageForRef(workDir, refID string) string {
+	examID, number, ok := parseListeningRef(refID)
+	if !ok {
+		return ""
+	}
+	manifest, err := readListeningManifestAt(workDir, examID)
+	if err != nil {
+		return ""
+	}
+	for _, q := range manifest.Questions {
+		if q.Number != number {
+			continue
+		}
+		rel := listeningImagePath(examID, q.Image)
+		if rel == "" {
+			return ""
+		}
+		if info, err := os.Stat(filepath.Join(workDir, filepath.FromSlash(rel))); err != nil || info.IsDir() {
+			return ""
+		}
+		return rel
+	}
+	return ""
+}
+
+// parseListeningRef 解析 listening:{examID}:{number}。
+func parseListeningRef(refID string) (string, int, bool) {
+	const prefix = "listening:"
+	if !strings.HasPrefix(refID, prefix) {
+		return "", 0, false
+	}
+	rest := strings.TrimPrefix(refID, prefix)
+	idx := strings.LastIndex(rest, ":")
+	if idx <= 0 || idx >= len(rest)-1 {
+		return "", 0, false
+	}
+	number, err := strconv.Atoi(rest[idx+1:])
+	if err != nil || number <= 0 {
+		return "", 0, false
+	}
+	return rest[:idx], number, true
 }
 
 // listeningCandidates 把 manifest 题目转成可出题的候选；丢弃无答案或无选项的题。
@@ -723,6 +890,7 @@ func listeningCandidates(examID string, manifest *listeningManifest) []listening
 			ExamID:   examID,
 			Number:   q.Number,
 			Audio:    filepath.ToSlash(filepath.Join("listening", examID, filepath.FromSlash(audio))),
+			Image:    listeningImagePath(examID, q.Image),
 			Options:  options,
 			Answer:   answer,
 			Duration: math.Round((q.End-q.Start)*10) / 10,
@@ -779,13 +947,14 @@ func newChoiceItem(kind, refID, question string, options []string, correct, expl
 	}, nil
 }
 
-func newAudioItem(refID, question string, options []string, correct, audio string, duration float64, explanation string) (store.DailyChallengeItem, error) {
+func newAudioItem(refID, question string, options []string, correct, audio, image string, duration float64, explanation string) (store.DailyChallengeItem, error) {
 	options = shuffleOptions(options, refID)
 	prompt, err := json.Marshal(audioChoicePrompt{
 		Type:     "audio_choice",
 		Question: question,
 		Options:  options,
 		Audio:    audio,
+		Image:    image,
 		Duration: duration,
 	})
 	if err != nil {

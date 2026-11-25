@@ -197,12 +197,12 @@ func TestBuildItemCountsIntegration(t *testing.T) {
 		if len(items) != 6 {
 			t.Fatalf("修改后题数 = %d，期望 6", len(items))
 		}
-		monthRows, err := st.ListChallengesForMonth(ctx, lang, level, "2026-11-01", "2026-11-30")
+		rows, err := st.ListChallengesForAdmin(ctx, lang, level)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(monthRows) != 1 || monthRows[0].ChallengeType != store.ChallengeTypeVocab {
-			t.Fatalf("月历列表未返回关卡类型：%+v", monthRows)
+		if len(rows) != 1 || rows[0].ChallengeType != store.ChallengeTypeVocab {
+			t.Fatalf("管理台关卡列表未返回关卡类型：%+v", rows)
 		}
 	})
 

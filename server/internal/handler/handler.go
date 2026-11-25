@@ -238,19 +238,21 @@ func (h *Handler) Routes() http.Handler {
 	{
 		levels.GET("", h.listChallenges)
 		levels.GET("/audio/:itemId", h.challengeAudioFile)
+		levels.GET("/image/:itemId", h.challengeImageFile)
 		levels.GET("/calendar", h.dailyChallengeCalendar)
 		levels.GET("/streak", h.dailyChallengeStreak)
 		levels.GET("/:id", h.getChallenge)
 		levels.POST("/:id/submit", h.submitDailyChallenge)
 	}
 
-	// 管理台每日关卡维护：列表、预览、重新生成、发布。
+	// 管理台每日关卡维护：按关卡 ID 操作，列表按 (lang, level) 序列返回并附参与人数。
 	adminLevels := api.Group("/admin/levels")
 	{
 		adminLevels.GET("", h.adminListChallenges)
-		adminLevels.GET("/:day", h.adminGetChallenge)
-		adminLevels.POST("/:day/regenerate", h.adminRegenerateChallenge)
-		adminLevels.PATCH("/:day", h.adminUpdateChallenge)
+		adminLevels.POST("", h.adminCreateChallenge)
+		adminLevels.GET("/:id", h.adminGetChallenge)
+		adminLevels.POST("/:id/regenerate", h.adminRegenerateChallenge)
+		adminLevels.PATCH("/:id", h.adminUpdateChallenge)
 	}
 
 	// 语法题库审核：agent 导入草稿、导出 CSV、回传审核结果。

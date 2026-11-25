@@ -321,7 +321,7 @@ func (h *Handler) adminGenerateGrammar(c *gin.Context) {
 	_, _ = h.store.InsertNotification(ctx, jobID, "info",
 		fmt.Sprintf("语法题生成已排队 (%s)", levelLabel(level)),
 		fmt.Sprintf("共 %d 个语法点待处理", len(preCheck)),
-		map[string]any{"lang": lang, "level": level, "per_source": body.PerSource, "sources_total": len(preCheck)})
+		map[string]any{"kind": "grammar_generate", "lang": lang, "level": level, "per_source": body.PerSource, "sources_total": len(preCheck)})
 
 	c.JSON(http.StatusAccepted, map[string]any{
 		"job_id":        jobID,
@@ -360,7 +360,7 @@ func (h *Handler) runGenerateGrammar(jobID string, req struct {
 		})
 		_, _ = h.store.InsertNotification(ctx, jobID, level,
 			fmt.Sprintf("语法生成 · %s", stage), msg,
-			map[string]any{"lang": req.Lang, "level": req.Level, "stage": stage, "data": data})
+			map[string]any{"kind": "grammar_generate", "lang": req.Lang, "level": req.Level, "stage": stage, "data": data})
 	}
 
 	fail := func(err error, perSourceErrors []string, totalSources, totalDraft int) {
@@ -375,7 +375,7 @@ func (h *Handler) runGenerateGrammar(jobID string, req struct {
 		})
 		_, _ = h.store.InsertNotification(ctx, jobID, "error",
 			fmt.Sprintf("语法题生成失败 (%s)", levelLabel(req.Level)), msg,
-			map[string]any{"lang": req.Lang, "level": req.Level, "errors": perSourceErrors})
+			map[string]any{"kind": "grammar_generate", "lang": req.Lang, "level": req.Level, "errors": perSourceErrors})
 	}
 
 	push("init", "info", "开始生成语法题草稿", nil)
@@ -428,7 +428,7 @@ func (h *Handler) runGenerateGrammar(jobID string, req struct {
 	_, _ = h.store.InsertNotification(ctx, jobID, "success",
 		fmt.Sprintf("语法题生成完成 (%s)", levelLabel(req.Level)),
 		fmt.Sprintf("共 %d 个语法点，入库 %d 道草稿", res.Sources, res.TotalDraft),
-		map[string]any{"lang": req.Lang, "level": req.Level, "result": successData})
+		map[string]any{"kind": "grammar_generate", "lang": req.Lang, "level": req.Level, "result": successData})
 }
 
 func levelLabel(level string) string {

@@ -26,6 +26,10 @@ type DailyChallenge struct {
 	CreatedAt     time.Time `gorm:"column:created_at" json:"created_at"`
 	UpdatedAt     time.Time `gorm:"column:updated_at" json:"updated_at"`
 	ItemCount     int       `gorm:"column:item_count" json:"item_count"`
+	// Seq 是同一 (lang, level) 序列中的序号，仅管理台查询填充。
+	Seq int `gorm:"column:seq" json:"seq,omitempty"`
+	// ParticipantCount 是去重后的参与人数，仅管理台查询填充。
+	ParticipantCount int `gorm:"column:participant_count" json:"participant_count,omitempty"`
 }
 
 // DailyChallengeItem 对应 daily_challenge_items 一行，prompt/answer 为 JSONB。
@@ -182,6 +186,39 @@ func (s *Store) GetChallengeByID(ctx context.Context, id int64) (*DailyChallenge
 		return nil, ErrNotFound
 	}
 	return &ch, nil
+}
+
+// GetChallengeForAdmin 按主键读取关卡，附带序列序号与去重参与人数，供管理台详情使用。
+func (s *Store) GetChallengeForAdmin(ctx context.Context, id int64) (*DailyChallenge, error) {
+	var ch DailyChallenge
+	err := s.db.WithContext(ctx).Raw(
+		`SELECT c.id, c.lang, c.level, to_char(c.day, 'YYYY-MM-DD') AS day, c.challenge_type, c.title, c.status,
+		        c.created_at, c.updated_at,
+		        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = c.id) AS item_count,
+		        (SELECT count(DISTINCT a.openid) FROM challenge_attempts a WHERE a.challenge_id = c.id) AS participant_count,
+		        (SELECT count(*) FROM daily_challenges x
+		          WHERE x.lang = c.lang AND x.level = c.level AND x.id <= c.id)::int AS seq
+		 FROM daily_challenges c WHERE c.id = ?`,
+		id,
+	).Scan(&ch).Error
+	if err != nil {
+		return nil, err
+	}
+	if ch.ID == 0 {
+		return nil, ErrNotFound
+	}
+	return &ch, nil
+}
+
+// ChallengeSequenceNumber 返回关卡在 (lang, level) 序列中的序号（从 1 开始）。
+func (s *Store) ChallengeSequenceNumber(ctx context.Context, lang, level string, id int64) (int, error) {
+	var seq int
+	err := s.db.WithContext(ctx).Raw(
+		`SELECT count(*)::int FROM daily_challenges
+		 WHERE lang = ? AND level = ? AND id <= ?`,
+		lang, level, id,
+	).Scan(&seq).Error
+	return seq, err
 }
 
 // ListChallengeItems 按 seq 返回关卡题目。
@@ -417,21 +454,23 @@ func (s *Store) PassedChallengeDays(ctx context.Context) ([]ChallengePassDay, er
 	return days, err
 }
 
-// ListChallengesForMonth 返回管理台某月的关卡列表（含草稿与题目数）。
-func (s *Store) ListChallengesForMonth(ctx context.Context, lang, level, from, to string) ([]DailyChallenge, error) {
-	rows := make([]DailyChallenge, 0, 31)
-	q := s.db.WithContext(ctx).Raw(
+// ListChallengesForAdmin 返回管理台关卡序列（含草稿），按 id 升序，附序号、题目数与去重参与人数。
+// 关卡已与日期解绑，lang / level 为空时返回全部。
+func (s *Store) ListChallengesForAdmin(ctx context.Context, lang, level string) ([]DailyChallenge, error) {
+	rows := make([]DailyChallenge, 0, 64)
+	err := s.db.WithContext(ctx).Raw(
 		`SELECT c.id, c.lang, c.level, to_char(c.day, 'YYYY-MM-DD') AS day, c.challenge_type, c.title, c.status,
 		        c.created_at, c.updated_at,
-		        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = c.id) AS item_count
+		        (SELECT count(*) FROM daily_challenge_items i WHERE i.challenge_id = c.id) AS item_count,
+		        (SELECT count(DISTINCT a.openid) FROM challenge_attempts a WHERE a.challenge_id = c.id) AS participant_count,
+		        (row_number() OVER (PARTITION BY c.lang, c.level ORDER BY c.id))::int AS seq
 		 FROM daily_challenges c
-		 WHERE c.day >= ?::date AND c.day <= ?::date
-		   AND (? = '' OR c.lang = ?)
+		 WHERE (? = '' OR c.lang = ?)
 		   AND (? = '' OR c.level = ?)
-		 ORDER BY c.day ASC`,
-		from, to, lang, lang, level, level,
-	)
-	if err := q.Scan(&rows).Error; err != nil {
+		 ORDER BY c.lang ASC, c.level ASC, c.id ASC`,
+		lang, lang, level, level,
+	).Scan(&rows).Error
+	if err != nil {
 		return nil, err
 	}
 	return rows, nil
