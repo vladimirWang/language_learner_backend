@@ -43,6 +43,7 @@ type speakingItemView struct {
 	ItemKey        string `json:"item_key"`
 	Topic          string `json:"topic"`
 	Role           string `json:"role"`
+	ExamPart       string `json:"exam_part"`
 	PromptDE       string `json:"prompt_de"`
 	PromptZH       string `json:"prompt_zh"`
 	ExpectedPoints string `json:"expected_points"`
@@ -288,6 +289,7 @@ func speakingItemFromStore(item *store.SpeakingItem) speakingItemView {
 		ItemKey:        item.ItemKey,
 		Topic:          item.Topic,
 		Role:           item.Role,
+		ExamPart:       item.ExamPart,
 		PromptDE:       item.PromptDE,
 		PromptZH:       item.PromptZH,
 		ExpectedPoints: item.ExpectedPoints,
