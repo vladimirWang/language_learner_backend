@@ -105,7 +105,7 @@ func (s *Store) DailyWords(ctx context.Context, lang, level string, count int, d
 		return nil, err
 	}
 	if len(ids) > 0 {
-		words, complete, err := s.wordsByIDs(ctx, ids)
+		words, complete, err := s.wordsByIDs(ctx, lang, ids)
 		if err != nil {
 			return nil, err
 		}
@@ -124,7 +124,7 @@ func (s *Store) DailyWords(ctx context.Context, lang, level string, count int, d
 	if err := s.saveDailyAssignment(ctx, lang, level, dayStr, deviceID, ids); err != nil {
 		return nil, err
 	}
-	words, _, err := s.wordsByIDs(ctx, ids)
+	words, _, err := s.wordsByIDs(ctx, lang, ids)
 	return words, err
 }
 
@@ -147,10 +147,14 @@ func (s *Store) loadDailyAssignment(ctx context.Context, lang, level, dayStr, de
 }
 
 func (s *Store) pickDailyWordIDs(ctx context.Context, lang, level, dayStr, deviceID string, count int) ([]int64, error) {
-	sql := "SELECT id FROM vocab_words WHERE lang = ?"
-	args := []any{lang}
+	table := vocabTableByLang(lang)
+	if table == "" {
+		return nil, nil
+	}
+	sql := "SELECT id FROM " + table
+	args := make([]any, 0, 4)
 	if level != "" {
-		sql += " AND level = ?"
+		sql += " WHERE level = ?"
 		args = append(args, level)
 	}
 	// 把 device_id 计入哈希：不同设备同一天拿到不同词表，公共分配（空串）仍稳定可复现。
@@ -173,12 +177,26 @@ func (s *Store) saveDailyAssignment(ctx context.Context, lang, level, dayStr, de
 }
 
 // wordsByIDs 按 ids 顺序返回词条；complete 为 false 表示有词条已不存在。
-func (s *Store) wordsByIDs(ctx context.Context, ids []int64) ([]VocabWord, bool, error) {
+// 客户端统一读取 example_de，这里把各语种例句列别名成 example_de，保持接口不变。
+func (s *Store) wordsByIDs(ctx context.Context, lang string, ids []int64) ([]VocabWord, bool, error) {
 	if len(ids) == 0 {
 		return []VocabWord{}, true, nil
 	}
+	table := vocabTableByLang(lang)
+	if table == "" {
+		return []VocabWord{}, false, nil
+	}
+	columns := fmt.Sprintf(`id, lemma, level, word_type,
+		NULL::text AS gender, NULL::text AS plural, chinese_mean, english_mean,
+		%s AS example_de`, vocabExampleColumn(lang))
+	if lang == "de" {
+		columns = `id, lemma, level, word_type, gender, plural,
+			chinese_mean, english_mean, example_de`
+	}
 	found := make([]VocabWord, 0, len(ids))
-	if err := s.db.WithContext(ctx).Table("vocab_words").Where("id IN ?", ids).Scan(&found).Error; err != nil {
+	if err := s.db.WithContext(ctx).Raw(
+		fmt.Sprintf("SELECT %s FROM %s WHERE id IN ?", columns, table), ids,
+	).Scan(&found).Error; err != nil {
 		return nil, false, err
 	}
 	byID := make(map[int64]VocabWord, len(found))
@@ -211,8 +229,14 @@ func (s *Store) MarkWordsLearnedAt(ctx context.Context, deviceID string, ids []i
 	}
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		existing := make([]int64, 0, len(ids))
-		if err := tx.Raw("SELECT id FROM vocab_words WHERE id IN ? FOR KEY SHARE", ids).Scan(&existing).Error; err != nil {
-			return err
+		for _, table := range vocabTables {
+			found := make([]int64, 0, len(ids))
+			if err := tx.Raw(
+				fmt.Sprintf("SELECT id FROM %s WHERE id IN ? FOR KEY SHARE", table), ids,
+			).Scan(&found).Error; err != nil {
+				return err
+			}
+			existing = append(existing, found...)
 		}
 		for _, id := range existing {
 			var err error
@@ -248,17 +272,21 @@ func (s *Store) RecentWords(ctx context.Context, deviceID, lang string, since ti
 	if deviceID == "" {
 		return out, nil
 	}
+	table := vocabTableByLang(lang)
+	if table == "" {
+		return out, nil
+	}
 	err := s.db.WithContext(ctx).Raw(
-		`SELECT lemma, chinese_mean, level FROM (
+		fmt.Sprintf(`SELECT lemma, chinese_mean, level FROM (
 		     SELECT DISTINCT ON (vw.lemma) vw.lemma, vw.chinese_mean, vw.level, l.learned_at
 		     FROM user_word_learning l
-		     JOIN vocab_words vw ON vw.id = l.word_id
-		     WHERE l.device_id = ? AND l.learned_at >= ? AND vw.lang = ?
+		     JOIN %s vw ON vw.id = l.word_id
+		     WHERE l.device_id = ? AND l.learned_at >= ?
 		     ORDER BY vw.lemma, l.learned_at DESC
 		 ) t
 		 ORDER BY learned_at DESC
-		 LIMIT 20`,
-		deviceID, since, lang,
+		 LIMIT 20`, table),
+		deviceID, since,
 	).Scan(&out).Error
 	return out, err
 }

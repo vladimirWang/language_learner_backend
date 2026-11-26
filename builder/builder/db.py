@@ -101,38 +101,23 @@ class Store:
             raise
 
     def upsert_vocab_words(self, lang: str, rows: list[dict]) -> int:
-        """按 (lang, lemma) upsert 词表，保持 word_id 稳定；返回写入行数。"""
+        """按 (lang, lemma) upsert 到语种词表，保持 word_id 稳定；返回写入行数。"""
         if not rows:
             return 0
+        columns = _VOCAB_COLUMNS_BY_LANG.get(lang)
+        if columns is None:
+            raise ValueError(f"unsupported vocab lang: {lang}")
         payload = [
-            (
-                lang,
-                row.get("lemma", ""),
-                row.get("level", ""),
-                _none(row.get("word_type")),
-                _none(row.get("gender")),
-                _none(row.get("plural")),
-                row.get("chinese_mean", ""),
-                _none(row.get("english_mean")),
-                _none(row.get("example_de")),
-                _none(row.get("source_md_path")),
-            )
+            tuple(_vocab_column_value(row, column, lang) for column in columns)
             for row in rows
         ]
-        sql = """
-            INSERT INTO vocab_words
-                (lang, lemma, level, word_type, gender, plural, chinese_mean, english_mean,
-                 example_de, source_md_path)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (lang, lemma) DO UPDATE SET
-                level = EXCLUDED.level,
-                word_type = EXCLUDED.word_type,
-                gender = EXCLUDED.gender,
-                plural = EXCLUDED.plural,
-                chinese_mean = EXCLUDED.chinese_mean,
-                english_mean = EXCLUDED.english_mean,
-                example_de = EXCLUDED.example_de,
-                source_md_path = EXCLUDED.source_md_path,
+        placeholders = ", ".join(["%s"] * len(columns))
+        updates = ", ".join(f"{column} = EXCLUDED.{column}" for column in columns)
+        sql = f"""
+            INSERT INTO vocab_words_{lang} ({", ".join(columns)})
+            VALUES ({placeholders})
+            ON CONFLICT (lemma) DO UPDATE SET
+                {updates},
                 updated_at = now()
         """
         try:
@@ -203,6 +188,45 @@ class Store:
 
     def log(self, version: str, stage: str, message: str, level: str = "info") -> None:
         print(f"[{stage}] [{level}] {message}", flush=True)
+
+
+# 语种词表可写列；与 Go 侧 store.vocabWriteColumns 保持一致。
+_VOCAB_COLUMNS_BY_LANG: dict[str, tuple[str, ...]] = {
+    "de": (
+        "lemma", "level", "word_type", "gender", "plural",
+        "chinese_mean", "english_mean", "example_de", "source_md_path",
+    ),
+    "en": (
+        "lemma", "level", "word_type", "phonetic",
+        "chinese_mean", "english_mean", "example_en", "source_md_path",
+    ),
+    "ja": (
+        "lemma", "level", "word_type", "kana", "kanji", "romaji",
+        "chinese_mean", "english_mean", "example_ja", "source_md_path",
+    ),
+}
+
+_REQUIRED_VOCAB_COLUMNS = frozenset({"lemma", "level", "chinese_mean"})
+
+
+def _vocab_column_value(row: dict, column: str, lang: str) -> str | None:
+    """把一行 CSV 数据映射到语种表列；日语假名/汉字从 extra_json 提取。"""
+    if column in _REQUIRED_VOCAB_COLUMNS:
+        return row.get(column, "")
+    if column in {"kana", "kanji"}:
+        return _none(_extra_json(row).get(column))
+    return _none(row.get(column, ""))
+
+
+def _extra_json(row: dict) -> dict:
+    raw = (row.get("extra_json") or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _vector_values(value) -> list[float]:

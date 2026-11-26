@@ -79,3 +79,61 @@ func TestNormalizeVocabWordLevels(t *testing.T) {
 		t.Fatal("非法等级应报错")
 	}
 }
+
+func TestNormalizeVocabWordEnglishNoGenderPlural(t *testing.T) {
+	base := vocabWordUpsert{Lemma: "apple", WordType: "noun", Level: "A1", ChineseMean: "苹果"}
+	if _, msg := normalizeVocabWord(base, "en"); msg != "" {
+		t.Fatalf("英语名词不应要求词性性别：%s", msg)
+	}
+
+	withGender := base
+	withGender.Gender = "m"
+	if _, msg := normalizeVocabWord(withGender, "en"); msg == "" {
+		t.Fatal("英语词条填写词性性别应报错")
+	}
+
+	withPlural := base
+	withPlural.Plural = "apples"
+	if _, msg := normalizeVocabWord(withPlural, "en"); msg == "" {
+		t.Fatal("英语词条填写复数应报错")
+	}
+}
+
+func TestNormalizeVocabWordLangSpecificFields(t *testing.T) {
+	en := vocabWordUpsert{
+		Lemma: "apple", WordType: "noun", Level: "A1", ChineseMean: "苹果",
+		Phonetic: "/ˈæpl/", ExampleEN: "I ate an apple.",
+	}
+	if _, msg := normalizeVocabWord(en, "en"); msg != "" {
+		t.Fatalf("英语专有字段应通过：%s", msg)
+	}
+	enWithKana := en
+	enWithKana.Kana = "りんご"
+	if _, msg := normalizeVocabWord(enWithKana, "en"); msg == "" {
+		t.Fatal("英语词条填写假名应报错")
+	}
+	enWithDE := en
+	enWithDE.ExampleDE = "Ich aß einen Apfel."
+	if _, msg := normalizeVocabWord(enWithDE, "en"); msg == "" {
+		t.Fatal("英语词条填写德语例句应报错")
+	}
+
+	ja := vocabWordUpsert{
+		Lemma: "山", WordType: "noun", Level: "N5", ChineseMean: "山",
+		Kana: "やま", Kanji: "山", Romaji: "yama", ExampleJA: "山に登る。",
+	}
+	if _, msg := normalizeVocabWord(ja, "ja"); msg != "" {
+		t.Fatalf("日语专有字段应通过：%s", msg)
+	}
+	jaWithPhonetic := ja
+	jaWithPhonetic.Phonetic = "/jama/"
+	if _, msg := normalizeVocabWord(jaWithPhonetic, "ja"); msg == "" {
+		t.Fatal("日语词条填写音标应报错")
+	}
+
+	if _, msg := normalizeVocabWord(
+		vocabWordUpsert{Lemma: "chat", WordType: "noun", Level: "A1", ChineseMean: "猫"}, "fr",
+	); msg == "" {
+		t.Fatal("暂不支持的语种应报错")
+	}
+}

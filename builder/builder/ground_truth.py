@@ -118,7 +118,7 @@ def load_vocab(settings: Settings, lang: str) -> list[dict[str, str]]:
     vocab: list[dict[str, str]] = []
     for _, row in rows:
         item = dict(row)
-        item["example_de"] = _first_example(settings, item.get("source_md_path", ""))
+        item[f"example_{lang}"] = _first_example(settings, item.get("source_md_path", ""))
         vocab.append(item)
     return vocab
 

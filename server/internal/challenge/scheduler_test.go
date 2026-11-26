@@ -61,12 +61,12 @@ func TestEnsureCountIntegration(t *testing.T) {
 	}
 	t.Cleanup(st.Close)
 
-	lang := fmt.Sprintf("sched-%d", time.Now().UnixNano())
+	lang := "en"
 	const level = "A1"
 	cleanup := func() {
 		_, _ = sqlDB.ExecContext(ctx, "DELETE FROM daily_challenge_items WHERE challenge_id IN (SELECT id FROM daily_challenges WHERE lang = $1)", lang)
 		_, _ = sqlDB.ExecContext(ctx, "DELETE FROM daily_challenges WHERE lang = $1", lang)
-		_, _ = sqlDB.ExecContext(ctx, "DELETE FROM vocab_words WHERE lang = $1", lang)
+		_, _ = sqlDB.ExecContext(ctx, "DELETE FROM vocab_words_en")
 		_, _ = sqlDB.ExecContext(ctx, "DELETE FROM collocations WHERE lang = $1", lang)
 		_, _ = sqlDB.ExecContext(ctx, "DELETE FROM rag_chunks WHERE lang = $1", lang)
 	}
@@ -76,8 +76,8 @@ func TestEnsureCountIntegration(t *testing.T) {
 	// 单词 + 搭配 + 语法模板可用，听力无素材（应被跳过）。
 	for i := 0; i < 3; i++ {
 		if _, err := sqlDB.ExecContext(ctx,
-			"INSERT INTO vocab_words (lang, lemma, level, chinese_mean) VALUES ($1, $2, $3, $4)",
-			lang, fmt.Sprintf("word-%d", i), level, fmt.Sprintf("释义-%d", i),
+			"INSERT INTO vocab_words_en (lemma, level, chinese_mean) VALUES ($1, $2, $3)",
+			fmt.Sprintf("word-%d", i), level, fmt.Sprintf("释义-%d", i),
 		); err != nil {
 			t.Fatal(err)
 		}

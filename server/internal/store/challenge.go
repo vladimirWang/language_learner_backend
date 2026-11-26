@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -484,8 +485,9 @@ func (s *Store) ChallengeTargets(ctx context.Context) ([][2]string, error) {
 	}
 	rows := make([]row, 0, 32)
 	if err := s.db.WithContext(ctx).Raw(
-		`SELECT DISTINCT lang, level FROM vocab_words
-		 WHERE level <> ''
+		`SELECT DISTINCT 'de' AS lang, level FROM vocab_words_de WHERE level <> ''
+		 UNION ALL SELECT DISTINCT 'en' AS lang, level FROM vocab_words_en WHERE level <> ''
+		 UNION ALL SELECT DISTINCT 'ja' AS lang, level FROM vocab_words_ja WHERE level <> ''
 		 ORDER BY lang ASC, level ASC`,
 	).Scan(&rows).Error; err != nil {
 		return nil, err
@@ -500,14 +502,20 @@ func (s *Store) ChallengeTargets(ctx context.Context) ([][2]string, error) {
 // ChallengeWordPool 返回按日期稳定打散的词条候选；优先当前等级，不足时补同语种词条。
 func (s *Store) ChallengeWordPool(ctx context.Context, lang, level, seed string, limit int) ([]ChallengeWord, error) {
 	words := make([]ChallengeWord, 0, limit)
-	err := s.db.WithContext(ctx).Raw(
+	table := vocabTableByLang(lang)
+	if table == "" {
+		return words, nil
+	}
+	// 各语种例句列不同，统一别名成 example_de 供 ChallengeWord 使用。
+	example := vocabExampleColumn(lang)
+	err := s.db.WithContext(ctx).Raw(fmt.Sprintf(
 		`SELECT id, lemma, chinese_mean, COALESCE(word_type, '') AS word_type,
-		        COALESCE(example_de, '') AS example_de
-		 FROM vocab_words
-		 WHERE lang = ? AND level = ?
+		        COALESCE(%s, '') AS example_de
+		 FROM %s
+		 WHERE level = ?
 		 ORDER BY md5(lemma || ?) ASC, id ASC
-		 LIMIT ?`,
-		lang, level, seed, limit,
+		 LIMIT ?`, example, table),
+		level, seed, limit,
 	).Scan(&words).Error
 	if err != nil {
 		return nil, err
@@ -520,14 +528,13 @@ func (s *Store) ChallengeWordPool(ctx context.Context, lang, level, seed string,
 		seen[w.ID] = true
 	}
 	extra := make([]ChallengeWord, 0, limit-len(words))
-	err = s.db.WithContext(ctx).Raw(
+	err = s.db.WithContext(ctx).Raw(fmt.Sprintf(
 		`SELECT id, lemma, chinese_mean, COALESCE(word_type, '') AS word_type,
-		        COALESCE(example_de, '') AS example_de
-		 FROM vocab_words
-		 WHERE lang = ?
+		        COALESCE(%s, '') AS example_de
+		 FROM %s
 		 ORDER BY md5(lemma || ?) ASC, id ASC
-		 LIMIT ?`,
-		lang, seed, limit*2,
+		 LIMIT ?`, example, table),
+		seed, limit*2,
 	).Scan(&extra).Error
 	if err != nil {
 		return words, err

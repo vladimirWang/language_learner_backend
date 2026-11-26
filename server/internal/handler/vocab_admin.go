@@ -39,6 +39,9 @@ var validVocabLevels = map[string]bool{
 	"N1": true, "N2": true, "N3": true, "N4": true, "N5": true,
 }
 
+// supportedVocabLangs 是已拆表的语种；其余语种没有对应词表。
+var supportedVocabLangs = map[string]bool{"de": true, "en": true, "ja": true}
+
 // vocabWordUpsert 是新增/更新词条的请求体。
 type vocabWordUpsert struct {
 	Lang         string `json:"lang"`
@@ -47,9 +50,15 @@ type vocabWordUpsert struct {
 	WordType     string `json:"word_type"`
 	Gender       string `json:"gender"`
 	Plural       string `json:"plural"`
+	Phonetic     string `json:"phonetic"`
+	Kana         string `json:"kana"`
+	Kanji        string `json:"kanji"`
+	Romaji       string `json:"romaji"`
 	ChineseMean  string `json:"chinese_mean"`
 	EnglishMean  string `json:"english_mean"`
 	ExampleDE    string `json:"example_de"`
+	ExampleEN    string `json:"example_en"`
+	ExampleJA    string `json:"example_ja"`
 	SourceMDPath string `json:"source_md_path"`
 }
 
@@ -67,6 +76,9 @@ func normalizeVocabWord(req vocabWordUpsert, forcedLang string) (store.VocabWord
 	}
 	if forcedLang != "" && req.Lang != forcedLang {
 		return store.VocabWordInput{}, "lang 与所选语种不一致"
+	}
+	if !supportedVocabLangs[req.Lang] {
+		return store.VocabWordInput{}, "暂不支持的语种（仅 de/en/ja）"
 	}
 
 	req.Lemma = strings.TrimSpace(req.Lemma)
@@ -91,6 +103,43 @@ func normalizeVocabWord(req vocabWordUpsert, forcedLang string) (store.VocabWord
 	}
 
 	req.Gender = strings.ToLower(strings.TrimSpace(req.Gender))
+	req.Plural = strings.TrimSpace(req.Plural)
+	req.Phonetic = strings.TrimSpace(req.Phonetic)
+	req.Kana = strings.TrimSpace(req.Kana)
+	req.Kanji = strings.TrimSpace(req.Kanji)
+	req.Romaji = strings.TrimSpace(req.Romaji)
+	req.ExampleDE = strings.TrimSpace(req.ExampleDE)
+	req.ExampleEN = strings.TrimSpace(req.ExampleEN)
+	req.ExampleJA = strings.TrimSpace(req.ExampleJA)
+
+	// 语种专有字段不允许跨语种填写，避免拆表后仍有脏数据。
+	if req.Lang != "de" {
+		if req.Gender != "" {
+			return store.VocabWordInput{}, "只有德语词条可以填写词性性别"
+		}
+		if req.Plural != "" {
+			return store.VocabWordInput{}, "只有德语词条可以填写复数"
+		}
+		if req.ExampleDE != "" {
+			return store.VocabWordInput{}, "只有德语词条可以填写德语例句"
+		}
+	}
+	if req.Lang != "en" {
+		if req.Phonetic != "" {
+			return store.VocabWordInput{}, "只有英语词条可以填写音标"
+		}
+		if req.ExampleEN != "" {
+			return store.VocabWordInput{}, "只有英语词条可以填写英语例句"
+		}
+	}
+	if req.Lang != "ja" {
+		if req.Kana != "" || req.Kanji != "" || req.Romaji != "" {
+			return store.VocabWordInput{}, "只有日语词条可以填写假名/汉字/罗马字"
+		}
+		if req.ExampleJA != "" {
+			return store.VocabWordInput{}, "只有日语词条可以填写日语例句"
+		}
+	}
 	if req.Gender != "" && req.Gender != "m" && req.Gender != "f" && req.Gender != "n" {
 		return store.VocabWordInput{}, "无效词性性别（m/f/n）"
 	}
@@ -101,7 +150,6 @@ func normalizeVocabWord(req vocabWordUpsert, forcedLang string) (store.VocabWord
 		return store.VocabWordInput{}, "只有名词可以填写词性性别"
 	}
 
-	req.Plural = strings.TrimSpace(req.Plural)
 	req.ChineseMean = strings.TrimSpace(req.ChineseMean)
 	if req.ChineseMean == "" {
 		return store.VocabWordInput{}, "中文释义不能为空"
@@ -111,10 +159,13 @@ func normalizeVocabWord(req vocabWordUpsert, forcedLang string) (store.VocabWord
 	}
 
 	req.EnglishMean = strings.TrimSpace(req.EnglishMean)
-	req.ExampleDE = strings.TrimSpace(req.ExampleDE)
 	req.SourceMDPath = strings.TrimSpace(req.SourceMDPath)
-	if utf8.RuneCountInString(req.EnglishMean) > 200 || utf8.RuneCountInString(req.ExampleDE) > 500 ||
-		utf8.RuneCountInString(req.SourceMDPath) > 300 || utf8.RuneCountInString(req.Plural) > 80 {
+	if utf8.RuneCountInString(req.EnglishMean) > 200 || utf8.RuneCountInString(req.SourceMDPath) > 300 ||
+		utf8.RuneCountInString(req.Plural) > 80 || utf8.RuneCountInString(req.Phonetic) > 80 ||
+		utf8.RuneCountInString(req.Kana) > 80 || utf8.RuneCountInString(req.Kanji) > 80 ||
+		utf8.RuneCountInString(req.Romaji) > 80 ||
+		utf8.RuneCountInString(req.ExampleDE) > 500 || utf8.RuneCountInString(req.ExampleEN) > 500 ||
+		utf8.RuneCountInString(req.ExampleJA) > 500 {
 		return store.VocabWordInput{}, "字段长度超出限制"
 	}
 
@@ -125,9 +176,15 @@ func normalizeVocabWord(req vocabWordUpsert, forcedLang string) (store.VocabWord
 		WordType:     req.WordType,
 		Gender:       req.Gender,
 		Plural:       req.Plural,
+		Phonetic:     req.Phonetic,
+		Kana:         req.Kana,
+		Kanji:        req.Kanji,
+		Romaji:       req.Romaji,
 		ChineseMean:  req.ChineseMean,
 		EnglishMean:  req.EnglishMean,
 		ExampleDE:    req.ExampleDE,
+		ExampleEN:    req.ExampleEN,
+		ExampleJA:    req.ExampleJA,
 		SourceMDPath: req.SourceMDPath,
 	}, ""
 }
@@ -135,7 +192,7 @@ func normalizeVocabWord(req vocabWordUpsert, forcedLang string) (store.VocabWord
 // listVocabWords 返回新词库列表。支持 ?lang=&level=&q=&limit=&offset=。
 func (h *Handler) listVocabWords(c *gin.Context) {
 	lang := strings.TrimSpace(c.Query("lang"))
-	if lang != "" && !langPattern.MatchString(lang) {
+	if lang != "" && (!langPattern.MatchString(lang) || !supportedVocabLangs[lang]) {
 		writeError(c, http.StatusBadRequest, "invalid lang")
 		return
 	}
@@ -225,14 +282,19 @@ func (h *Handler) updateVocabWord(c *gin.Context) {
 	writeJSON(c, http.StatusOK, map[string]any{"ok": true})
 }
 
-// deleteVocabWord 按 ID 删除词条。
+// deleteVocabWord 按 ID 删除词条；lang 指明所在语种表。
 func (h *Handler) deleteVocabWord(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
 		writeError(c, http.StatusBadRequest, "invalid word id")
 		return
 	}
-	ok, err := h.store.DeleteVocabWord(c.Request.Context(), id)
+	lang := strings.TrimSpace(c.Query("lang"))
+	if lang != "" && !supportedVocabLangs[lang] {
+		writeError(c, http.StatusBadRequest, "invalid lang")
+		return
+	}
+	ok, err := h.store.DeleteVocabWord(c.Request.Context(), lang, id)
 	if err != nil {
 		h.logger.Printf("delete vocab word %d: %v", id, err)
 		writeError(c, http.StatusInternalServerError, "delete vocab word failed")
@@ -263,7 +325,7 @@ func (h *Handler) importVocabWords(c *gin.Context) {
 	if req.Lang == "" {
 		req.Lang = "de"
 	}
-	if !langPattern.MatchString(req.Lang) {
+	if !langPattern.MatchString(req.Lang) || !supportedVocabLangs[req.Lang] {
 		writeError(c, http.StatusBadRequest, "invalid lang")
 		return
 	}
@@ -413,9 +475,15 @@ func parseVocabCSV(lang, raw string) ([]store.VocabWordInput, []string) {
 			WordType:     pick(record, "word_type"),
 			Gender:       pick(record, "gender"),
 			Plural:       pick(record, "plural"),
+			Phonetic:     pick(record, "phonetic"),
+			Kana:         pick(record, "kana"),
+			Kanji:        pick(record, "kanji"),
+			Romaji:       pick(record, "romaji"),
 			ChineseMean:  pick(record, "chinese_mean"),
 			EnglishMean:  pick(record, "english_mean"),
 			ExampleDE:    pick(record, "example_de"),
+			ExampleEN:    pick(record, "example_en"),
+			ExampleJA:    pick(record, "example_ja"),
 			SourceMDPath: pick(record, "source_md_path"),
 		}, lang)
 		if msg != "" {
