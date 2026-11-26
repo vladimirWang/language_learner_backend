@@ -214,6 +214,14 @@ func (h *Handler) addLevelExam(c *gin.Context) {
 			writeError(c, http.StatusNotFound, "level not found")
 			return
 		}
+		if errors.Is(err, store.ErrExamNotFound) {
+			writeError(c, http.StatusNotFound, "题目不存在或已删除")
+			return
+		}
+		if errors.Is(err, store.ErrExamLevelMismatch) {
+			writeError(c, http.StatusBadRequest, "只能添加与测试语种、等级匹配的题目")
+			return
+		}
 		h.logger.Printf("add level exam: %v", err)
 		writeError(c, http.StatusInternalServerError, "add level exam failed")
 		return

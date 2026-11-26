@@ -1067,15 +1067,49 @@ func (s *Store) ListLevelExams(ctx context.Context, levelID int64) ([]LevelExamI
 	return rows, nil
 }
 
-// AddLevelExam 给关卡添加一个题目（听力或口语）；写入前校验逻辑外键父记录。
+// ErrExamNotFound 表示要关联的题目不存在或已删除。
+var ErrExamNotFound = errors.New("exam not found")
+
+// ErrExamLevelMismatch 表示题目的语种或等级与测试不一致。
+var ErrExamLevelMismatch = errors.New("exam level mismatch")
+
+// AddLevelExam 给关卡添加一个题目（听力或口语）；写入前校验逻辑外键父记录，
+// 并要求题目的语种、等级与测试一致。
 func (s *Store) AddLevelExam(ctx context.Context, levelID int64, itemType, examID string, sortOrder int) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var parentID int64
-		if err := tx.Raw("SELECT id FROM tests WHERE id = ? FOR KEY SHARE", levelID).Scan(&parentID).Error; err != nil {
+		var lv struct {
+			ID         int64  `gorm:"column:id"`
+			Lang       string `gorm:"column:lang"`
+			Difficulty string `gorm:"column:difficulty"`
+		}
+		if err := tx.Raw("SELECT id, lang, difficulty FROM tests WHERE id = ? FOR KEY SHARE", levelID).Scan(&lv).Error; err != nil {
 			return err
 		}
-		if parentID == 0 {
+		if lv.ID == 0 {
 			return ErrNotFound
+		}
+		var exam struct {
+			Found int    `gorm:"column:found"`
+			Lang  string `gorm:"column:lang"`
+			Level string `gorm:"column:level"`
+		}
+		var query string
+		switch itemType {
+		case "listening":
+			query = "SELECT 1 AS found, lang, level FROM listening_jobs WHERE exam_id = ? AND deleted_at IS NULL"
+		case "speaking_plan":
+			query = "SELECT 1 AS found, lang, level FROM speaking_exam_plans WHERE id::text = ? AND deleted_at IS NULL"
+		default: // speaking / speaking_topic 历史口语关联
+			query = "SELECT 1 AS found, lang, level FROM speaking_items WHERE item_key = ? AND deleted_at IS NULL"
+		}
+		if err := tx.Raw(query, examID).Scan(&exam).Error; err != nil {
+			return err
+		}
+		if exam.Found == 0 {
+			return ErrExamNotFound
+		}
+		if exam.Lang != lv.Lang || exam.Level != lv.Difficulty {
+			return ErrExamLevelMismatch
 		}
 		row := LevelExam{LevelID: levelID, ExamID: examID, ItemType: itemType, SortOrder: sortOrder}
 		return tx.Clauses(clause.OnConflict{
@@ -1104,7 +1138,7 @@ type AvailableExam struct {
 }
 
 // ListAvailableExams 返回可加入指定关卡且尚未关联的听力 exam 与口语方案。
-// 口语以方案为单位：只返回该关卡语种与难度下、启用且含题目的方案。
+// 只返回与该关卡语种、难度一致的内容：听力需已构建并绑定答案，口语方案需启用且含题目。
 func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]AvailableExam, error) {
 	var lv Level
 	if err := s.db.WithContext(ctx).Where("id = ?", levelID).Take(&lv).Error; err != nil {
@@ -1118,6 +1152,7 @@ func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]Availa
 		SELECT 'listening' AS item_type, exam_id, name, lang, source_url, created_at
 		FROM listening_jobs
 		WHERE status = 'built' AND deleted_at IS NULL AND has_answers = true
+		  AND lang = ? AND level = ?
 		  AND exam_id NOT IN (
 		      SELECT exam_id FROM test_items WHERE level_id = ? AND item_type = 'listening'
 		  )
@@ -1132,7 +1167,7 @@ func (s *Store) ListAvailableExams(ctx context.Context, levelID int64) ([]Availa
 		      SELECT exam_id FROM test_items WHERE level_id = ? AND item_type = 'speaking_plan'
 		  )
 		ORDER BY item_type ASC, created_at DESC
-	`, levelID, lv.Lang, lv.Difficulty, levelID).Scan(&rows).Error
+	`, lv.Lang, lv.Difficulty, levelID, lv.Lang, lv.Difficulty, levelID).Scan(&rows).Error
 	return rows, err
 }
 
