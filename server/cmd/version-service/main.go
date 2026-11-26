@@ -72,6 +72,14 @@ func main() {
 	if err != nil {
 		logger.Fatalf("init object storage: %v", err)
 	}
+	// 未配置对象存储时，头像走本地磁盘（同域 /api/auth/wx-avatar/file 回传）。
+	var localAvatar *storage.LocalAvatarStore
+	if presigner == nil {
+		localAvatar = storage.NewLocalAvatarStore(cfg.AvatarDir)
+		logger.Printf("wx avatar: local storage at %s", cfg.AvatarDir)
+	} else {
+		logger.Printf("wx avatar: object storage (S3 compatible)")
+	}
 
 	rn := runner.New(cfg.BuilderCmd, cfg.BuilderArgs, cfg.BuilderDir)
 	sch := scheduler.New(st, rn, cfg.MinAvailMB, cfg.RepoURLs, logger)
@@ -152,7 +160,7 @@ func main() {
 		logger.Printf("wechat miniapp login: not configured, /api/auth/wx-* returns 503")
 	}
 	langCfg := handler.LangConfig{Default: cfg.DefaultLang, Supported: cfg.SupportedLangs}
-	h := handler.New(st, sch, presigner, cfg.RepoURLs, llmClient, ttsClient, publisher, dailyCfg, ssoCfg, wxCfg, langCfg, streakStore, logger)
+	h := handler.New(st, sch, presigner, localAvatar, cfg.RepoURLs, llmClient, ttsClient, publisher, dailyCfg, ssoCfg, wxCfg, langCfg, streakStore, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

@@ -39,10 +39,11 @@ type LangConfig struct {
 
 // Handler 聚合依赖并构造路由。
 type Handler struct {
-	store     *store.Store
-	sched     *scheduler.Scheduler
-	presigner *storage.Presigner
-	repoURLs  map[string]string
+	store       *store.Store
+	sched       *scheduler.Scheduler
+	presigner   *storage.Presigner
+	localAvatar *storage.LocalAvatarStore // 未配置对象存储时的本地头像回退
+	repoURLs    map[string]string
 	llm       *llm.Client
 	tts       *tts.Client
 	pdfPub    JobPublisher
@@ -83,7 +84,7 @@ type Handler struct {
 }
 
 // New 创建 HTTP 处理器。
-func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, daily DailyWordsConfig, sso SSOConfig, wx wxauth.Config, langs LangConfig, streakStore *streak.Store, logger *log.Logger) *Handler {
+func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, localAvatar *storage.LocalAvatarStore, repoURLs map[string]string, llmClient *llm.Client, ttsClient *tts.Client, pdfPub JobPublisher, daily DailyWordsConfig, sso SSOConfig, wx wxauth.Config, langs LangConfig, streakStore *streak.Store, logger *log.Logger) *Handler {
 	defaultLang := strings.TrimSpace(langs.Default)
 	if defaultLang == "" {
 		defaultLang = "de"
@@ -95,7 +96,7 @@ func New(st *store.Store, sch *scheduler.Scheduler, ps *storage.Presigner, repoU
 		}
 	}
 	supported[defaultLang] = true
-	h := &Handler{store: st, sched: sch, presigner: ps, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, sso: sso, wx: wx, defaultLang: defaultLang, supportedLangs: supported, streak: streakStore, logger: logger}
+	h := &Handler{store: st, sched: sch, presigner: ps, localAvatar: localAvatar, repoURLs: repoURLs, llm: llmClient, tts: ttsClient, pdfPub: pdfPub, daily: daily, sso: sso, wx: wx, defaultLang: defaultLang, supportedLangs: supported, streak: streakStore, logger: logger}
 	h.challenge = challenge.NewBuilder(st)
 	if sch != nil {
 		// 听力解析任务的状态变更 → 消息中心通知 + 全局 SSE
@@ -155,6 +156,8 @@ func (h *Handler) Routes() http.Handler {
 			auth.GET("/wx-me", h.wxMe)
 			auth.PUT("/wx-profile", h.wxUpdateProfile)
 			auth.POST("/wx-avatar", h.wxUploadAvatar)
+			// 本地头像回读：仅当未配置对象存储时使用，路径为 /api/auth/wx-avatar/file/<key>。
+			auth.GET("/wx-avatar/file/*key", h.wxAvatarFile)
 		}
 
 		// PDF 试卷导入：分片上传支持断点续传，合并后再投递解析队列

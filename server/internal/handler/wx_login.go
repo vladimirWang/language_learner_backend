@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -42,9 +43,8 @@ type wxUserView struct {
 func (h *Handler) newWXUserView(ctx context.Context, u store.WXUser, isNew bool) wxUserView {
 	avatar := u.AvatarURL
 	if avatar != "" && !strings.HasPrefix(avatar, "http://") && !strings.HasPrefix(avatar, "https://") {
-		if h.presigner == nil {
-			avatar = ""
-		} else {
+		if h.presigner != nil {
+			// 对象存储：把私有 key 签成临时下载链接。
 			signed, err := h.presigner.URL(ctx, avatar)
 			if err != nil {
 				h.logger.Printf("wx user avatar presign user=%d: %v", u.ID, err)
@@ -52,6 +52,18 @@ func (h *Handler) newWXUserView(ctx context.Context, u store.WXUser, isNew bool)
 			} else {
 				avatar = signed
 			}
+		} else if h.localAvatar != nil {
+			// 本地存储：返回同域相对路径，由小程序用 getBaseUrl() 拼接；
+			// 同时兼容历史 S3 key（wx-avatars/<id>/<name>）与新的本地 key（<id>/<name>）。
+			key := strings.TrimPrefix(avatar, "wx-avatars/")
+			if f, _, err := h.localAvatar.Open(key); err == nil {
+				f.Close()
+				avatar = "/api/auth/wx-avatar/file/" + key
+			} else {
+				avatar = ""
+			}
+		} else {
+			avatar = ""
 		}
 	}
 	return wxUserView{
@@ -166,7 +178,7 @@ func (h *Handler) wxUploadAvatar(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if h.presigner == nil {
+	if h.presigner == nil && h.localAvatar == nil {
 		writeError(c, http.StatusServiceUnavailable, "avatar storage not configured")
 		return
 	}
@@ -202,15 +214,28 @@ func (h *Handler) wxUploadAvatar(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "upload avatar failed")
 		return
 	}
-	key := fmt.Sprintf("wx-avatars/%d/%s.%s", u.ID, hex.EncodeToString(random), ext)
-	if err := h.presigner.Upload(c.Request.Context(), key, file, header.Size, contentType); err != nil {
-		if errors.Is(err, storage.ErrNotConfigured) {
-			writeError(c, http.StatusServiceUnavailable, "avatar storage not configured")
+	randomName := hex.EncodeToString(random) + "." + ext
+	var key string
+	if h.presigner != nil {
+		key = fmt.Sprintf("wx-avatars/%d/%s", u.ID, randomName)
+		if err := h.presigner.Upload(c.Request.Context(), key, file, header.Size, contentType); err != nil {
+			if errors.Is(err, storage.ErrNotConfigured) {
+				writeError(c, http.StatusServiceUnavailable, "avatar storage not configured")
+				return
+			}
+			h.logger.Printf("wx-avatar upload user=%d: %v", u.ID, err)
+			writeError(c, http.StatusInternalServerError, "upload avatar failed")
 			return
 		}
-		h.logger.Printf("wx-avatar upload user=%d: %v", u.ID, err)
-		writeError(c, http.StatusInternalServerError, "upload avatar failed")
-		return
+	} else {
+		// 本地存储：key 为 <userID>/<random>.<ext>，与历史 S3 key 区分（无 wx-avatars/ 前缀）。
+		localKey, err := h.localAvatar.Upload(u.ID, file, ext)
+		if err != nil {
+			h.logger.Printf("wx-avatar local upload user=%d: %v", u.ID, err)
+			writeError(c, http.StatusInternalServerError, "upload avatar failed")
+			return
+		}
+		key = localKey
 	}
 	updated, err := h.store.UpdateWXUserAvatar(c.Request.Context(), u.ID, key)
 	if err != nil {
@@ -219,6 +244,36 @@ func (h *Handler) wxUploadAvatar(c *gin.Context) {
 		return
 	}
 	writeJSON(c, http.StatusOK, map[string]any{"user": h.newWXUserView(c.Request.Context(), updated, false)})
+}
+
+// wxAvatarFile 在未配置对象存储时按 key 回读本地头像（同域 /api/auth/wx-avatar/file/<key>）。
+// 头像为公开资料且 key 不可枚举，故不需要鉴权；小程序 image 组件不能带 Authorization 头。
+func (h *Handler) wxAvatarFile(c *gin.Context) {
+	if h.presigner != nil || h.localAvatar == nil {
+		writeError(c, http.StatusNotFound, "avatar not found")
+		return
+	}
+	key := strings.TrimPrefix(c.Param("key"), "/")
+	// 兼容历史 key：wx-avatars/<id>/<name>。
+	key = strings.TrimPrefix(key, "wx-avatars/")
+	f, info, err := h.localAvatar.Open(key)
+	if err != nil {
+		writeError(c, http.StatusNotFound, "avatar not found")
+		return
+	}
+	defer f.Close()
+	switch strings.ToLower(filepath.Ext(info.Name())) {
+	case ".jpg", ".jpeg":
+		c.Header("Content-Type", "image/jpeg")
+	case ".png":
+		c.Header("Content-Type", "image/png")
+	case ".webp":
+		c.Header("Content-Type", "image/webp")
+	default:
+		c.Header("Content-Type", "application/octet-stream")
+	}
+	c.Header("Cache-Control", "public, max-age=86400")
+	http.ServeContent(c.Writer, c.Request, info.Name(), info.ModTime(), f)
 }
 
 func wxAvatarFileType(head []byte) (contentType, ext string, ok bool) {

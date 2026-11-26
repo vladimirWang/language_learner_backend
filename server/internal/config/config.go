@@ -67,6 +67,10 @@ type Config struct {
 	WXAppSecret   string
 	WXTokenSecret string
 	WXBaseURL     string
+
+	// 头像本地存储目录：未配置对象存储（S3_ENDPOINT 为空）时，头像写到该目录，
+	// 默认落在 WORK_DIR/wx-avatars（生产 compose 已把 WORK_DIR 挂到持久化卷 ./data/builder-work）。
+	AvatarDir string
 }
 
 // Load 读取环境变量并做缺省处理；不因缺少可选项而失败。
@@ -108,6 +112,7 @@ func Load() Config {
 		DefaultLang:    envOr("DEFAULT_LANG", "de"),
 		SupportedLangs: parseSupportedLangs(os.Getenv("SUPPORTED_LANGS")),
 	}
+	cfg.AvatarDir = envOr("AVATAR_DIR", strings.TrimRight(cfg.WorkDir, "/")+"/wx-avatars")
 	cfg.SSOPublicBaseURL = envOr("SSO_PUBLIC_BASE_URL", cfg.SSOBaseURL)
 	cfg.DefaultLang = strings.ToLower(strings.TrimSpace(cfg.DefaultLang))
 	if !validLang(cfg.DefaultLang) {
