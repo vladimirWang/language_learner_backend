@@ -3,15 +3,16 @@
 ## 架构
 
 ```
-Mac (arm64)  ──  buildx --platform linux/amd64  ──►  Docker Hub  ──►  Ubuntu 24.04 (amd64)
-                         │                          (按层复用)            │
-                    docker push                                   docker compose pull
-                                                                        │
-                                                              docker compose up -d
+Mac (arm64)  ──  buildx --platform linux/amd64  ──►  阿里云 ACR  ──►  Ubuntu 24.04 (amd64)
+                         │                     （按层复用）             │
+                    docker push                                docker compose pull
+                                                                       │
+                                                             docker compose up -d
 ```
 
-默认仓库：`docker.io/furchtlos`（`lang-service` / `lang-nginx` / `lang-pg` / `lang-migrate`）。
-离线备用仍可走 tar 上传：`make export-all` + `DEPLOY_MODE=tar ./deploy_all.sh`。
+默认使用阿里云单仓库多 tag：`registry.cn-hangzhou.aliyuncs.com/fishwang/mycentos`，一键入口为 `./deploy_acr.sh`。杭州 ACR + 上海 ECS 使用公网 Registry 地址，不能使用 `registry-vpc.*`。
+
+Docker Hub 流程仍保留（`make push-all` + `deploy_all.sh`）；离线备用可走 tar 上传：`make export-all` + `DEPLOY_MODE=tar ./deploy_all.sh`。
 
 ---
 
@@ -28,6 +29,8 @@ free -h && df -h /
 docker --version          # 没有就走下面的安装
 docker compose version    # 必须 v2+（docker compose 不是 docker-compose）
 ```
+
+生产后端还会加入外部 Docker 网络 `infra_network`，复用其中服务名为 `rabbitmq`、`redis` 的既有容器。新服务器必须先启动这套基础设施并创建同名网络；容器内 Redis 地址为 `redis:6379`，宿主机映射端口 `16379` 不用于容器间访问。
 
 ### Docker 安装（Ubuntu 24.04）
 
@@ -85,38 +88,71 @@ certbot certificates   # 查看
 
 ---
 
-## Step 1：Mac 本地构建打包
+## Step 1：一键构建并部署（ACR，推荐）
 
 ```bash
 cd language_learner_backend/deploy
+./deploy_acr.sh
+```
 
-# 首次：登录镜像仓库（Token 不要写进仓库；本机执行一次即可）
+脚本按顺序完成：
+
+1. 使用 ACR 访问凭证登录本机与服务器（密码通过 `password-stdin` 输入，不写入命令参数）。
+2. 调用 `make push-all` 构建 amd64 镜像并推送到 ACR，无需手动 `docker tag`。
+3. 调用 `deploy_at_server.sh` 同步业务文件、拉取镜像、重启服务。
+4. 执行健康检查，并输出当前版本与可回滚的时间戳版本。
+
+本机和服务器都已登录时可跳过登录：
+
+```bash
+SKIP_ACR_LOGIN=1 ./deploy_acr.sh
+```
+
+默认配置及覆盖方式：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `ACR_REGISTRY` | `registry.cn-hangzhou.aliyuncs.com` | 跨地域部署使用公网地址 |
+| `ACR_NAMESPACE` | `fishwang` | ACR 命名空间 |
+| `ACR_REPOSITORY` | `mycentos` | 单仓库，通过 tag 区分镜像 |
+| `ACR_USERNAME` | `ruijin45` | ACR 登录账号全名 |
+| `SERVER` | `root@139.224.68.145` | 目标服务器 |
+| `REMOTE_ROOT` | `/root/lang_app` | 服务器部署目录 |
+| `PULL_TIMEOUT` | `1800` | 单镜像拉取超时秒数 |
+
+例如：
+
+```bash
+ACR_USERNAME=your-account SERVER=root@1.2.3.4 REMOTE_ROOT=/opt/lang-app ./deploy_acr.sh
+```
+
+单仓库内使用的 tag：
+
+| tag | 内容 |
+|---|---|
+| `python-base-py312` | apt、uv 与 builder Python 依赖 |
+| `listen-parser-prod` | PyInstaller 听力解析二进制 |
+| `service-prod` | 当前 Go 服务与业务代码 |
+| `service-prod-<时间戳>` | 当前服务的回滚版本 |
+| `nginx-prod` | nginx 镜像 |
+| `pg-pg17` | PostgreSQL + pgvector |
+| `migrate-v4.18.3` | 数据库迁移工具 |
+
+- 首次构建 `lang-python-base` 在 Apple Silicon 上走 QEMU 模拟 amd64，apt 安装约 10～15 分钟；后续命中缓存会明显加快。
+- 本地已有基础镜像时，对应 push 目标只推送，不重复构建；service 每次发布都会重新构建。
+- 磁盘空间不足会淘汰构建缓存，执行前留意 `df -h` 与 Docker 可用空间。
+- 服务器拉取中断后直接重跑脚本即可，已下载的镜像层会保留。
+- 时间戳版本的回滚：将脚本最后输出的 `service-prod-<时间戳>` 完整地址赋给 `IMG_SERVICE`，其余 `IMG_NGINX/IMG_PG/IMG_MIGRATE` 保持不变，再执行 `./deploy_at_server.sh`。
+
+### Docker Hub 备用流程
+
+```bash
 docker login -u furchtlos
-
-# 构建并推送 service/nginx/base 镜像（amd64）
 make push-all
-# 推送两个 tag：lang-service:prod 和 lang-service:prod-<时间戳>，后者用于回滚
-
-# 同步部署文件并让服务器拉取镜像 + 启动
 ./deploy_all.sh root@your-server-ip /opt/lang-app
 ```
 
-`make push-all` 的镜像分三层，重依赖只在首次或变更时构建：
-
-| 镜像 | 内容 | 何时重建 |
-|---|---|---|
-| `lang-python-base:py312` | apt（ffmpeg/tesseract/git/openssh）+ uv + builder 依赖 | 仅 `Dockerfile.base` / `pyproject.toml` 变化 |
-| `lang-listen-parser:prod` | PyInstaller 听力解析二进制 | 仅 `builder/` 或 `pyproject.toml` 变化 |
-| `lang-service:prod` | Go 二进制 + 业务代码，`FROM` 上面两个 | 每次 `push-all`（通常 1 分钟内） |
-
-- 首次构建 `lang-python-base` 在 Apple Silicon 上走 QEMU 模拟 amd64，apt 安装约 10~15 分钟，属正常；后续命中缓存秒级完成。
-- 本地已有这两个镜像时，`push-base-image` / `push-parser-image` 只执行 `docker push`，不会重建。
-- 如果本地构建缓存被清理导致又要重装 apt，可在服务器上原生构建后推送：
-  `docker buildx build --platform linux/amd64 -t furchtlos/lang-python-base:py312 -f server/Dockerfile.base --push .`
-- 磁盘空间不足会频繁淘汰构建缓存（`docker builder prune` 前后留意 `df -h`）。
-
-`deploy_all.sh` 默认走仓库模式，只同步 `deploy/content/builder` 等挂载文件，
-镜像由服务器 `docker compose pull` 获取，不再上传 tar 包。
+`deploy_all.sh` 默认走仓库模式，只同步 `deploy/content/builder` 等挂载文件，镜像由服务器拉取。服务器到 Docker Hub 长期很慢时，优先使用上述 ACR 一键脚本，或使用下面的 tar 离线模式。
 
 旧 tar 流程（离线备用，按镜像分包）：
 

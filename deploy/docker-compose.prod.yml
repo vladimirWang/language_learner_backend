@@ -70,6 +70,9 @@ services:
   version-service:
     image: ${IMG_SERVICE:-lang-service:prod}
     container_name: lang-service-prod
+    networks:
+      - default
+      - infra_network
     env_file: .env.prod
     environment:
       GIT_SSH_COMMAND: "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
@@ -79,10 +82,11 @@ services:
       ASR_MODEL: ${ASR_MODEL:-}
       TTS_MODEL: ${TTS_MODEL:-}
       TTS_VOICE: ${TTS_VOICE:-}
-      RABBITMQ_URL: ${RABBITMQ_URL:-}
+      # PDF 队列与签到 bitmap 复用宿主机 infra_network 中的 rabbitmq / redis。
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://root:1234@rabbitmq:5672/}
       PDF_IMPORT_QUEUE: ${PDF_IMPORT_QUEUE:-pdf.import}
-      # 连续签到 bitmap：与 PostgreSQL 同网络的 redis
-      REDIS_ADDR: ${REDIS_ADDR:-redis:16379}
+      # infra 网络内直连容器端口 6379；宿主机的 16379 只供容器外访问。
+      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       REDIS_DB: ${REDIS_DB:-0}
     ports:
@@ -140,3 +144,8 @@ services:
 
 volumes:
   pgdata:
+
+# 复用服务器已有基础设施容器，避免在 2C2G 主机重复启动 RabbitMQ / Redis。
+networks:
+  infra_network:
+    external: true
