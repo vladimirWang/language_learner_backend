@@ -44,10 +44,10 @@ type Handler struct {
 	presigner   *storage.Presigner
 	localAvatar *storage.LocalAvatarStore // 未配置对象存储时的本地头像回退
 	repoURLs    map[string]string
-	llm       *llm.Client
-	tts       *tts.Client
-	pdfPub    JobPublisher
-	logger    *log.Logger
+	llm         *llm.Client
+	tts         *tts.Client
+	pdfPub      JobPublisher
+	logger      *log.Logger
 
 	// 学员端语种：请求未带 lang 时用 defaultLang，且只接受 supportedLangs 中的值。
 	defaultLang    string
@@ -284,6 +284,8 @@ func (h *Handler) Routes() http.Handler {
 		speaking.GET("/plans/:id", h.getSpeakingPlan)
 		speaking.POST("/plans", h.createSpeakingPlan)
 		speaking.POST("/plans/generate", h.generateSpeakingPlan)
+		speaking.POST("/plans/suggest-names", h.suggestSpeakingPlanNames)
+		speaking.POST("/plans/suggest-description", h.suggestSpeakingPlanDescription)
 		speaking.PUT("/plans/:id", h.updateSpeakingPlan)
 		speaking.DELETE("/plans/:id", h.deleteSpeakingPlan)
 		speaking.POST("/plans/batch-delete", h.adminBatchDeleteSpeakingPlans)
