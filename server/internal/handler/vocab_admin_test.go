@@ -60,6 +60,22 @@ func TestParseVocabCSV(t *testing.T) {
 		}
 	})
 
+	t.Run("解析语料字段并可回写 CSV", func(t *testing.T) {
+		raw := "lang,lemma,word_type,separable,trans_intr,core_case,sort_key,level,chinese_mean,extra_json\n" +
+			"de,aufstehen,verb,true,vi,,日常,A2,起床,\"{\"\"past\"\":\"\"stand auf\"\"}\"\n"
+		rows, errs := parseVocabCSV("de", raw)
+		if len(errs) != 0 || len(rows) != 1 {
+			t.Fatalf("解析失败：rows=%+v errs=%v", rows, errs)
+		}
+		row := rows[0]
+		if row.Separable != "true" || row.TransIntr != "vi" || row.SortKey != "日常" {
+			t.Fatalf("语料字段未正确解析：%+v", row)
+		}
+		if row.ExtraJSON != `{"past":"stand auf"}` {
+			t.Fatalf("extra_json 未原样保留：%q", row.ExtraJSON)
+		}
+	})
+
 	t.Run("lang 与请求语种不一致时报错", func(t *testing.T) {
 		raw := "lang,lemma,word_type,level,chinese_mean\nen,dog,noun,A2,狗\n"
 		if _, errs := parseVocabCSV("de", raw); len(errs) == 0 {
@@ -96,6 +112,42 @@ func TestNormalizeVocabWordEnglishNoGenderPlural(t *testing.T) {
 	withPlural.Plural = "apples"
 	if _, msg := normalizeVocabWord(withPlural, "en"); msg == "" {
 		t.Fatal("英语词条填写复数应报错")
+	}
+}
+
+func TestNormalizeVocabWordCorpusFields(t *testing.T) {
+	de := vocabWordUpsert{
+		Lemma: "aufstehen", WordType: "verb", Level: "A2", ChineseMean: "起床",
+		Separable: "1", TransIntr: "vi", SortKey: "日常", ExtraJSON: `{"past":"stand auf"}`,
+	}
+	got, msg := normalizeVocabWord(de, "de")
+	if msg != "" {
+		t.Fatalf("德语语料字段应通过：%s", msg)
+	}
+	if got.Separable != "true" {
+		t.Fatalf("separable 应归一化为 true，实际 %q", got.Separable)
+	}
+
+	enWithSeparable := vocabWordUpsert{
+		Lemma: "get up", WordType: "verb", Level: "A1", ChineseMean: "起床", Separable: "true",
+	}
+	if _, msg := normalizeVocabWord(enWithSeparable, "en"); msg == "" {
+		t.Fatal("英语词条填写可分动词应报错")
+	}
+
+	jaWithCase := vocabWordUpsert{
+		Lemma: "山", WordType: "noun", Level: "N5", ChineseMean: "山", CoreCase: "+A",
+	}
+	if _, msg := normalizeVocabWord(jaWithCase, "ja"); msg == "" {
+		t.Fatal("日语词条填写支配格应报错")
+	}
+
+	badJSON := vocabWordUpsert{
+		Lemma: "Hund", WordType: "noun", Gender: "m", Level: "A2", ChineseMean: "狗",
+		ExtraJSON: `{"past":`,
+	}
+	if _, msg := normalizeVocabWord(badJSON, "de"); msg == "" {
+		t.Fatal("非法 extra_json 应报错")
 	}
 }
 

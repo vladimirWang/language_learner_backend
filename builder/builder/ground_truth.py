@@ -1,4 +1,4 @@
-"""CSV 校验 → 生成客户端只读真值库 ground_truth.db（SQLite）。"""
+"""读取数据库词表（按需从 CSV 导入）→ 生成客户端只读真值库 ground_truth.db（SQLite）。"""
 
 from __future__ import annotations
 
@@ -91,11 +91,10 @@ class GroundTruthResult:
     path: Path
     vocab_count: int
     form_count: int
-    vocab_rows: list[dict[str, str]]
 
 
-def load_vocab(settings: Settings, lang: str) -> list[dict[str, str]]:
-    """读取并校验 vocab.csv，返回带例句的规范化行；供真值库与 PG 词表共用。"""
+def load_vocab_csv(settings: Settings, lang: str) -> list[dict[str, str]]:
+    """读取并校验 vocab.csv；仅在 --import-vocab 时用于初始化/更新数据库词表。"""
     plugin = get_plugin(lang)
     vocab_path = settings.content_dir / lang / "vocab.csv"
     if not vocab_path.is_file():
@@ -123,11 +122,31 @@ def load_vocab(settings: Settings, lang: str) -> list[dict[str, str]]:
     return vocab
 
 
-def build(settings: Settings, lang: str, version: str) -> GroundTruthResult:
+def load_vocab_from_store(settings: Settings, store, lang: str) -> list[dict[str, str]]:
+    """从数据库词表读取构库数据；数据库是词库唯一真值，构建不再回读 vocab.csv。"""
+    rows = store.load_vocab_rows(lang)
+    if not rows:
+        raise BuildError(
+            f"no vocab in DB for lang={lang}; 请先用管理台或 --import-vocab "
+            f"导入 content/{lang}/vocab.csv"
+        )
+    example_column = f"example_{lang}"
+    for row in rows:
+        if not row.get(example_column):
+            row[example_column] = _first_example(settings, row.get("source_md_path", ""))
+        _warn_missing_md(
+            settings,
+            row.get("source_md_path", ""),
+            f"vocab_words_{lang}:{row.get('lemma', '')}",
+        )
+    return rows
+
+
+def build(settings: Settings, store, lang: str, version: str) -> GroundTruthResult:
     plugin = get_plugin(lang)
     lang_dir = settings.content_dir / lang
 
-    vocab_rows = load_vocab(settings, lang)
+    vocab_rows = load_vocab_from_store(settings, store, lang)
 
     errors: list[str] = []
     form_rows: list[tuple[int, dict[str, str]]] = []
@@ -223,7 +242,6 @@ def build(settings: Settings, lang: str, version: str) -> GroundTruthResult:
         path=dest,
         vocab_count=len(vocab_rows),
         form_count=len(form_rows),
-        vocab_rows=vocab_rows,
     )
 
 

@@ -54,6 +54,11 @@ type vocabWordUpsert struct {
 	Kana         string `json:"kana"`
 	Kanji        string `json:"kanji"`
 	Romaji       string `json:"romaji"`
+	Separable    string `json:"separable"`
+	TransIntr    string `json:"trans_intr"`
+	CoreCase     string `json:"core_case"`
+	SortKey      string `json:"sort_key"`
+	ExtraJSON    string `json:"extra_json"`
 	ChineseMean  string `json:"chinese_mean"`
 	EnglishMean  string `json:"english_mean"`
 	ExampleDE    string `json:"example_de"`
@@ -111,6 +116,11 @@ func normalizeVocabWord(req vocabWordUpsert, forcedLang string) (store.VocabWord
 	req.ExampleDE = strings.TrimSpace(req.ExampleDE)
 	req.ExampleEN = strings.TrimSpace(req.ExampleEN)
 	req.ExampleJA = strings.TrimSpace(req.ExampleJA)
+	req.Separable = strings.ToLower(strings.TrimSpace(req.Separable))
+	req.TransIntr = strings.ToLower(strings.TrimSpace(req.TransIntr))
+	req.CoreCase = strings.TrimSpace(req.CoreCase)
+	req.SortKey = strings.TrimSpace(req.SortKey)
+	req.ExtraJSON = strings.TrimSpace(req.ExtraJSON)
 
 	// 语种专有字段不允许跨语种填写，避免拆表后仍有脏数据。
 	if req.Lang != "de" {
@@ -140,6 +150,28 @@ func normalizeVocabWord(req vocabWordUpsert, forcedLang string) (store.VocabWord
 			return store.VocabWordInput{}, "只有日语词条可以填写日语例句"
 		}
 	}
+	// 语料字段（原先只存在于 vocab.csv）同样按语种约束。
+	if req.Lang != "de" && req.Separable != "" {
+		return store.VocabWordInput{}, "只有德语词条可以填写可分动词"
+	}
+	if req.Lang == "ja" && (req.TransIntr != "" || req.CoreCase != "") {
+		return store.VocabWordInput{}, "日语词条不支持及物性/支配格"
+	}
+	switch req.Separable {
+	case "", "true", "false":
+	case "1", "yes", "y":
+		req.Separable = "true"
+	case "0", "no", "n":
+		req.Separable = "false"
+	default:
+		return store.VocabWordInput{}, "separable 只能是 true 或 false"
+	}
+	if req.ExtraJSON != "" {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(req.ExtraJSON), &obj); err != nil {
+			return store.VocabWordInput{}, "extra_json 必须是 JSON 对象"
+		}
+	}
 	if req.Gender != "" && req.Gender != "m" && req.Gender != "f" && req.Gender != "n" {
 		return store.VocabWordInput{}, "无效词性性别（m/f/n）"
 	}
@@ -165,7 +197,9 @@ func normalizeVocabWord(req vocabWordUpsert, forcedLang string) (store.VocabWord
 		utf8.RuneCountInString(req.Kana) > 80 || utf8.RuneCountInString(req.Kanji) > 80 ||
 		utf8.RuneCountInString(req.Romaji) > 80 ||
 		utf8.RuneCountInString(req.ExampleDE) > 500 || utf8.RuneCountInString(req.ExampleEN) > 500 ||
-		utf8.RuneCountInString(req.ExampleJA) > 500 {
+		utf8.RuneCountInString(req.ExampleJA) > 500 ||
+		utf8.RuneCountInString(req.TransIntr) > 20 || utf8.RuneCountInString(req.CoreCase) > 80 ||
+		utf8.RuneCountInString(req.SortKey) > 80 || utf8.RuneCountInString(req.ExtraJSON) > 2000 {
 		return store.VocabWordInput{}, "字段长度超出限制"
 	}
 
@@ -180,6 +214,11 @@ func normalizeVocabWord(req vocabWordUpsert, forcedLang string) (store.VocabWord
 		Kana:         req.Kana,
 		Kanji:        req.Kanji,
 		Romaji:       req.Romaji,
+		Separable:    req.Separable,
+		TransIntr:    req.TransIntr,
+		CoreCase:     req.CoreCase,
+		SortKey:      req.SortKey,
+		ExtraJSON:    req.ExtraJSON,
 		ChineseMean:  req.ChineseMean,
 		EnglishMean:  req.EnglishMean,
 		ExampleDE:    req.ExampleDE,
@@ -479,6 +518,11 @@ func parseVocabCSV(lang, raw string) ([]store.VocabWordInput, []string) {
 			Kana:         pick(record, "kana"),
 			Kanji:        pick(record, "kanji"),
 			Romaji:       pick(record, "romaji"),
+			Separable:    pick(record, "separable"),
+			TransIntr:    pick(record, "trans_intr"),
+			CoreCase:     pick(record, "core_case"),
+			SortKey:      pick(record, "sort_key"),
+			ExtraJSON:    pick(record, "extra_json"),
 			ChineseMean:  pick(record, "chinese_mean"),
 			EnglishMean:  pick(record, "english_mean"),
 			ExampleDE:    pick(record, "example_de"),

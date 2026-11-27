@@ -21,6 +21,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="builder", description="素材构建任务（一次性）")
     parser.add_argument("--lang", action="append", dest="langs", help="语种，可重复；缺省构建全部")
     parser.add_argument("--version", help="素材版本号；缺省按时间生成")
+    parser.add_argument(
+        "--import-vocab",
+        action="store_true",
+        help="构建前先把 content/<lang>/vocab.csv 导入数据库；默认只读数据库词表",
+    )
     args = parser.parse_args(argv)
 
     settings = Settings.from_env()
@@ -30,9 +35,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     version = args.version or datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    logging.info("build start langs=%s version=%s", langs, version)
+    logging.info("build start langs=%s version=%s import_vocab=%s", langs, version, args.import_vocab)
     try:
-        pipeline.run(settings, langs, version)
+        pipeline.run(settings, langs, version, import_vocab=args.import_vocab)
     except BuildError as exc:
         logging.error("build failed: %s", exc)
         return 1

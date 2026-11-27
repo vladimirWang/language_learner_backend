@@ -17,7 +17,7 @@ from .upload import Uploader, md5_file
 logger = logging.getLogger(__name__)
 
 
-def run(settings: Settings, langs: list[str], version: str) -> None:
+def run(settings: Settings, langs: list[str], version: str, import_vocab: bool = False) -> None:
     for lang in langs:
         get_plugin(lang)
 
@@ -27,7 +27,7 @@ def run(settings: Settings, langs: list[str], version: str) -> None:
         for lang in langs:
             lang_version = version if len(langs) == 1 else f"{version}-{lang}"
             try:
-                _run_lang(settings, store, uploader, lang, lang_version)
+                _run_lang(settings, store, uploader, lang, lang_version, import_vocab)
             except Exception as exc:
                 store.fail_build(lang_version, str(exc))
                 raise
@@ -36,7 +36,12 @@ def run(settings: Settings, langs: list[str], version: str) -> None:
 
 
 def _run_lang(
-    settings: Settings, store: Store, uploader: Uploader, lang: str, version: str
+    settings: Settings,
+    store: Store,
+    uploader: Uploader,
+    lang: str,
+    version: str,
+    import_vocab: bool,
 ) -> None:
     source_commit = os.getenv("SOURCE_COMMIT", "").strip()
     store.record_build(version, lang, "building", source_commit)
@@ -77,9 +82,13 @@ def _run_lang(
         f"inserted={len(chunks)} removed_sources={len(deleted) + len(changed)}",
     )
 
-    truth = ground_truth.build(settings, lang, version)
+    # 词库以数据库为唯一真值：默认不回写，只有 --import-vocab 时才用 CSV 初始化/更新。
+    if import_vocab:
+        csv_rows = ground_truth.load_vocab_csv(settings, lang)
+        store.log(version, "vocab", f"imported={store.upsert_vocab_words(lang, csv_rows)}")
+
+    truth = ground_truth.build(settings, store, lang, version)
     store.log(version, "parse", f"ground_truth vocab={truth.vocab_count} forms={truth.form_count}")
-    store.log(version, "vocab", f"upserted={store.upsert_vocab_words(lang, truth.vocab_rows)}")
 
     snap = snapshot.export(store, lang, version, settings.work_dir / version / lang)
     store.log(version, "snapshot", f"chunks={snap.chunk_count}")

@@ -83,6 +83,11 @@ type VocabWordInput struct {
 	Kana         string
 	Kanji        string
 	Romaji       string
+	Separable    string
+	TransIntr    string
+	CoreCase     string
+	SortKey      string
+	ExtraJSON    string
 	ChineseMean  string
 	EnglishMean  string
 	ExampleDE    string
@@ -176,7 +181,8 @@ func (s *Store) ListVocabWords(ctx context.Context, lang, level, query string, l
 	return rows, total, err
 }
 
-// vocabWriteColumns 返回该语种表中管理台/CSV 可写的列（不含 id 与 updated_at）。
+// vocabWriteColumns 返回该语种表中管理台表单可写的列（不含 id 与 updated_at）。
+// CSV 批量导入改用 vocabImportColumns，避免管理台编辑把语料字段清空。
 func vocabWriteColumns(lang string) []string {
 	switch lang {
 	case "de":
@@ -193,6 +199,32 @@ func vocabWriteColumns(lang string) []string {
 		return []string{
 			"lemma", "level", "word_type", "kana", "kanji", "romaji",
 			"chinese_mean", "english_mean", "example_ja", "source_md_path",
+		}
+	}
+	return nil
+}
+
+// vocabImportColumns 返回 CSV / builder 批量导入可写的全部列，
+// 比管理台表单多出只在语料里维护的字段（可分动词、支配格、排序键、extra_json），
+// 保证数据库能无损承接 content/<lang>/vocab.csv。
+func vocabImportColumns(lang string) []string {
+	switch lang {
+	case "de":
+		return []string{
+			"lemma", "level", "word_type", "gender", "plural", "separable",
+			"trans_intr", "core_case", "sort_key", "chinese_mean", "english_mean",
+			"example_de", "source_md_path", "extra_json",
+		}
+	case "en":
+		return []string{
+			"lemma", "level", "word_type", "phonetic", "trans_intr", "core_case",
+			"sort_key", "chinese_mean", "english_mean", "example_en",
+			"source_md_path", "extra_json",
+		}
+	case "ja":
+		return []string{
+			"lemma", "level", "word_type", "kana", "kanji", "romaji", "sort_key",
+			"chinese_mean", "english_mean", "example_ja", "source_md_path", "extra_json",
 		}
 	}
 	return nil
@@ -219,6 +251,16 @@ func vocabColumnValue(in VocabWordInput, column string) (string, bool) {
 		return in.Kanji, true
 	case "romaji":
 		return in.Romaji, true
+	case "separable":
+		return in.Separable, true
+	case "trans_intr":
+		return in.TransIntr, true
+	case "core_case":
+		return in.CoreCase, true
+	case "sort_key":
+		return in.SortKey, true
+	case "extra_json":
+		return in.ExtraJSON, true
 	case "chinese_mean":
 		return in.ChineseMean, false
 	case "english_mean":
@@ -235,15 +277,21 @@ func vocabColumnValue(in VocabWordInput, column string) (string, bool) {
 	return "", true
 }
 
-// vocabWriteArgs 按列顺序返回参数；可空列传 NULLIF(?, ”)。
+// vocabWriteArgs 按列顺序返回参数；可空列传 NULLIF(?, ”)，
+// 布尔/JSONB 列额外做类型转换，空串仍写入 NULL。
 func vocabWriteArgs(in VocabWordInput, columns []string) ([]string, []any) {
 	exprs := make([]string, 0, len(columns))
 	args := make([]any, 0, len(columns))
 	for _, column := range columns {
 		value, nullable := vocabColumnValue(in, column)
-		if nullable {
+		switch {
+		case column == "separable":
+			exprs = append(exprs, "NULLIF(?, '')::boolean")
+		case column == "extra_json":
+			exprs = append(exprs, "NULLIF(?, '')::jsonb")
+		case nullable:
 			exprs = append(exprs, "NULLIF(?, '')")
-		} else {
+		default:
 			exprs = append(exprs, "?")
 		}
 		args = append(args, value)
@@ -366,7 +414,7 @@ func (s *Store) VocabWordIDsByLemmas(ctx context.Context, lang string, lemmas []
 // vocabUpsertSQL 生成该语种表的 upsert 语句；image_url 不在写入范围，保留管理台配图。
 func vocabUpsertSQL(lang string) (string, []string) {
 	table := vocabTableByLang(lang)
-	columns := vocabWriteColumns(lang)
+	columns := vocabImportColumns(lang)
 	if table == "" || len(columns) == 0 {
 		return "", nil
 	}

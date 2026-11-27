@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import psycopg
 from pgvector.psycopg import register_vector
+from psycopg.types.json import Jsonb
 
 from .chunking import Chunk
 
@@ -101,7 +102,7 @@ class Store:
             raise
 
     def upsert_vocab_words(self, lang: str, rows: list[dict]) -> int:
-        """按 (lang, lemma) upsert 到语种词表，保持 word_id 稳定；返回写入行数。"""
+        """仅在 --import-vocab 时调用：按 (lang, lemma) 把 CSV 写入语种词表。"""
         if not rows:
             return 0
         columns = _VOCAB_COLUMNS_BY_LANG.get(lang)
@@ -129,6 +130,47 @@ class Store:
             self._conn.rollback()
             raise
         return len(payload)
+
+    def load_vocab_rows(self, lang: str) -> list[dict[str, str]]:
+        """从语种词表读出全部词条，转成与 vocab.csv 同构的行，供构建真值库使用。"""
+        columns = _VOCAB_READ_COLUMNS.get(lang)
+        if columns is None:
+            raise ValueError(f"unsupported vocab lang: {lang}")
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {', '.join(columns)} FROM vocab_words_{lang} ORDER BY id"
+            )
+            records = cur.fetchall()
+
+        example_column = f"example_{lang}"
+        rows: list[dict[str, str]] = []
+        for record in records:
+            item = dict(zip(columns, record))
+            extra_value = item.get("extra_json")
+            row = {
+                "lang": lang,
+                "lemma": item["lemma"],
+                "word_type": item.get("word_type") or "",
+                "gender": item.get("gender") or "",
+                "plural": item.get("plural") or "",
+                "level": item["level"],
+                "chinese_mean": item["chinese_mean"],
+                "english_mean": item.get("english_mean") or "",
+                "source_md_path": item.get("source_md_path") or "",
+                "separable": _bool_text(item.get("separable")),
+                "trans_intr": item.get("trans_intr") or "",
+                "core_case": item.get("core_case") or "",
+                "sort_key": item.get("sort_key") or "",
+                "extra_json": (
+                    json.dumps(extra_value, ensure_ascii=False) if extra_value else ""
+                ),
+                example_column: item.get(example_column) or "",
+            }
+            for name in ("phonetic", "kana", "kanji", "romaji"):
+                if name in item:
+                    row[name] = item[name] or ""
+            rows.append(row)
+        return rows
 
     def iter_chunks(self, lang: str) -> Iterator[StoredChunk]:
         with self._conn.cursor(name="snapshot_cursor") as cur:
@@ -190,32 +232,74 @@ class Store:
         print(f"[{stage}] [{level}] {message}", flush=True)
 
 
-# 语种词表可写列；与 Go 侧 store.vocabWriteColumns 保持一致。
+# 语种词表可写列；与 Go 侧 store.vocabImportColumns 保持一致。
+# 只在显式 --import-vocab 时使用：数据库是词库的唯一真值，构建默认只读。
 _VOCAB_COLUMNS_BY_LANG: dict[str, tuple[str, ...]] = {
     "de": (
-        "lemma", "level", "word_type", "gender", "plural",
-        "chinese_mean", "english_mean", "example_de", "source_md_path",
+        "lemma", "level", "word_type", "gender", "plural", "separable",
+        "trans_intr", "core_case", "sort_key",
+        "chinese_mean", "english_mean", "example_de", "source_md_path", "extra_json",
     ),
     "en": (
-        "lemma", "level", "word_type", "phonetic",
-        "chinese_mean", "english_mean", "example_en", "source_md_path",
+        "lemma", "level", "word_type", "phonetic", "trans_intr", "core_case", "sort_key",
+        "chinese_mean", "english_mean", "example_en", "source_md_path", "extra_json",
     ),
     "ja": (
-        "lemma", "level", "word_type", "kana", "kanji", "romaji",
-        "chinese_mean", "english_mean", "example_ja", "source_md_path",
+        "lemma", "level", "word_type", "kana", "kanji", "romaji", "sort_key",
+        "chinese_mean", "english_mean", "example_ja", "source_md_path", "extra_json",
+    ),
+}
+
+# 构建真值库时从词表读取的列；各语种列集不同，需完整列出。
+_VOCAB_READ_COLUMNS: dict[str, tuple[str, ...]] = {
+    "de": (
+        "lemma", "word_type", "gender", "plural", "level",
+        "chinese_mean", "english_mean", "source_md_path",
+        "separable", "trans_intr", "core_case", "sort_key", "extra_json", "example_de",
+    ),
+    "en": (
+        "lemma", "word_type", "phonetic", "level",
+        "chinese_mean", "english_mean", "source_md_path",
+        "trans_intr", "core_case", "sort_key", "extra_json", "example_en",
+    ),
+    "ja": (
+        "lemma", "word_type", "kana", "kanji", "romaji", "level",
+        "chinese_mean", "english_mean", "source_md_path",
+        "sort_key", "extra_json", "example_ja",
     ),
 }
 
 _REQUIRED_VOCAB_COLUMNS = frozenset({"lemma", "level", "chinese_mean"})
 
 
-def _vocab_column_value(row: dict, column: str, lang: str) -> str | None:
+def _vocab_column_value(row: dict, column: str, lang: str):
     """把一行 CSV 数据映射到语种表列；日语假名/汉字从 extra_json 提取。"""
     if column in _REQUIRED_VOCAB_COLUMNS:
         return row.get(column, "")
+    if column == "separable":
+        raw = (row.get("separable") or "").strip().lower()
+        if not raw:
+            return None
+        return raw in {"true", "1", "yes", "y"}
+    if column == "extra_json":
+        return _extra_jsonb(row)
     if column in {"kana", "kanji"}:
         return _none(_extra_json(row).get(column))
     return _none(row.get(column, ""))
+
+
+def _extra_jsonb(row: dict) -> Jsonb | None:
+    """CSV 的 extra_json 文本转 JSONB；非法 JSON 直接让导入失败，避免静默丢数据。"""
+    raw = (row.get("extra_json") or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid extra_json for {row.get('lemma')}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"extra_json must be an object for {row.get('lemma')}")
+    return Jsonb(data)
 
 
 def _extra_json(row: dict) -> dict:
@@ -242,3 +326,10 @@ def _none(value: str | None) -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def _bool_text(value: bool | None) -> str:
+    """数据库布尔值转回 CSV 的 true/false 文本；NULL 写成空串。"""
+    if value is None:
+        return ""
+    return "true" if value else "false"
