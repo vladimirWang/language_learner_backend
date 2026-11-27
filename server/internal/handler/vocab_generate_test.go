@@ -32,6 +32,27 @@ func TestParseGeneratedVocab(t *testing.T) {
 	}
 }
 
+func TestParseGeneratedVocabTruncated(t *testing.T) {
+	// 模拟 max_tokens 截断：第二个对象没有闭合，但第一个对象完整。
+	raw := `{"items":[{"lemma":"Haus","word_type":"noun","gender":"n","plural":"Häuser",` +
+		`"chinese_mean":"房子","example":"Das {Haus} ist groß."},` +
+		`{"lemma":"Baum","word_type":"nou`
+	items, err := parseGeneratedVocab(raw)
+	if err != nil {
+		t.Fatalf("截断内容应尽量恢复：%v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("期望恢复 1 条，实际 %d", len(items))
+	}
+	if items[0].Lemma != "Haus" || items[0].Plural != "Häuser" {
+		t.Fatalf("恢复内容不对：%+v", items[0])
+	}
+
+	if _, err := parseGeneratedVocab("模型拒绝回答"); err == nil {
+		t.Fatal("完全不可解析时应报错")
+	}
+}
+
 func TestNormalizeGeneratedVocab(t *testing.T) {
 	req := vocabGenerateRequest{Lang: "de", Level: "A2"}
 

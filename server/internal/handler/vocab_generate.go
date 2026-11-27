@@ -154,7 +154,11 @@ func (h *Handler) generateVocabWords(c *gin.Context) {
 	rounds := 0
 	for rounds < vocabGenerateMaxRounds && len(accepted) < req.Count {
 		rounds++
+		// ChatJSON 的 maxTokens 上限是 2000，单轮要太多条会被截断，因此每轮最多要 8 条。
 		want := (req.Count - len(accepted)) * vocabGeneratePerRound
+		if want > 8 {
+			want = 8
+		}
 		if want < 4 {
 			want = 4
 		}
@@ -162,7 +166,7 @@ func (h *Handler) generateVocabWords(c *gin.Context) {
 		if err != nil {
 			h.logger.Printf("generate vocab llm round=%d: %v", rounds, err)
 			if len(accepted) == 0 {
-				writeError(c, http.StatusBadGateway, "词条生成失败："+err.Error())
+				writeError(c, http.StatusBadGateway, "词条生成失败：模型返回内容不完整，请重试")
 				return
 			}
 			break
@@ -265,7 +269,7 @@ func (h *Handler) askVocabCandidates(
 		c.Request.Context(),
 		vocabGenerateSystemPrompt(req.Lang, req.Level),
 		"请生成候选词条：\n"+string(payload),
-		2400,
+		1800,
 	)
 	if err != nil {
 		return nil, err
@@ -378,18 +382,94 @@ func toVocabInputs(candidates []vocabCandidate, req vocabGenerateRequest) []stor
 }
 
 func parseGeneratedVocab(raw string) ([]generatedVocabItem, error) {
-	start := strings.Index(raw, "{")
-	end := strings.LastIndex(raw, "}")
-	if start < 0 || end <= start {
-		return nil, fmt.Errorf("返回内容不是 JSON 对象")
+	body := strings.TrimSpace(raw)
+	// 去掉 ```json 围栏；被截断时可能没有收尾围栏。
+	body = strings.TrimPrefix(body, "```json")
+	body = strings.TrimPrefix(body, "```")
+	body = strings.TrimSuffix(body, "```")
+	body = strings.TrimSpace(body)
+
+	if items, ok := decodeVocabItems(body); ok {
+		return items, nil
 	}
+	// 模型输出被 max_tokens 截断时，完整 JSON 无法解析；
+	// 逐个提取已闭合的对象，尽量保留已生成的有效候选。
+	if items := scanVocabItems(body); len(items) > 0 {
+		return items, nil
+	}
+	return nil, fmt.Errorf("模型未返回可解析的词条 JSON（前 120 字：%s）", snippet(body, 120))
+}
+
+// decodeVocabItems 按完整 JSON 解析对象或数组。
+func decodeVocabItems(body string) ([]generatedVocabItem, bool) {
 	var payload struct {
 		Items []generatedVocabItem `json:"items"`
 	}
-	if err := json.Unmarshal([]byte(raw[start:end+1]), &payload); err != nil {
-		return nil, fmt.Errorf("JSON 解析失败: %w", err)
+	if err := json.Unmarshal([]byte(body), &payload); err == nil {
+		return payload.Items, true
 	}
-	return payload.Items, nil
+	var items []generatedVocabItem
+	if err := json.Unmarshal([]byte(body), &items); err == nil {
+		return items, true
+	}
+	return nil, false
+}
+
+// scanVocabItems 从（可能被截断的）文本里提取每个已闭合的词条对象。
+func scanVocabItems(body string) []generatedVocabItem {
+	if start := strings.Index(body, `"items"`); start >= 0 {
+		if bracket := strings.Index(body[start:], "["); bracket >= 0 {
+			body = body[start+bracket+1:]
+		}
+	}
+	items := make([]generatedVocabItem, 0, 8)
+	depth, objStart := 0, -1
+	inString, escaped := false, false
+	for i := 0; i < len(body); i++ {
+		ch := body[i]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case ch == '\\':
+				escaped = true
+			case ch == '"':
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			if depth == 0 {
+				objStart = i
+			}
+			depth++
+		case '}':
+			if depth == 0 {
+				continue
+			}
+			depth--
+			if depth == 0 && objStart >= 0 {
+				var item generatedVocabItem
+				if err := json.Unmarshal([]byte(body[objStart:i+1]), &item); err == nil &&
+					strings.TrimSpace(item.Lemma) != "" {
+					items = append(items, item)
+				}
+				objStart = -1
+			}
+		}
+	}
+	return items
+}
+
+func snippet(text string, limit int) string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit]) + "…"
 }
 
 // separableText 兼容模型返回布尔或字符串。
