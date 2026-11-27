@@ -140,6 +140,7 @@ func (h *Handler) Routes() http.Handler {
 		{
 			vocab.GET("", h.listVocabWords)
 			vocab.POST("", h.createVocabWord)
+			vocab.POST("/generate", h.generateVocabWords)
 			vocab.POST("/import", h.importVocabWords)
 			vocab.PUT("/:id", h.updateVocabWord)
 			vocab.DELETE("/:id", h.deleteVocabWord)

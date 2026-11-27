@@ -390,6 +390,27 @@ func (s *Store) DeleteVocabWord(ctx context.Context, lang string, id int64) (boo
 	return deleted, err
 }
 
+// AllVocabLemmas 返回该语种的全部词条名（含软删除），供智能生成查重。
+func (s *Store) AllVocabLemmas(ctx context.Context, lang string) ([]string, error) {
+	table := vocabTableByLang(lang)
+	if table == "" {
+		return nil, ErrUnsupportedVocabLang
+	}
+	lemmas := make([]string, 0, 256)
+	var rows []struct {
+		Lemma string `gorm:"column:lemma"`
+	}
+	if err := s.db.WithContext(ctx).Raw(
+		fmt.Sprintf("SELECT lemma FROM %s", table),
+	).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		lemmas = append(lemmas, row.Lemma)
+	}
+	return lemmas, nil
+}
+
 // VocabWordIDsByLemmas 按 lemma 列表精确查找 word_id，顺序与输入一致，
 // 未命中的 lemma 自动跳过。供 CSV 导入后反查 word_id 用。
 func (s *Store) VocabWordIDsByLemmas(ctx context.Context, lang string, lemmas []string) ([]int64, error) {
