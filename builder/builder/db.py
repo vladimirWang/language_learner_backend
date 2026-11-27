@@ -114,6 +114,8 @@ class Store:
         ]
         placeholders = ", ".join(["%s"] * len(columns))
         updates = ", ".join(f"{column} = EXCLUDED.{column}" for column in columns)
+        # CSV 里再次出现同名 lemma 时恢复软删除词条。
+        updates += ", deleted_at = NULL"
         sql = f"""
             INSERT INTO vocab_words_{lang} ({", ".join(columns)})
             VALUES ({placeholders})
@@ -138,7 +140,8 @@ class Store:
             raise ValueError(f"unsupported vocab lang: {lang}")
         with self._conn.cursor() as cur:
             cur.execute(
-                f"SELECT {', '.join(columns)} FROM vocab_words_{lang} ORDER BY id"
+                f"SELECT {', '.join(columns)} FROM vocab_words_{lang}"
+                " WHERE deleted_at IS NULL ORDER BY id"
             )
             records = cur.fetchall()
 

@@ -485,9 +485,9 @@ func (s *Store) ChallengeTargets(ctx context.Context) ([][2]string, error) {
 	}
 	rows := make([]row, 0, 32)
 	if err := s.db.WithContext(ctx).Raw(
-		`SELECT DISTINCT 'de' AS lang, level FROM vocab_words_de WHERE level <> ''
-		 UNION ALL SELECT DISTINCT 'en' AS lang, level FROM vocab_words_en WHERE level <> ''
-		 UNION ALL SELECT DISTINCT 'ja' AS lang, level FROM vocab_words_ja WHERE level <> ''
+		`SELECT DISTINCT 'de' AS lang, level FROM vocab_words_de WHERE level <> '' AND deleted_at IS NULL
+		 UNION ALL SELECT DISTINCT 'en' AS lang, level FROM vocab_words_en WHERE level <> '' AND deleted_at IS NULL
+		 UNION ALL SELECT DISTINCT 'ja' AS lang, level FROM vocab_words_ja WHERE level <> '' AND deleted_at IS NULL
 		 ORDER BY lang ASC, level ASC`,
 	).Scan(&rows).Error; err != nil {
 		return nil, err
@@ -512,7 +512,7 @@ func (s *Store) ChallengeWordPool(ctx context.Context, lang, level, seed string,
 		`SELECT id, lemma, chinese_mean, COALESCE(word_type, '') AS word_type,
 		        COALESCE(%s, '') AS example_de
 		 FROM %s
-		 WHERE level = ?
+		 WHERE level = ? AND deleted_at IS NULL
 		 ORDER BY md5(lemma || ?) ASC, id ASC
 		 LIMIT ?`, example, table),
 		level, seed, limit,
@@ -532,6 +532,7 @@ func (s *Store) ChallengeWordPool(ctx context.Context, lang, level, seed string,
 		`SELECT id, lemma, chinese_mean, COALESCE(word_type, '') AS word_type,
 		        COALESCE(%s, '') AS example_de
 		 FROM %s
+		 WHERE deleted_at IS NULL
 		 ORDER BY md5(lemma || ?) ASC, id ASC
 		 LIMIT ?`, example, table),
 		seed, limit*2,

@@ -124,13 +124,16 @@ func vocabSelectSource(lang string) (string, error) {
 		if table == "" {
 			return "", ErrUnsupportedVocabLang
 		}
-		return fmt.Sprintf("SELECT '%s' AS lang, %s FROM %s", lang, vocabSelectColumns(table), table), nil
+		return fmt.Sprintf(
+			"SELECT '%s' AS lang, %s FROM %s WHERE deleted_at IS NULL", lang, vocabSelectColumns(table), table,
+		), nil
 	}
 	parts := make([]string, 0, len(vocabTables))
 	for _, table := range vocabTables {
 		tableLang := strings.TrimPrefix(table, "vocab_words_")
 		parts = append(parts, fmt.Sprintf(
-			"SELECT '%s' AS lang, %s FROM %s", tableLang, vocabSelectColumns(table), table,
+			"SELECT '%s' AS lang, %s FROM %s WHERE deleted_at IS NULL",
+			tableLang, vocabSelectColumns(table), table,
 		))
 	}
 	return strings.Join(parts, " UNION ALL "), nil
@@ -309,9 +312,14 @@ func (s *Store) CreateVocabWord(ctx context.Context, in VocabWordInput) (int64, 
 	var out struct {
 		ID int64 `gorm:"column:id"`
 	}
+	// 同名词条若曾被软删除，重新录入时直接恢复并清空 deleted_at；
+	// 仍是活跃词条时不返回行，调用方据此提示已存在。
 	err := s.db.WithContext(ctx).Raw(fmt.Sprintf(
-		`INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (lemma) DO NOTHING RETURNING id`,
-		table, strings.Join(columns, ", "), strings.Join(exprs, ", "),
+		`INSERT INTO %s (%s) VALUES (%s)
+		 ON CONFLICT (lemma) DO UPDATE SET deleted_at = NULL
+		 WHERE %s.deleted_at IS NOT NULL
+		 RETURNING id`,
+		table, strings.Join(columns, ", "), strings.Join(exprs, ", "), table,
 	), args...).Scan(&out).Error
 	if err != nil {
 		return 0, false, err
@@ -336,7 +344,7 @@ func (s *Store) UpdateVocabWord(ctx context.Context, id int64, in VocabWordInput
 	}
 	sets = append(sets, "updated_at = now()")
 	res := s.db.WithContext(ctx).Exec(fmt.Sprintf(
-		`UPDATE %s SET %s WHERE id = ?`, table, strings.Join(sets, ", "),
+		`UPDATE %s SET %s WHERE id = ? AND deleted_at IS NULL`, table, strings.Join(sets, ", "),
 	), append(args, id)...)
 	if res.Error != nil {
 		return false, res.Error
@@ -344,7 +352,8 @@ func (s *Store) UpdateVocabWord(ctx context.Context, id int64, in VocabWordInput
 	return res.RowsAffected > 0, nil
 }
 
-// DeleteVocabWord 删除词条并清理学习记录；lang 为空时依次尝试三张语种表。
+// DeleteVocabWord 软删除词条并清理学习记录；lang 为空时依次尝试三张语种表。
+// 物理行保留，便于误删恢复；学习记录仍物理清理，避免统计口径出现已删除词。
 func (s *Store) DeleteVocabWord(ctx context.Context, lang string, id int64) (bool, error) {
 	tables := vocabTables
 	if lang != "" {
@@ -359,7 +368,7 @@ func (s *Store) DeleteVocabWord(ctx context.Context, lang string, id int64) (boo
 		for _, table := range tables {
 			var found int64
 			if err := tx.Raw(
-				fmt.Sprintf("SELECT id FROM %s WHERE id = ? FOR UPDATE", table), id,
+				fmt.Sprintf("SELECT id FROM %s WHERE id = ? AND deleted_at IS NULL FOR UPDATE", table), id,
 			).Scan(&found).Error; err != nil {
 				return err
 			}
@@ -369,7 +378,9 @@ func (s *Store) DeleteVocabWord(ctx context.Context, lang string, id int64) (boo
 			if err := tx.Exec("DELETE FROM user_word_learning WHERE word_id = ?", id).Error; err != nil {
 				return err
 			}
-			if err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE id = ?", table), id).Error; err != nil {
+			if err := tx.Exec(fmt.Sprintf(
+				"UPDATE %s SET deleted_at = now() WHERE id = ?", table,
+			), id).Error; err != nil {
 				return err
 			}
 			deleted = true
@@ -394,7 +405,7 @@ func (s *Store) VocabWordIDsByLemmas(ctx context.Context, lang string, lemmas []
 		Lemma string `gorm:"column:lemma"`
 	}
 	if err := s.db.WithContext(ctx).Raw(
-		fmt.Sprintf("SELECT id, lemma FROM %s WHERE lemma IN ?", table), lemmas,
+		fmt.Sprintf("SELECT id, lemma FROM %s WHERE lemma IN ? AND deleted_at IS NULL", table), lemmas,
 	).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -419,11 +430,12 @@ func vocabUpsertSQL(lang string) (string, []string) {
 		return "", nil
 	}
 	exprs, _ := vocabWriteArgs(VocabWordInput{}, columns)
-	updates := make([]string, 0, len(columns)+1)
+	updates := make([]string, 0, len(columns)+2)
 	for _, column := range columns {
 		updates = append(updates, column+" = EXCLUDED."+column)
 	}
-	updates = append(updates, "updated_at = now()")
+	// 导入同名 CSV 时恢复软删除词条。
+	updates = append(updates, "deleted_at = NULL", "updated_at = now()")
 	return fmt.Sprintf(
 		`INSERT INTO %s (%s) VALUES (%s)
 		 ON CONFLICT (lemma) DO UPDATE SET %s

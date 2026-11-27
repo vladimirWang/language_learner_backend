@@ -151,10 +151,10 @@ func (s *Store) pickDailyWordIDs(ctx context.Context, lang, level, dayStr, devic
 	if table == "" {
 		return nil, nil
 	}
-	sql := "SELECT id FROM " + table
+	sql := "SELECT id FROM " + table + " WHERE deleted_at IS NULL"
 	args := make([]any, 0, 4)
 	if level != "" {
-		sql += " WHERE level = ?"
+		sql += " AND level = ?"
 		args = append(args, level)
 	}
 	// 把 device_id 计入哈希：不同设备同一天拿到不同词表，公共分配（空串）仍稳定可复现。
@@ -195,7 +195,7 @@ func (s *Store) wordsByIDs(ctx context.Context, lang string, ids []int64) ([]Voc
 	}
 	found := make([]VocabWord, 0, len(ids))
 	if err := s.db.WithContext(ctx).Raw(
-		fmt.Sprintf("SELECT %s FROM %s WHERE id IN ?", columns, table), ids,
+		fmt.Sprintf("SELECT %s FROM %s WHERE id IN ? AND deleted_at IS NULL", columns, table), ids,
 	).Scan(&found).Error; err != nil {
 		return nil, false, err
 	}
@@ -232,7 +232,7 @@ func (s *Store) MarkWordsLearnedAt(ctx context.Context, deviceID string, ids []i
 		for _, table := range vocabTables {
 			found := make([]int64, 0, len(ids))
 			if err := tx.Raw(
-				fmt.Sprintf("SELECT id FROM %s WHERE id IN ? FOR KEY SHARE", table), ids,
+				fmt.Sprintf("SELECT id FROM %s WHERE id IN ? AND deleted_at IS NULL FOR KEY SHARE", table), ids,
 			).Scan(&found).Error; err != nil {
 				return err
 			}
@@ -281,7 +281,7 @@ func (s *Store) RecentWords(ctx context.Context, deviceID, lang string, since ti
 		     SELECT DISTINCT ON (vw.lemma) vw.lemma, vw.chinese_mean, vw.level, l.learned_at
 		     FROM user_word_learning l
 		     JOIN %s vw ON vw.id = l.word_id
-		     WHERE l.device_id = ? AND l.learned_at >= ?
+		     WHERE l.device_id = ? AND l.learned_at >= ? AND vw.deleted_at IS NULL
 		     ORDER BY vw.lemma, l.learned_at DESC
 		 ) t
 		 ORDER BY learned_at DESC

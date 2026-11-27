@@ -8,8 +8,9 @@ import os
 import sys
 from datetime import datetime
 
-from . import pipeline
+from . import pipeline, vocab_sync
 from .config import BuildError, Settings
+from .db import Store
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -26,6 +27,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="构建前先把 content/<lang>/vocab.csv 导入数据库；默认只读数据库词表",
     )
+    parser.add_argument(
+        "--export-vocab",
+        action="store_true",
+        help="把数据库词表导出为 content/<lang>/vocab.csv 快照与 manifest 后退出",
+    )
+    parser.add_argument(
+        "--check-vocab",
+        action="store_true",
+        help="校验数据库与 content/<lang>/vocab.csv 的 lemma 是否一致；不一致时退出码为 1",
+    )
+    parser.add_argument(
+        "--out-dir",
+        help="导出目录，默认使用 content 目录",
+    )
     args = parser.parse_args(argv)
 
     settings = Settings.from_env()
@@ -37,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.info("build start langs=%s version=%s import_vocab=%s", langs, version, args.import_vocab)
     try:
+        if args.export_vocab or args.check_vocab:
+            return _sync_vocab(settings, langs, args, version)
         pipeline.run(settings, langs, version, import_vocab=args.import_vocab)
     except BuildError as exc:
         logging.error("build failed: %s", exc)
@@ -44,6 +61,30 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:  # 未预期错误；失败状态由 Go scheduler 依据退出码落库
         logging.exception("build crashed")
         return 1
+    return 0
+
+
+def _sync_vocab(settings: Settings, langs: list[str], args, version: str) -> int:
+    """词库快照导出与一致性校验；不触发 embedding / 上传。"""
+    store = Store(settings.pg_dsn)
+    try:
+        if args.export_vocab:
+            manifest = vocab_sync.export_csv(store, settings, langs, args.out_dir, version)
+            for lang, info in manifest["langs"].items():
+                logging.info(
+                    "vocab export %s rows=%d sha256=%s", lang, info["rows"], info["sha256"]
+                )
+            logging.info("vocab manifest version=%s", manifest["version"])
+            return 0
+        issues = vocab_sync.check(store, settings, langs)
+    finally:
+        store.close()
+
+    if issues:
+        for issue in issues:
+            logging.error("vocab check: %s", issue)
+        return 1
+    logging.info("vocab check ok langs=%s", ",".join(langs))
     return 0
 
 

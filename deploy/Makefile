@@ -185,6 +185,20 @@ export-base: pull-base
 export-all: export-service export-base
 	@echo "✅ 分包导出完成（service 每次重建，base 通常只传一次）"
 
+# ---------- 词库快照 ----------
+# 数据库是词库唯一真值；发布前导出快照提交到 git，CI 用 vocab-check 防止再出现漂移。
+PYTHON_BIN ?= python3
+VOCAB_LANGS ?= de en ja
+
+.PHONY: vocab-export vocab-check
+vocab-export:
+	cd $(REPO_ROOT)/builder && $(PYTHON_BIN) -m builder \
+		$(addprefix --lang ,$(VOCAB_LANGS)) --export-vocab --version $(TAG_VERSIONED)
+
+vocab-check:
+	cd $(REPO_ROOT)/builder && $(PYTHON_BIN) -m builder \
+		$(addprefix --lang ,$(VOCAB_LANGS)) --check-vocab
+
 # ---------- 上传（旧 tar 流程） ----------
 .PHONY: upload
 upload:
